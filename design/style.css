@@ -1,0 +1,105 @@
+/* youtube-rusty — GTK4 / libadwaita 1.5+ stylesheet
+   Palette and shape come from the Kalam design system (Terracotta, dark).
+   Load with gtk::style_context_add_provider_for_display at PRIORITY_APPLICATION.
+   Force dark: adw::StyleManager::default().set_color_scheme(PreferDark). */
+
+/* ---------- tokens ---------- */
+@define-color yr_bg        #100C0A;
+@define-color yr_surface   #1A1512;
+@define-color yr_text      #F4EDE7;
+@define-color yr_text2     #C9BEB6;
+@define-color yr_accent    #D4552A;
+@define-color yr_accent_hi #E8845F;   /* links on dark */
+@define-color yr_on_accent #100C0A;
+
+/* libadwaita overrides so stock widgets follow the palette */
+@define-color window_bg_color   @yr_bg;
+@define-color window_fg_color   @yr_text;
+@define-color view_bg_color     @yr_bg;
+@define-color headerbar_bg_color @yr_bg;
+@define-color headerbar_fg_color @yr_text;
+@define-color headerbar_shade_color transparent;
+@define-color headerbar_backdrop_color @yr_bg;
+@define-color popover_bg_color  @yr_surface;
+@define-color dialog_bg_color   @yr_surface;
+@define-color accent_bg_color   @yr_accent;
+@define-color accent_color      @yr_accent_hi;
+
+window, window.background { background-color: @yr_bg; color: @yr_text;
+  font-family: "DM Sans", "Adwaita Sans", sans-serif; }
+
+/* headerbar blends into content: no border, no shadow */
+headerbar { background: @yr_bg; box-shadow: none; border-bottom: none; }
+
+/* ---------- typography ---------- */
+.yr-h1      { font-family: "Playfair Display", serif; font-weight: 500; font-size: 26px; }
+.yr-h2      { font-family: "Playfair Display", serif; font-weight: 500; font-size: 18px; }
+.yr-title   { font-weight: 500; font-size: 15px; color: @yr_text; }
+.yr-meta    { font-size: 13px; color: @yr_text2; }
+.yr-link    { color: @yr_accent_hi; font-weight: 500; }
+.yr-link:hover { text-decoration: underline; }
+
+/* ---------- sidebar rail (68px, same bg as content) ---------- */
+.yr-rail { background: none; padding: 28px 0 24px 0; min-width: 68px; }
+.yr-rail-sep { background-color: alpha(#E8DDD5, 0.10); min-width: 2px;
+  border-radius: 2px; margin: 28px 0 24px 0; }   /* sits in an Overlay at the right edge */
+.yr-rail-btn { min-width: 44px; min-height: 44px; padding: 0; border-radius: 999px;
+  background: none; color: @yr_text2; box-shadow: none; }
+.yr-rail-btn:hover { background-color: alpha(#E8DDD5, 0.08); }
+.yr-rail-btn.active { background-color: @yr_accent; color: @yr_on_accent; }
+
+/* ---------- search + chips + buttons ---------- */
+entry.yr-search, searchentry.yr-search { background-color: alpha(#E8DDD5, 0.08);
+  border-radius: 10px; border: none; box-shadow: none; min-height: 36px; padding: 0 14px; }
+.yr-chip { border-radius: 999px; padding: 7px 14px; background-color: alpha(#E8DDD5, 0.08);
+  color: @yr_text; box-shadow: none; font-size: 13px; }
+.yr-chip:checked, .yr-chip.active { background-color: #E8DDD5; color: #1A1512; font-weight: 500; }
+.yr-segmented { background-color: alpha(#E8DDD5, 0.08); border-radius: 999px; padding: 4px; }
+.yr-segmented .yr-chip { background: none; }
+.yr-segmented .yr-chip:checked { background-color: #E8DDD5; }
+.yr-btn { border-radius: 999px; padding: 8px 16px; background-color: alpha(#E8DDD5, 0.10);
+  color: @yr_text; box-shadow: none; font-weight: 500; }
+.yr-btn.primary { background-color: @yr_accent; color: @yr_on_accent; font-weight: 700; }
+.yr-btn:hover { background-image: image(alpha(white, 0.06)); }
+
+/* ---------- video / short cards ---------- */
+.yr-card { background: none; border-radius: 14px; padding: 0; }
+.yr-thumb { border-radius: 14px; background-color: #2B1F1A; }  /* clip children: overflow:hidden */
+.yr-thumb { overflow: hidden; }
+.yr-duration { background-color: alpha(black, 0.80); color: white; border-radius: 6px;
+  padding: 2px 6px; margin: 8px; font-size: 11px; font-weight: 600; }
+/* no hover lift; subtle only */
+.yr-card:hover .yr-thumb { background-color: #33241E; }
+
+/* ---------- loading skeleton ---------- */
+@keyframes yr-pulse { from { opacity: 0.55; } to { opacity: 1; } }
+.yr-skeleton { background-color: alpha(#E8DDD5, 0.08); border-radius: 8px;
+  animation: yr-pulse 900ms ease-in-out infinite alternate; }
+
+/* ---------- floating player card ---------- */
+.yr-player { background-color: @yr_surface; border: 1px solid alpha(#E8DDD5, 0.14);
+  border-radius: 22px; padding: 14px; margin: 20px;
+  box-shadow: 0 8px 28px alpha(black, 0.55); }
+progressbar.yr-progress trough { min-height: 4px; border-radius: 2px;
+  background-color: alpha(#E8DDD5, 0.14); }
+progressbar.yr-progress progress { min-height: 4px; border-radius: 2px; background-color: @yr_accent; }
+.yr-queue-row { border-radius: 12px; padding: 5px 6px; }
+.yr-queue-row.current { background-color: alpha(#D4552A, 0.16); }
+.yr-queue-row.drop-target { background-color: alpha(#E8DDD5, 0.10); }
+
+/* ---------- popovers, menus, sheet ---------- */
+popover > contents { background-color: @yr_surface; border: 1px solid alpha(#E8DDD5, 0.14);
+  border-radius: 14px; padding: 6px; box-shadow: 0 8px 24px alpha(black, 0.5); }
+popover modelbutton, .yr-menu-item { border-radius: 10px; padding: 10px 14px; min-height: 0; }
+popover modelbutton:hover, .yr-menu-item:hover { background-color: alpha(#E8DDD5, 0.10); }
+.yr-popover-head { font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+  color: @yr_text2; margin: 8px 14px 2px 14px; }
+dialog.yr-sheet, .yr-sheet { background-color: @yr_surface; border-radius: 22px; }
+
+/* ---------- preferences groups (AdwPreferencesGroup keeps its own look) ---------- */
+preferencesgroup > box > box > list, .boxed-list { background-color: alpha(#E8DDD5, 0.06);
+  border-radius: 14px; border: none; }
+
+/* ---------- status pages ---------- */
+.yr-status-icon { background-color: alpha(#E8DDD5, 0.08); border-radius: 999px;
+  min-width: 96px; min-height: 96px; color: @yr_text2; }

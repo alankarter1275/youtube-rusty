@@ -2,12 +2,14 @@ use crate::backend::cache::Cache;
 use crate::backend::engine::Engine;
 use crate::backend::models::VideoSummary;
 use crate::player::mpv;
+use crate::ui::rail::{Rail, RailTab};
 use crate::ui::video_card::VideoCard;
 use adw::prelude::*;
 use gtk4::gdk::{Display, Texture};
+use gtk4::gio;
 use gtk4::{
-    Box as GtkBox, CssProvider, FlowBox, Label, ListBox, ListBoxRow, Orientation, ScrolledWindow,
-    SearchEntry, SelectionMode, StyleContext,
+    Box as GtkBox, CssProvider, FlowBox, MenuButton, Orientation, Overlay,
+    ScrolledWindow, SearchEntry, SelectionMode,
 };
 use libadwaita as adw;
 use std::rc::Rc;
@@ -22,10 +24,13 @@ pub enum ViewMode {
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
+    pub toolbar_view: adw::ToolbarView,
+    pub header_bar: adw::HeaderBar,
     pub search_entry: SearchEntry,
+    pub rail: Rc<Rail>,
+    pub nav_view: adw::NavigationView,
     pub flow_box: FlowBox,
     pub toast_overlay: adw::ToastOverlay,
-    pub sidebar_list: ListBox,
     engine: Arc<Engine>,
     cache: Arc<Cache>,
     runtime: Arc<Runtime>,
@@ -33,50 +38,60 @@ pub struct MainWindow {
 
 impl MainWindow {
     pub fn new(app: &adw::Application) -> Rc<Self> {
-        // Load custom styling
         load_custom_css();
 
+        // Enforce dark style matching Kalam Terracotta theme
         let style_manager = adw::StyleManager::default();
         style_manager.set_color_scheme(adw::ColorScheme::PreferDark);
 
-        // Header bar
+        // Header Bar (borderless, blends with #100C0A)
         let header_bar = adw::HeaderBar::new();
+        header_bar.add_css_class("flat");
+
+        // Centered Search Entry wrapped in AdwClamp (max 420px)
         let search_entry = SearchEntry::builder()
             .placeholder_text("Search YouTube...")
-            .width_request(460)
             .build();
-        header_bar.set_title_widget(Some(&search_entry));
+        search_entry.add_css_class("yr-search");
 
-        // Left Sidebar (Navigation drawer)
-        let sidebar_list = ListBox::builder()
-            .selection_mode(SelectionMode::Single)
+        let search_clamp = adw::Clamp::builder()
+            .maximum_size(420)
+            .child(&search_entry)
             .build();
-        sidebar_list.add_css_class("sidebar-list");
+        header_bar.set_title_widget(Some(&search_clamp));
 
-        sidebar_list.append(&create_sidebar_row("🔥 Trending", "trending"));
-        sidebar_list.append(&create_sidebar_row("🎮 Gaming", "gaming"));
-        sidebar_list.append(&create_sidebar_row("🎵 Music", "music"));
-        sidebar_list.append(&create_sidebar_row("📰 News", "news"));
+        // Primary Menu Button at the right (Preferences, Shortcuts, About)
+        let menu_model = gio::Menu::new();
+        menu_model.append(Some("Preferences"), Some("app.preferences"));
+        menu_model.append(Some("Keyboard Shortcuts"), Some("app.shortcuts"));
+        menu_model.append(Some("About YouTube Rusty"), Some("app.about"));
 
-        let sidebar_scrolled = ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::Never)
-            .vscrollbar_policy(gtk4::PolicyType::Automatic)
-            .width_request(190)
-            .child(&sidebar_list)
+        let primary_menu_btn = MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .menu_model(&menu_model)
+            .tooltip_text("Main Menu")
             .build();
+        primary_menu_btn.add_css_class("yr-rail-btn");
+        header_bar.pack_end(&primary_menu_btn);
 
-        // Main content area: video flow box inside scrolled window
+        // Left 68px Icon Rail
+        let rail = Rc::new(Rail::new());
+
+        // Navigation View for Content (Enables pushing Channel / Search pages with back support)
+        let nav_view = adw::NavigationView::new();
+
+        // Home Page content: FlowBox inside smooth ScrolledWindow
         let flow_box = FlowBox::builder()
             .selection_mode(SelectionMode::None)
             .homogeneous(false)
-            .max_children_per_line(5)
+            .max_children_per_line(4)
             .min_children_per_line(1)
-            .column_spacing(18)
-            .row_spacing(20)
-            .margin_top(18)
-            .margin_bottom(18)
-            .margin_start(18)
-            .margin_end(18)
+            .column_spacing(20)
+            .row_spacing(24)
+            .margin_top(20)
+            .margin_bottom(20)
+            .margin_start(24)
+            .margin_end(24)
             .build();
 
         let content_scrolled = ScrolledWindow::builder()
@@ -87,21 +102,36 @@ impl MainWindow {
             .child(&flow_box)
             .build();
 
-        // Horizontal split container (Sidebar + Content)
+        let home_page = adw::NavigationPage::builder()
+            .title("Home")
+            .tag("home")
+            .child(&content_scrolled)
+            .build();
+
+        nav_view.push(&home_page);
+
+        // Horizontal Layout: Rail + Navigation View
         let main_h_box = GtkBox::new(Orientation::Horizontal, 0);
-        main_h_box.append(&sidebar_scrolled);
-        main_h_box.append(&content_scrolled);
+        main_h_box.append(&rail.container);
+        main_h_box.append(&nav_view);
 
-        let content_box = GtkBox::new(Orientation::Vertical, 0);
-        content_box.append(&header_bar);
-        content_box.append(&main_h_box);
+        // Overlay over content area (for persistent floating Player Card in future phase)
+        let content_overlay = Overlay::new();
+        content_overlay.set_child(Some(&main_h_box));
 
+        // Toolbar View managing top bar & content
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&content_overlay));
+
+        // Toast overlay at root
         let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&content_box));
+        toast_overlay.set_child(Some(&toolbar_view));
 
+        // Main Window
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("YouTube Rusty")
+            .title("youtube-rusty")
             .default_width(1280)
             .default_height(780)
             .content(&toast_overlay)
@@ -113,10 +143,13 @@ impl MainWindow {
 
         let this = Rc::new(Self {
             window,
+            toolbar_view,
+            header_bar,
             search_entry,
+            rail,
+            nav_view,
             flow_box,
             toast_overlay,
-            sidebar_list,
             engine,
             cache,
             runtime,
@@ -129,7 +162,7 @@ impl MainWindow {
     }
 
     fn setup_events(self: &Rc<Self>) {
-        // Search bar activation -> Search List View
+        // Search bar activation
         let this = self.clone();
         self.search_entry.connect_activate(move |entry| {
             let text = entry.text().to_string();
@@ -138,23 +171,35 @@ impl MainWindow {
             }
         });
 
-        // Sidebar row selection -> Grid View
+        // Rail Buttons
         let this = self.clone();
-        self.sidebar_list.connect_row_selected(move |_, row| {
-            if let Some(r) = row {
-                let tag = unsafe { r.data::<String>("tag") };
-                if let Some(tag_str) = tag {
-                    let s = unsafe { tag_str.as_ref() };
-                    if s == "trending" {
-                        this.load_trending();
-                    } else {
-                        this.search(s);
-                    }
-                }
-            }
+        self.rail.home_btn.connect_clicked(move |_| {
+            this.rail.set_active(RailTab::Home);
+            this.load_trending();
         });
 
-        // Video card click -> Stream in MPV
+        let this = self.clone();
+        self.rail.subs_btn.connect_clicked(move |_| {
+            this.rail.set_active(RailTab::Subscriptions);
+            let toast = adw::Toast::new("Subscriptions (Coming in Phase 6)");
+            this.toast_overlay.add_toast(toast);
+        });
+
+        let this = self.clone();
+        self.rail.hist_btn.connect_clicked(move |_| {
+            this.rail.set_active(RailTab::History);
+            let toast = adw::Toast::new("History (Coming in Phase 6)");
+            this.toast_overlay.add_toast(toast);
+        });
+
+        let this = self.clone();
+        self.rail.settings_btn.connect_clicked(move |_| {
+            this.rail.set_active(RailTab::Settings);
+            let toast = adw::Toast::new("Settings (Coming in Phase 6)");
+            this.toast_overlay.add_toast(toast);
+        });
+
+        // FlowBox card activation -> MPV streaming
         let this = self.clone();
         self.flow_box.connect_child_activated(move |_, child| {
             if let Some(id) = unsafe { child.data::<String>("video_id") } {
@@ -218,25 +263,22 @@ impl MainWindow {
     }
 
     fn populate_videos(self: &Rc<Self>, videos: Vec<VideoSummary>, mode: ViewMode) {
-        // Clear previous video cards
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
 
-        // Adjust layout flow rules
         match mode {
             ViewMode::Grid => {
-                self.flow_box.set_max_children_per_line(5);
+                self.flow_box.set_max_children_per_line(4);
                 self.flow_box.set_min_children_per_line(1);
-                self.flow_box.set_column_spacing(18);
-                self.flow_box.set_row_spacing(20);
+                self.flow_box.set_column_spacing(20);
+                self.flow_box.set_row_spacing(24);
             }
             ViewMode::SearchList => {
-                // In search list mode: 1 item per line, vertical stack of horizontal cards
                 self.flow_box.set_max_children_per_line(1);
                 self.flow_box.set_min_children_per_line(1);
                 self.flow_box.set_column_spacing(0);
-                self.flow_box.set_row_spacing(12);
+                self.flow_box.set_row_spacing(14);
             }
         }
 
@@ -302,26 +344,13 @@ impl MainWindow {
     }
 }
 
-fn create_sidebar_row(title: &str, tag: &str) -> ListBoxRow {
-    let row = ListBoxRow::new();
-    row.add_css_class("sidebar-row");
-    let label = Label::new(Some(title));
-    label.set_halign(gtk4::Align::Start);
-    label.add_css_class("heading");
-    row.set_child(Some(&label));
-    unsafe {
-        row.set_data("tag", tag.to_string());
-    }
-    row
-}
-
 fn load_custom_css() {
     let provider = CssProvider::new();
     let css = include_str!("style.css");
     provider.load_from_data(css);
 
     if let Some(display) = Display::default() {
-        StyleContext::add_provider_for_display(
+        gtk4::style_context_add_provider_for_display(
             &display,
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
