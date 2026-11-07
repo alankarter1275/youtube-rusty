@@ -59,6 +59,10 @@ impl Engine {
                     .map(|c| c.name)
                     .unwrap_or_else(|| "Unknown".to_string());
 
+                let description_snippet = item
+                    .short_description
+                    .unwrap_or_default();
+
                 VideoSummary {
                     id: item.id,
                     title: item.name,
@@ -67,6 +71,7 @@ impl Engine {
                     duration_text,
                     view_count_text,
                     thumbnail_url,
+                    description_snippet,
                 }
             })
             .collect();
@@ -118,6 +123,10 @@ impl Engine {
                     .map(|c| c.name)
                     .unwrap_or_else(|| "Unknown".to_string());
 
+                let description_snippet = item
+                    .short_description
+                    .unwrap_or_default();
+
                 VideoSummary {
                     id: item.id,
                     title: item.name,
@@ -126,6 +135,7 @@ impl Engine {
                     duration_text,
                     view_count_text,
                     thumbnail_url,
+                    description_snippet,
                 }
             })
             .collect();

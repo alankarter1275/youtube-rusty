@@ -1,0 +1,99 @@
+/* Modern YouTube Desktop Styling for YouTube Rusty */
+
+window.background {
+    background-color: #121212;
+    color: #f1f1f1;
+}
+
+headerbar {
+    background-color: #0f0f0f;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Sidebar styling */
+.sidebar-list {
+    background-color: #0f0f0f;
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-row {
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin: 2px 8px;
+    transition: background 150ms ease;
+}
+
+.sidebar-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-row:selected {
+    background-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Grid Video Card (Home / Trending) */
+.grid-card {
+    background-color: transparent;
+    border-radius: 12px;
+    padding: 8px;
+    transition: background-color 180ms ease, transform 180ms ease;
+}
+
+.grid-card:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+    transform: translateY(-2px);
+}
+
+/* Search Result Card (Horizontal YouTube Search Style) */
+.search-card {
+    background-color: transparent;
+    border-radius: 12px;
+    padding: 10px;
+    margin: 4px 12px;
+    transition: background-color 180ms ease;
+}
+
+.search-card:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+/* Thumbnail with aspect ratio & rounded corners */
+.thumb-container {
+    border-radius: 12px;
+    overflow: hidden;
+    background-color: #212121;
+}
+
+.video-thumb {
+    border-radius: 12px;
+}
+
+/* Duration badge overlaid on thumbnail */
+.duration-badge {
+    background-color: rgba(0, 0, 0, 0.85);
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 5px;
+    border-radius: 4px;
+    margin: 6px;
+}
+
+/* Typography */
+.video-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #f1f1f1;
+    line-height: 1.3;
+}
+
+.video-meta {
+    font-size: 12px;
+    color: #aaaaaa;
+}
+
+.video-description {
+    font-size: 12px;
+    color: #888888;
+    line-height: 1.35;
+}
