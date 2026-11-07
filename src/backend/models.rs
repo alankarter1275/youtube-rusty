@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 pub struct VideoSummary {
     pub id: String,
     pub title: String,
+    pub channel_id: String,
     pub channel_name: String,
+    pub channel_avatar_url: String,
     pub duration_seconds: Option<u64>,
     pub duration_text: String,
     pub view_count_text: String,

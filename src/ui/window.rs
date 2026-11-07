@@ -8,7 +8,7 @@ use adw::prelude::*;
 use gtk4::gdk::{Display, Texture};
 use gtk4::gio;
 use gtk4::{
-    Box as GtkBox, CssProvider, FlowBox, MenuButton, Orientation, Overlay,
+    Align, Box as GtkBox, Button, CssProvider, FlowBox, Label, MenuButton, Orientation, Overlay,
     ScrolledWindow, SearchEntry, SelectionMode,
 };
 use libadwaita as adw;
@@ -30,6 +30,7 @@ pub struct MainWindow {
     pub rail: Rc<Rail>,
     pub nav_view: adw::NavigationView,
     pub flow_box: FlowBox,
+    pub section_title: Label,
     pub toast_overlay: adw::ToastOverlay,
     engine: Arc<Engine>,
     cache: Arc<Cache>,
@@ -40,15 +41,13 @@ impl MainWindow {
     pub fn new(app: &adw::Application) -> Rc<Self> {
         load_custom_css();
 
-        // Enforce dark style matching Kalam Terracotta theme
         let style_manager = adw::StyleManager::default();
         style_manager.set_color_scheme(adw::ColorScheme::PreferDark);
 
-        // Header Bar (borderless, blends with #100C0A)
+        // Header Bar (borderless, blends into #100C0A)
         let header_bar = adw::HeaderBar::new();
         header_bar.add_css_class("flat");
 
-        // Centered Search Entry wrapped in AdwClamp (max 420px)
         let search_entry = SearchEntry::builder()
             .placeholder_text("Search YouTube...")
             .build();
@@ -60,7 +59,6 @@ impl MainWindow {
             .build();
         header_bar.set_title_widget(Some(&search_clamp));
 
-        // Primary Menu Button at the right (Preferences, Shortcuts, About)
         let menu_model = gio::Menu::new();
         menu_model.append(Some("Preferences"), Some("app.preferences"));
         menu_model.append(Some("Keyboard Shortcuts"), Some("app.shortcuts"));
@@ -74,13 +72,39 @@ impl MainWindow {
         primary_menu_btn.add_css_class("yr-rail-btn");
         header_bar.pack_end(&primary_menu_btn);
 
-        // Left 68px Icon Rail
+        // 68px Icon Rail
         let rail = Rc::new(Rail::new());
 
-        // Navigation View for Content (Enables pushing Channel / Search pages with back support)
+        // Navigation View
         let nav_view = adw::NavigationView::new();
 
-        // Home Page content: FlowBox inside smooth ScrolledWindow
+        // Home View Container: [ Chips Row ] + [ Section Title: Playfair 18 ] + [ FlowBox Grid ]
+        let home_vbox = GtkBox::new(Orientation::Vertical, 16);
+        home_vbox.set_margin_top(18);
+        home_vbox.set_margin_start(24);
+        home_vbox.set_margin_end(24);
+        home_vbox.set_margin_bottom(24);
+
+        // Chips Row (Trending, Gaming, Music, News)
+        let chips_box = GtkBox::new(Orientation::Horizontal, 8);
+        chips_box.set_halign(Align::Start);
+        let chip_trending = create_chip("Trending", true);
+        let chip_gaming = create_chip("Gaming", false);
+        let chip_music = create_chip("Music", false);
+        let chip_news = create_chip("News", false);
+
+        chips_box.append(&chip_trending);
+        chips_box.append(&chip_gaming);
+        chips_box.append(&chip_music);
+        chips_box.append(&chip_news);
+
+        // Section Title: Playfair 18
+        let section_title = Label::new(Some("Trending"));
+        section_title.set_halign(Align::Start);
+        section_title.add_css_class("yr-h2");
+        section_title.set_margin_top(6);
+
+        // Video Grid (4 columns at reference width)
         let flow_box = FlowBox::builder()
             .selection_mode(SelectionMode::None)
             .homogeneous(false)
@@ -88,18 +112,18 @@ impl MainWindow {
             .min_children_per_line(1)
             .column_spacing(20)
             .row_spacing(24)
-            .margin_top(20)
-            .margin_bottom(20)
-            .margin_start(24)
-            .margin_end(24)
             .build();
+
+        home_vbox.append(&chips_box);
+        home_vbox.append(&section_title);
+        home_vbox.append(&flow_box);
 
         let content_scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
             .vexpand(true)
             .hexpand(true)
-            .child(&flow_box)
+            .child(&home_vbox)
             .build();
 
         let home_page = adw::NavigationPage::builder()
@@ -110,25 +134,21 @@ impl MainWindow {
 
         nav_view.push(&home_page);
 
-        // Horizontal Layout: Rail + Navigation View
+        // Main Horizontal Layout: Rail + Navigation View
         let main_h_box = GtkBox::new(Orientation::Horizontal, 0);
         main_h_box.append(&rail.container);
         main_h_box.append(&nav_view);
 
-        // Overlay over content area (for persistent floating Player Card in future phase)
         let content_overlay = Overlay::new();
         content_overlay.set_child(Some(&main_h_box));
 
-        // Toolbar View managing top bar & content
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
         toolbar_view.set_content(Some(&content_overlay));
 
-        // Toast overlay at root
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&toolbar_view));
 
-        // Main Window
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("youtube-rusty")
@@ -149,20 +169,27 @@ impl MainWindow {
             rail,
             nav_view,
             flow_box,
+            section_title,
             toast_overlay,
             engine,
             cache,
             runtime,
         });
 
-        this.setup_events();
+        this.setup_events(&chip_trending, &chip_gaming, &chip_music, &chip_news);
         this.load_trending();
 
         this
     }
 
-    fn setup_events(self: &Rc<Self>) {
-        // Search bar activation
+    fn setup_events(
+        self: &Rc<Self>,
+        chip_trending: &Button,
+        chip_gaming: &Button,
+        chip_music: &Button,
+        chip_news: &Button,
+    ) {
+        // Search bar activation -> Search Results Mode
         let this = self.clone();
         self.search_entry.connect_activate(move |entry| {
             let text = entry.text().to_string();
@@ -171,7 +198,7 @@ impl MainWindow {
             }
         });
 
-        // Rail Buttons
+        // Rail Navigation Buttons
         let this = self.clone();
         self.rail.home_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::Home);
@@ -199,6 +226,47 @@ impl MainWindow {
             this.toast_overlay.add_toast(toast);
         });
 
+        // Category Chips
+        let this = self.clone();
+        let ct = chip_trending.clone();
+        let cg = chip_gaming.clone();
+        let cm = chip_music.clone();
+        let cn = chip_news.clone();
+        chip_trending.connect_clicked(move |_| {
+            reset_chips(&[&ct, &cg, &cm, &cn], &ct);
+            this.load_trending();
+        });
+
+        let this = self.clone();
+        let ct = chip_trending.clone();
+        let cg = chip_gaming.clone();
+        let cm = chip_music.clone();
+        let cn = chip_news.clone();
+        chip_gaming.connect_clicked(move |_| {
+            reset_chips(&[&ct, &cg, &cm, &cn], &cg);
+            this.search_category("Gaming");
+        });
+
+        let this = self.clone();
+        let ct = chip_trending.clone();
+        let cg = chip_gaming.clone();
+        let cm = chip_music.clone();
+        let cn = chip_news.clone();
+        chip_music.connect_clicked(move |_| {
+            reset_chips(&[&ct, &cg, &cm, &cn], &cm);
+            this.search_category("Music");
+        });
+
+        let this = self.clone();
+        let ct = chip_trending.clone();
+        let cg = chip_gaming.clone();
+        let cm = chip_music.clone();
+        let cn = chip_news.clone();
+        chip_news.connect_clicked(move |_| {
+            reset_chips(&[&ct, &cg, &cm, &cn], &cn);
+            this.search_category("News");
+        });
+
         // FlowBox card activation -> MPV streaming
         let this = self.clone();
         self.flow_box.connect_child_activated(move |_, child| {
@@ -220,6 +288,10 @@ impl MainWindow {
     }
 
     pub fn search(self: &Rc<Self>, query: &str) {
+        self.section_title
+            .set_text(&format!("Results for \"{query}\""));
+        self.show_skeletons(6);
+
         let (sender, receiver) = async_channel::unbounded::<Result<Vec<VideoSummary>, String>>();
         let engine = self.engine.clone();
         let q = query.to_string();
@@ -233,17 +305,48 @@ impl MainWindow {
         glib::spawn_future_local(async move {
             if let Ok(res) = receiver.recv().await {
                 match res {
-                    Ok(videos) => this.populate_videos(videos, ViewMode::SearchList),
+                    Ok(videos) => {
+                        if videos.is_empty() {
+                            this.show_empty_state("No videos found", "Try different keywords or check spelling");
+                        } else {
+                            this.populate_videos(videos, ViewMode::SearchList);
+                        }
+                    }
                     Err(e) => {
-                        let toast = adw::Toast::new(&format!("Error: {e}"));
-                        this.toast_overlay.add_toast(toast);
+                        this.show_empty_state("Failed to load results", &e);
                     }
                 }
             }
         });
     }
 
+    pub fn search_category(self: &Rc<Self>, category: &str) {
+        self.section_title.set_text(category);
+        self.show_skeletons(8);
+
+        let (sender, receiver) = async_channel::unbounded::<Result<Vec<VideoSummary>, String>>();
+        let engine = self.engine.clone();
+        let cat = category.to_string();
+
+        self.runtime.spawn(async move {
+            let res = engine.search(&cat).await;
+            let _ = sender.send(res).await;
+        });
+
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(res) = receiver.recv().await {
+                if let Ok(videos) = res {
+                    this.populate_videos(videos, ViewMode::Grid);
+                }
+            }
+        });
+    }
+
     pub fn load_trending(self: &Rc<Self>) {
+        self.section_title.set_text("Trending");
+        self.show_skeletons(8);
+
         let (sender, receiver) = async_channel::unbounded::<Result<Vec<VideoSummary>, String>>();
         let engine = self.engine.clone();
 
@@ -260,6 +363,31 @@ impl MainWindow {
                 }
             }
         });
+    }
+
+    fn show_skeletons(self: &Rc<Self>, count: usize) {
+        while let Some(child) = self.flow_box.first_child() {
+            self.flow_box.remove(&child);
+        }
+        for _ in 0..count {
+            self.flow_box.append(&VideoCard::new_skeleton());
+        }
+    }
+
+    fn show_empty_state(self: &Rc<Self>, title: &str, description: &str) {
+        while let Some(child) = self.flow_box.first_child() {
+            self.flow_box.remove(&child);
+        }
+
+        let status_page = adw::StatusPage::builder()
+            .icon_name("system-search-symbolic")
+            .title(title)
+            .description(description)
+            .build();
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_child(Some(&status_page));
+        self.flow_box.append(&container);
     }
 
     fn populate_videos(self: &Rc<Self>, videos: Vec<VideoSummary>, mode: ViewMode) {
@@ -294,6 +422,10 @@ impl MainWindow {
             }
 
             self.load_thumbnail_async(&card, &summary.thumbnail_url, &summary.id);
+            if !summary.channel_avatar_url.is_empty() {
+                self.load_avatar_async(&card, &summary.channel_avatar_url, &summary.channel_id);
+            }
+
             self.flow_box.append(&card.container);
         }
     }
@@ -339,9 +471,66 @@ impl MainWindow {
         });
     }
 
+    fn load_avatar_async(self: &Rc<Self>, card: &VideoCard, url: &str, channel_id: &str) {
+        if url.is_empty() {
+            return;
+        }
+
+        let (sender, receiver) = async_channel::unbounded::<Option<Vec<u8>>>();
+        let cache = self.cache.clone();
+        let u = url.to_string();
+        let cid = format!("avatar_{channel_id}");
+
+        self.runtime.spawn(async move {
+            if cache.has_thumbnail(&cid) {
+                if let Ok(bytes) = std::fs::read(cache.get_thumbnail_path(&cid)) {
+                    let _ = sender.send(Some(bytes)).await;
+                    return;
+                }
+            }
+
+            if let Ok(resp) = reqwest::get(&u).await {
+                if let Ok(bytes) = resp.bytes().await {
+                    let vec_bytes = bytes.to_vec();
+                    let _ = cache.save_thumbnail(&cid, &vec_bytes);
+                    let _ = sender.send(Some(vec_bytes)).await;
+                    return;
+                }
+            }
+
+            let _ = sender.send(None).await;
+        });
+
+        let avatar = card.avatar.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Some(bytes)) = receiver.recv().await {
+                let glib_bytes = glib::Bytes::from(&bytes);
+                if let Ok(texture) = Texture::from_bytes(&glib_bytes) {
+                    avatar.set_custom_image(Some(&texture));
+                }
+            }
+        });
+    }
+
     pub fn present(&self) {
         self.window.present();
     }
+}
+
+fn create_chip(label: &str, is_active: bool) -> Button {
+    let btn = Button::builder().label(label).build();
+    btn.add_css_class("yr-chip");
+    if is_active {
+        btn.add_css_class("active");
+    }
+    btn
+}
+
+fn reset_chips(chips: &[&Button], active_chip: &Button) {
+    for chip in chips {
+        chip.remove_css_class("active");
+    }
+    active_chip.add_css_class("active");
 }
 
 fn load_custom_css() {

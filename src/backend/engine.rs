@@ -54,10 +54,12 @@ impl Engine {
                     .map(|t| t.url.clone())
                     .unwrap_or_default();
 
-                let channel_name = item
-                    .channel
-                    .map(|c| c.name)
-                    .unwrap_or_else(|| "Unknown".to_string());
+                let (channel_id, channel_name, channel_avatar_url) = if let Some(c) = item.channel {
+                    let avatar = c.avatar.last().map(|t| t.url.clone()).unwrap_or_default();
+                    (c.id, c.name, avatar)
+                } else {
+                    (String::new(), "Unknown".to_string(), String::new())
+                };
 
                 let description_snippet = item
                     .short_description
@@ -66,7 +68,9 @@ impl Engine {
                 VideoSummary {
                     id: item.id,
                     title: item.name,
+                    channel_id,
                     channel_name,
+                    channel_avatar_url,
                     duration_seconds: duration_secs,
                     duration_text,
                     view_count_text,
@@ -118,10 +122,12 @@ impl Engine {
                     .map(|t| t.url.clone())
                     .unwrap_or_default();
 
-                let channel_name = item
-                    .channel
-                    .map(|c| c.name)
-                    .unwrap_or_else(|| "Unknown".to_string());
+                let (channel_id, channel_name, channel_avatar_url) = if let Some(c) = item.channel {
+                    let avatar = c.avatar.last().map(|t| t.url.clone()).unwrap_or_default();
+                    (c.id, c.name, avatar)
+                } else {
+                    (String::new(), "Unknown".to_string(), String::new())
+                };
 
                 let description_snippet = item
                     .short_description
@@ -130,7 +136,9 @@ impl Engine {
                 VideoSummary {
                     id: item.id,
                     title: item.name,
+                    channel_id,
                     channel_name,
+                    channel_avatar_url,
                     duration_seconds: duration_secs,
                     duration_text,
                     view_count_text,

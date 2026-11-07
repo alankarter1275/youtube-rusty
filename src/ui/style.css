@@ -64,8 +64,7 @@ entry.yr-search, searchentry.yr-search { background-color: alpha(#E8DDD5, 0.08);
 
 /* ---------- video / short cards ---------- */
 .yr-card { background: none; border-radius: 14px; padding: 0; }
-.yr-thumb { border-radius: 14px; background-color: #2B1F1A; }  /* clip children: overflow:hidden */
-.yr-thumb { overflow: hidden; }
+.yr-thumb { border-radius: 14px; background-color: #2B1F1A; }
 .yr-duration { background-color: alpha(black, 0.80); color: white; border-radius: 6px;
   padding: 2px 6px; margin: 8px; font-size: 11px; font-weight: 600; }
 /* no hover lift; subtle only */
