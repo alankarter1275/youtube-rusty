@@ -1,3 +1,4 @@
+mod backend;
 mod ui;
 
 use adw::prelude::*;
