@@ -1,4 +1,5 @@
 mod backend;
+mod player;
 mod ui;
 
 use adw::prelude::*;
