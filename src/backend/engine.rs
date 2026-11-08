@@ -29,16 +29,6 @@ impl Engine {
         Self { rp }
     }
 
-    pub async fn search(&self, query: &str) -> Result<Vec<VideoSummary>, String> {
-        self.search_filtered(
-            query,
-            UploadDateFilter::AnyTime,
-            DurationFilter::AnyLength,
-            SearchSortOrder::Relevance,
-        )
-        .await
-    }
-
     pub async fn search_filtered(
         &self,
         query: &str,
