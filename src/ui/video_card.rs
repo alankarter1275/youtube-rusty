@@ -7,6 +7,7 @@ pub struct VideoCard {
     pub container: gtk4::FlowBoxChild,
     pub picture: Picture,
     pub avatar: adw::Avatar,
+    pub summary: VideoSummary,
 }
 
 impl VideoCard {
@@ -77,6 +78,7 @@ impl VideoCard {
             container,
             picture,
             avatar,
+            summary: summary.clone(),
         }
     }
 
@@ -194,6 +196,7 @@ impl VideoCard {
             container,
             picture,
             avatar,
+            summary: summary.clone(),
         }
     }
 }

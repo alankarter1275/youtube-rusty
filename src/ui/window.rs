@@ -1,7 +1,8 @@
 use crate::backend::cache::Cache;
 use crate::backend::engine::Engine;
 use crate::backend::models::VideoSummary;
-use crate::player::mpv;
+use crate::player::mpv::{self, Quality};
+use crate::ui::details_sheet::{ContextMenu, DetailsSheet};
 use crate::ui::rail::{Rail, RailTab};
 use crate::ui::video_card::VideoCard;
 use adw::prelude::*;
@@ -267,22 +268,48 @@ impl MainWindow {
             this.search_category("News");
         });
 
-        // FlowBox card activation -> MPV streaming
+        // FlowBox card activation -> Details Sheet (Phase 3)
         let this = self.clone();
         self.flow_box.connect_child_activated(move |_, child| {
-            if let Some(id) = unsafe { child.data::<String>("video_id") } {
-                let id_str = unsafe { id.as_ref() };
-                let title = unsafe {
-                    child
-                        .data::<String>("video_title")
-                        .map(|t| t.as_ref().clone())
-                        .unwrap_or_else(|| "YouTube Video".to_string())
+            if let Some(summary_ref) = unsafe { child.data::<VideoSummary>("video_summary") } {
+                let summary = unsafe { summary_ref.as_ref() }.clone();
+                let thumb_texture =
+                    unsafe { child.data::<Texture>("thumb_texture") }.map(|t| unsafe { t.as_ref() });
+                let avatar_texture =
+                    unsafe { child.data::<Texture>("avatar_texture") }.map(|t| unsafe { t.as_ref() });
+
+                let toast_overlay = this.toast_overlay.clone();
+                let on_toast = move |msg: String| {
+                    toast_overlay.add_toast(adw::Toast::new(&msg));
                 };
 
-                let toast = adw::Toast::new(&format!("Playing \"{title}\" in MPV..."));
-                this.toast_overlay.add_toast(toast);
+                let toast_overlay_play = this.toast_overlay.clone();
+                let on_play = move |id: String, title: String, quality: Quality| {
+                    let q_name = match quality {
+                        Quality::P360 => "360p",
+                        Quality::P720 => "720p",
+                        Quality::P1080 => "1080p",
+                        Quality::AudioOnly => "Audio",
+                    };
+                    toast_overlay_play.add_toast(adw::Toast::new(&format!(
+                        "Playing \"{title}\" ({q_name}) in MPV..."
+                    )));
+                    let _ = mpv::play_with_quality(&id, &title, quality);
+                };
 
-                let _ = mpv::play(id_str, &title);
+                let on_open_channel = move |_cid: String, _cname: String| {
+                    // Phase 5: channel page
+                };
+
+                DetailsSheet::show(
+                    &this.window,
+                    &summary,
+                    thumb_texture,
+                    avatar_texture,
+                    on_play,
+                    on_toast,
+                    on_open_channel,
+                );
             }
         });
     }
@@ -417,9 +444,40 @@ impl MainWindow {
             };
 
             unsafe {
-                card.container.set_data("video_id", summary.id.clone());
-                card.container.set_data("video_title", summary.title.clone());
+                card.container
+                    .set_data("video_summary", summary.clone());
             }
+
+            let toast_overlay = self.toast_overlay.clone();
+            let on_toast = move |msg: String| {
+                toast_overlay.add_toast(adw::Toast::new(&msg));
+            };
+
+            let toast_overlay_play = self.toast_overlay.clone();
+            let on_play = move |id: String, title: String, quality: Quality| {
+                let q_name = match quality {
+                    Quality::P360 => "360p",
+                    Quality::P720 => "720p",
+                    Quality::P1080 => "1080p",
+                    Quality::AudioOnly => "Audio",
+                };
+                toast_overlay_play.add_toast(adw::Toast::new(&format!(
+                    "Playing \"{title}\" ({q_name}) in MPV..."
+                )));
+                let _ = mpv::play_with_quality(&id, &title, quality);
+            };
+
+            let on_open_channel = move |_cid: String, _cname: String| {
+                // Phase 5
+            };
+
+            ContextMenu::attach(
+                &card.container,
+                &summary,
+                on_play,
+                on_toast,
+                on_open_channel,
+            );
 
             self.load_thumbnail_async(&card, &summary.thumbnail_url, &summary.id);
             if !summary.channel_avatar_url.is_empty() {
@@ -461,11 +519,15 @@ impl MainWindow {
         });
 
         let picture = card.picture.clone();
+        let container = card.container.clone();
         glib::spawn_future_local(async move {
             if let Ok(Some(bytes)) = receiver.recv().await {
                 let glib_bytes = glib::Bytes::from(&bytes);
                 if let Ok(texture) = Texture::from_bytes(&glib_bytes) {
                     picture.set_paintable(Some(&texture));
+                    unsafe {
+                        container.set_data("thumb_texture", texture);
+                    }
                 }
             }
         });
@@ -502,11 +564,15 @@ impl MainWindow {
         });
 
         let avatar = card.avatar.clone();
+        let container = card.container.clone();
         glib::spawn_future_local(async move {
             if let Ok(Some(bytes)) = receiver.recv().await {
                 let glib_bytes = glib::Bytes::from(&bytes);
                 if let Ok(texture) = Texture::from_bytes(&glib_bytes) {
                     avatar.set_custom_image(Some(&texture));
+                    unsafe {
+                        container.set_data("avatar_texture", texture);
+                    }
                 }
             }
         });

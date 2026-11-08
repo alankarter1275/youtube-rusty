@@ -10,6 +10,7 @@ pub struct VideoSummary {
     pub duration_seconds: Option<u64>,
     pub duration_text: String,
     pub view_count_text: String,
+    pub published_text: String,
     pub thumbnail_url: String,
     pub description_snippet: String,
 }

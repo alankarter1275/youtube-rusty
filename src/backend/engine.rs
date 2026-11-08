@@ -65,6 +65,8 @@ impl Engine {
                     .short_description
                     .unwrap_or_default();
 
+                let published_text = item.publish_date_txt.unwrap_or_default();
+
                 VideoSummary {
                     id: item.id,
                     title: item.name,
@@ -74,6 +76,7 @@ impl Engine {
                     duration_seconds: duration_secs,
                     duration_text,
                     view_count_text,
+                    published_text,
                     thumbnail_url,
                     description_snippet,
                 }
@@ -133,6 +136,8 @@ impl Engine {
                     .short_description
                     .unwrap_or_default();
 
+                let published_text = item.publish_date_txt.unwrap_or_default();
+
                 VideoSummary {
                     id: item.id,
                     title: item.name,
@@ -142,6 +147,7 @@ impl Engine {
                     duration_seconds: duration_secs,
                     duration_text,
                     view_count_text,
+                    published_text,
                     thumbnail_url,
                     description_snippet,
                 }
