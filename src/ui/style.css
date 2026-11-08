@@ -130,7 +130,6 @@ headerbar {
 .yr-thumb {
   border-radius: 14px;
   background-color: #2B1F1A;
-  overflow: hidden;
 }
 .yr-duration {
   background-color: alpha(black, 0.80);
@@ -149,6 +148,9 @@ headerbar {
   background-color: alpha(#E8DDD5, 0.08);
   border-radius: 8px;
   animation: yr-pulse 900ms ease-in-out infinite alternate;
+}
+.yr-skeleton-circle {
+  border-radius: 999px;
 }
 
 /* ---------- floating player card ---------- */

@@ -3,7 +3,8 @@ use crate::ui::image_loader::ImageLoader;
 use adw::prelude::*;
 use gtk4::{
     gdk, glib, Align, Box as GtkBox, Button, DragSource, DropTarget, EventControllerKey,
-    GestureClick, Label, Orientation, Overlay, Picture, ProgressBar, ScrolledWindow, Separator,
+    GestureClick, Label, Orientation, Overflow, Overlay, Picture, ProgressBar, ScrolledWindow,
+    Separator,
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
@@ -84,6 +85,7 @@ impl PlayerCard {
 
         let thumb_overlay = Overlay::new();
         thumb_overlay.set_child(Some(&thumb_pic));
+        thumb_overlay.set_overflow(Overflow::Hidden);
         thumb_overlay.set_size_request(96, 54);
         thumb_overlay.add_css_class("yr-thumb");
 
@@ -630,6 +632,7 @@ impl PlayerCard {
         if let Some(cur) = queue.get(cur_idx) {
             self.title_label.set_text(&cur.title);
             self.channel_btn.set_label(&cur.channel_name);
+            self.channel_btn.set_visible(!cur.channel_name.is_empty());
             self.channel_btn.set_sensitive(!cur.channel_id.is_empty());
 
             let prefix = if self.is_shorts_mode.get() {
@@ -719,6 +722,7 @@ impl PlayerCard {
 
             let row_thumb_overlay = Overlay::new();
             row_thumb_overlay.set_child(Some(&thumb));
+            row_thumb_overlay.set_overflow(Overflow::Hidden);
             row_thumb_overlay.add_css_class("yr-thumb");
             row_thumb_overlay.set_size_request(64, 36);
 

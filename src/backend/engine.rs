@@ -558,10 +558,6 @@ fn map_video_item(
         }
     }
 
-    if channel_name.is_empty() {
-        channel_name = "Unknown channel".to_string();
-    }
-
     let description_snippet = item.short_description.unwrap_or_default();
     let published_text = item.publish_date_txt.unwrap_or_default();
     let published_unix = item.publish_date.map(|dt| dt.unix_timestamp());

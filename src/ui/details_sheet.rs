@@ -3,7 +3,7 @@ use crate::player::mpv::Quality;
 use crate::ui::image_loader::ImageLoader;
 use gtk4::gdk::Rectangle;
 use gtk4::{
-    Align, AspectFrame, Box as GtkBox, Button, GestureClick, GestureLongPress, Label, Orientation,
+    Align, Box as GtkBox, Button, GestureClick, GestureLongPress, Label, Orientation, Overflow,
     Overlay, Picture, Popover, Separator, ToggleButton,
 };
 use libadwaita as adw;
@@ -55,8 +55,9 @@ impl DetailsSheet {
 
         let thumb_overlay = Overlay::new();
         thumb_overlay.set_child(Some(&picture));
+        thumb_overlay.set_overflow(Overflow::Hidden);
         thumb_overlay.set_hexpand(true);
-        thumb_overlay.set_vexpand(true);
+        thumb_overlay.set_size_request(480, 270);
         thumb_overlay.add_css_class("yr-thumb");
 
         if !summary.duration_text.is_empty() {
@@ -67,15 +68,11 @@ impl DetailsSheet {
             thumb_overlay.add_overlay(&dur_label);
         }
 
-        let thumb_aspect = AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
-        thumb_aspect.set_hexpand(true);
-        thumb_aspect.set_child(Some(&thumb_overlay));
-
         let thumb_v_clamp = adw::Clamp::builder()
             .orientation(Orientation::Vertical)
             .maximum_size(270)
             .tightening_threshold(270)
-            .child(&thumb_aspect)
+            .child(&thumb_overlay)
             .build();
         let thumb_h_clamp = adw::Clamp::builder()
             .orientation(Orientation::Horizontal)
@@ -101,7 +98,12 @@ impl DetailsSheet {
         let channel_row = GtkBox::new(Orientation::Horizontal, 12);
         channel_row.set_valign(Align::Center);
 
-        let avatar = adw::Avatar::new(36, Some(&summary.channel_name), true);
+        let avatar_label = if !summary.channel_name.is_empty() {
+            &summary.channel_name
+        } else {
+            &summary.title
+        };
+        let avatar = adw::Avatar::new(36, Some(avatar_label), true);
         actions.image_loader.load_into_avatar(
             &summary.channel_id,
             &summary.channel_avatar_url,
@@ -110,7 +112,12 @@ impl DetailsSheet {
         channel_row.append(&avatar);
 
         let channel_info = GtkBox::new(Orientation::Vertical, 2);
-        let channel_name = Label::new(Some(&summary.channel_name));
+        let disp_chan = if summary.channel_name.is_empty() {
+            "YouTube"
+        } else {
+            &summary.channel_name
+        };
+        let channel_name = Label::new(Some(disp_chan));
         channel_name.set_halign(Align::Start);
         channel_name.set_xalign(0.0);
         channel_name.add_css_class("yr-title");
