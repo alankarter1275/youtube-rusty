@@ -50,6 +50,8 @@ pub struct ChannelPage {
     status_page: adw::StatusPage,
     active_tab: Cell<ChannelTab>,
     is_narrow: Cell<bool>,
+    grid_cols: Cell<u32>,
+    shorts_cols: Cell<u32>,
     is_loading: Cell<bool>,
     request_seq: Cell<u64>,
     date_filter: Cell<UploadDateFilter>,
@@ -73,6 +75,8 @@ impl ChannelPage {
         store: Arc<SubscriptionStore>,
         on_play_shorts_queue: Rc<dyn Fn(Vec<VideoSummary>, usize)>,
         narrow: bool,
+        grid_cols: u32,
+        shorts_cols: u32,
     ) -> Rc<Self> {
         let root_box = GtkBox::new(Orientation::Vertical, 0);
         root_box.set_hexpand(true);
@@ -192,12 +196,12 @@ impl ChannelPage {
 
         let flow_box = FlowBox::new();
         flow_box.set_valign(Align::Start);
-        flow_box.set_max_children_per_line(if narrow { 1 } else { 4 });
-        flow_box.set_min_children_per_line(1);
+        flow_box.set_max_children_per_line(grid_cols);
+        flow_box.set_min_children_per_line(grid_cols);
         flow_box.set_selection_mode(SelectionMode::None);
         flow_box.set_column_spacing(20);
         flow_box.set_row_spacing(24);
-        flow_box.set_homogeneous(false);
+        flow_box.set_homogeneous(true);
         flow_box.set_margin_start(28);
         flow_box.set_margin_end(28);
         flow_box.set_margin_bottom(32);
@@ -254,6 +258,8 @@ impl ChannelPage {
             status_page,
             active_tab: Cell::new(ChannelTab::Videos),
             is_narrow: Cell::new(narrow),
+            grid_cols: Cell::new(grid_cols),
+            shorts_cols: Cell::new(shorts_cols),
             is_loading: Cell::new(true),
             request_seq: Cell::new(0),
             date_filter: Cell::new(UploadDateFilter::AnyTime),
@@ -266,7 +272,7 @@ impl ChannelPage {
         });
 
         this.wire_signals();
-        this.set_narrow_mode(narrow);
+        this.set_layout(narrow, grid_cols, shorts_cols);
         this.show_skeletons();
 
         this
@@ -761,8 +767,10 @@ impl ChannelPage {
         });
     }
 
-    pub fn set_narrow_mode(&self, narrow: bool) {
+    pub fn set_layout(&self, narrow: bool, grid_cols: u32, shorts_cols: u32) {
         self.is_narrow.set(narrow);
+        self.grid_cols.set(grid_cols);
+        self.shorts_cols.set(shorts_cols);
         self.search_entry.set_visible(!narrow);
         self.toolbar_box.set_margin_start(if narrow { 16 } else { 28 });
         self.toolbar_box.set_margin_end(if narrow { 16 } else { 28 });
@@ -772,16 +780,18 @@ impl ChannelPage {
     }
 
     fn update_grid_columns(&self) {
-        let narrow = self.is_narrow.get();
+        self.flow_box.set_homogeneous(true);
         match self.active_tab.get() {
             ChannelTab::Videos => {
-                self.flow_box
-                    .set_max_children_per_line(if narrow { 1 } else { 4 });
+                let cols = self.grid_cols.get();
+                self.flow_box.set_min_children_per_line(cols);
+                self.flow_box.set_max_children_per_line(cols);
                 self.flow_box.set_column_spacing(20);
             }
             ChannelTab::Shorts => {
-                self.flow_box
-                    .set_max_children_per_line(if narrow { 2 } else { 6 });
+                let cols = self.shorts_cols.get();
+                self.flow_box.set_min_children_per_line(cols);
+                self.flow_box.set_max_children_per_line(cols);
                 self.flow_box.set_column_spacing(14);
             }
         }
@@ -849,8 +859,10 @@ impl ChannelPage {
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
-        self.flow_box
-            .set_max_children_per_line(if self.is_narrow.get() { 1 } else { 4 });
+        let cols = self.grid_cols.get();
+        self.flow_box.set_homogeneous(true);
+        self.flow_box.set_min_children_per_line(cols);
+        self.flow_box.set_max_children_per_line(cols);
         for _ in 0..8 {
             self.flow_box.append(&VideoCard::new_skeleton());
         }

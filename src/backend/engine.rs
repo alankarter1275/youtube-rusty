@@ -99,16 +99,115 @@ impl Engine {
             .collect())
     }
 
-    pub async fn trending(&self) -> Result<Vec<VideoSummary>, String> {
-        let items = self
+    pub async fn category_feed(&self, category: &str) -> Result<Vec<VideoSummary>, String> {
+        let filter = SearchFilter::new()
+            .item_type(ItemType::Video)
+            .date(UploadDate::Week);
+
+        let items = match self
             .rp
             .query()
-            .trending()
+            .search_filter::<VideoItem, _>(category, &filter)
             .await
-            .map_err(|e| format!("Trending error: {e}"))?;
+        {
+            Ok(res) if !res.items.items.is_empty() => res.items.items,
+            _ => {
+                self.rp
+                    .query()
+                    .search::<VideoItem, _>(category)
+                    .await
+                    .map_err(|e| format!("Category error: {e}"))?
+                    .items
+                    .items
+            }
+        };
 
         Ok(items
             .into_iter()
+            .filter(|it| !it.is_short)
+            .map(|it| map_video_item(it, None, false))
+            .collect())
+    }
+
+    pub async fn trending(&self) -> Result<Vec<VideoSummary>, String> {
+        // YouTube retired the legacy FEtrending browse endpoint (HTTP 400).
+        // Build a concurrent discovery feed from popular full-length uploads this week.
+        let topics = ["music", "gaming", "technology", "news"];
+        let mut join_set = JoinSet::new();
+
+        for (idx, topic) in topics.into_iter().enumerate() {
+            let rp = self.rp.clone();
+            join_set.spawn(async move {
+                let filter = SearchFilter::new()
+                    .item_type(ItemType::Video)
+                    .date(UploadDate::Week);
+                let res = rp
+                    .query()
+                    .search_filter::<VideoItem, _>(topic, &filter)
+                    .await
+                    .map(|r| r.items.items)
+                    .map_err(|e| e.to_string());
+                (idx, res)
+            });
+        }
+
+        let mut buckets: Vec<Vec<VideoSummary>> = vec![Vec::new(); topics.len()];
+        let mut last_err = None;
+
+        while let Some(joined) = join_set.join_next().await {
+            if let Ok((idx, res)) = joined {
+                match res {
+                    Ok(items) => {
+                        buckets[idx] = items
+                            .into_iter()
+                            .filter(|it| !it.is_short && it.duration.unwrap_or(120) >= 60)
+                            .map(|it| map_video_item(it, None, false))
+                            .collect();
+                    }
+                    Err(err) => last_err = Some(err),
+                }
+            }
+        }
+
+        // Interleave round-robin across topics and deduplicate by video ID
+        let mut merged = Vec::new();
+        let mut seen = HashSet::new();
+        let max_len = buckets.iter().map(|b| b.len()).max().unwrap_or(0);
+        for i in 0..max_len {
+            for bucket in &buckets {
+                if let Some(v) = bucket.get(i) {
+                    if seen.insert(v.id.clone()) {
+                        merged.push(v.clone());
+                        if merged.len() >= 28 {
+                            return Ok(merged);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !merged.is_empty() {
+            return Ok(merged);
+        }
+
+        // Final fallback to general search if filtered queries returned nothing
+        let fallback = self
+            .rp
+            .query()
+            .search::<VideoItem, _>("popular videos")
+            .await
+            .map_err(|e| {
+                format!(
+                    "Trending error: {}",
+                    last_err.unwrap_or_else(|| e.to_string())
+                )
+            })?;
+
+        Ok(fallback
+            .items
+            .items
+            .into_iter()
+            .filter(|it| !it.is_short)
             .map(|it| map_video_item(it, None, false))
             .collect())
     }

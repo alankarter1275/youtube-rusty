@@ -83,6 +83,8 @@ pub struct MainWindow {
     pub mpv_pos: Cell<f64>,
     pub mpv_duration: Cell<f64>,
     is_narrow: Cell<bool>,
+    grid_cols: Cell<u32>,
+    shorts_cols: Cell<u32>,
     view_mode: Cell<ViewMode>,
     active_view: RefCell<ActiveView>,
     request_seq: Cell<u64>,
@@ -104,9 +106,10 @@ impl MainWindow {
     pub fn new(app: &adw::Application) -> Rc<Self> {
         let theme_provider = load_custom_css();
 
-        // HeaderBar: borderless, blends into background
+        // HeaderBar: borderless, no window close button, centered search bar
         let header_bar = adw::HeaderBar::new();
-        header_bar.set_show_title(false);
+        header_bar.set_show_end_title_buttons(false);
+        header_bar.set_show_start_title_buttons(false);
 
         let back_btn = Button::builder()
             .icon_name("go-previous-symbolic")
@@ -117,9 +120,14 @@ impl MainWindow {
         header_bar.pack_start(&back_btn);
 
         // Centered Search Bar: max 420px
-        let search_clamp = adw::Clamp::builder().maximum_size(420).build();
+        let search_clamp = adw::Clamp::builder()
+            .maximum_size(420)
+            .tightening_threshold(300)
+            .hexpand(true)
+            .build();
         let search_entry = SearchEntry::builder()
             .placeholder_text("Search YouTube...")
+            .width_request(280)
             .hexpand(true)
             .build();
         search_entry.add_css_class("yr-search");
@@ -283,11 +291,11 @@ impl MainWindow {
         let flow_box = FlowBox::new();
         flow_box.set_valign(Align::Start);
         flow_box.set_max_children_per_line(4);
-        flow_box.set_min_children_per_line(1);
+        flow_box.set_min_children_per_line(4);
         flow_box.set_selection_mode(SelectionMode::None);
         flow_box.set_column_spacing(20);
         flow_box.set_row_spacing(24);
-        flow_box.set_homogeneous(false);
+        flow_box.set_homogeneous(true);
         flow_box.set_margin_start(28);
         flow_box.set_margin_end(28);
         flow_box.set_margin_bottom(32);
@@ -409,6 +417,8 @@ impl MainWindow {
             mpv_pos: Cell::new(0.0),
             mpv_duration: Cell::new(0.0),
             is_narrow: Cell::new(false),
+            grid_cols: Cell::new(4),
+            shorts_cols: Cell::new(6),
             view_mode: Cell::new(ViewMode::Grid),
             active_view: RefCell::new(ActiveView::HomeTrending),
             request_seq: Cell::new(0),
@@ -528,42 +538,38 @@ impl MainWindow {
     }
 
     fn setup_breakpoint(self: &Rc<Self>, bottom_bar: &GtkBox) {
-        if let Ok(cond) = adw::BreakpointCondition::parse("max-width: 600px") {
-            let breakpoint = adw::Breakpoint::new(cond);
+        let tiers: [(&str, bool, u32, u32); 4] = [
+            ("max-width: 600px", true, 1, 2),
+            ("min-width: 601px and max-width: 900px", false, 2, 3),
+            ("min-width: 901px and max-width: 1180px", false, 3, 4),
+            ("min-width: 1181px", false, 4, 6),
+        ];
 
-            let weak_narrow = Rc::downgrade(self);
-            let b_bar_narrow = bottom_bar.clone();
-            breakpoint.connect_apply(move |_| {
-                if let Some(w) = weak_narrow.upgrade() {
-                    w.is_narrow.set(true);
-                    w.rail.container.set_visible(false);
-                    b_bar_narrow.set_visible(true);
-                    w.player_card.set_narrow_mode(true);
-                    w.update_flow_columns();
-                    w.notify_channels_narrow(true);
-                }
-            });
-
-            let weak_wide = Rc::downgrade(self);
-            let b_bar_wide = bottom_bar.clone();
-            breakpoint.connect_unapply(move |_| {
-                if let Some(w) = weak_wide.upgrade() {
-                    w.is_narrow.set(false);
-                    w.rail.container.set_visible(true);
-                    b_bar_wide.set_visible(false);
-                    w.player_card.set_narrow_mode(false);
-                    w.update_flow_columns();
-                    w.notify_channels_narrow(false);
-                }
-            });
-
-            self.window.add_breakpoint(breakpoint);
+        for (cond_str, narrow, g_cols, s_cols) in tiers {
+            if let Ok(cond) = adw::BreakpointCondition::parse(cond_str) {
+                let bp = adw::Breakpoint::new(cond);
+                let weak = Rc::downgrade(self);
+                let b_bar = bottom_bar.clone();
+                bp.connect_apply(move |_| {
+                    if let Some(w) = weak.upgrade() {
+                        w.is_narrow.set(narrow);
+                        w.grid_cols.set(g_cols);
+                        w.shorts_cols.set(s_cols);
+                        w.rail.container.set_visible(!narrow);
+                        b_bar.set_visible(narrow);
+                        w.player_card.set_narrow_mode(narrow);
+                        w.update_flow_columns();
+                        w.notify_channels_layout(narrow, g_cols, s_cols);
+                    }
+                });
+                self.window.add_breakpoint(bp);
+            }
         }
     }
 
-    fn notify_channels_narrow(&self, narrow: bool) {
+    fn notify_channels_layout(&self, narrow: bool, grid_cols: u32, shorts_cols: u32) {
         for cp in self.open_channels.borrow().iter() {
-            cp.set_narrow_mode(narrow);
+            cp.set_layout(narrow, grid_cols, shorts_cols);
         }
     }
 
@@ -599,20 +605,22 @@ impl MainWindow {
 
     fn update_flow_columns(&self) {
         let narrow = self.is_narrow.get();
+        let cols = self.grid_cols.get();
         self.flow_box.set_margin_start(if narrow { 16 } else { 28 });
         self.flow_box.set_margin_end(if narrow { 16 } else { 28 });
 
         match self.view_mode.get() {
             ViewMode::Grid => {
-                self.flow_box
-                    .set_max_children_per_line(if narrow { 1 } else { 4 });
-                self.flow_box.set_min_children_per_line(1);
+                self.flow_box.set_homogeneous(true);
+                self.flow_box.set_min_children_per_line(cols);
+                self.flow_box.set_max_children_per_line(cols);
                 self.flow_box.set_column_spacing(20);
                 self.flow_box.set_row_spacing(24);
             }
             ViewMode::SearchList => {
-                self.flow_box.set_max_children_per_line(1);
+                self.flow_box.set_homogeneous(false);
                 self.flow_box.set_min_children_per_line(1);
+                self.flow_box.set_max_children_per_line(1);
                 self.flow_box.set_column_spacing(0);
                 self.flow_box.set_row_spacing(14);
             }
@@ -1511,6 +1519,8 @@ impl MainWindow {
             self.subscription_store.clone(),
             on_play_shorts,
             self.is_narrow.get(),
+            self.grid_cols.get(),
+            self.shorts_cols.get(),
         );
 
         self.open_channels
@@ -1705,7 +1715,7 @@ impl MainWindow {
         let cat_ui = category.to_string();
 
         self.runtime.spawn(async move {
-            let res = engine.search(&cat).await;
+            let res = engine.category_feed(&cat).await;
             let _ = sender.send(res).await;
         });
 

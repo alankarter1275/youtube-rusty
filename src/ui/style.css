@@ -78,13 +78,17 @@ headerbar {
 .yr-rail-btn.active { background-color: @yr_accent; color: @yr_on_accent; }
 
 /* ---------- search + chips + buttons ---------- */
-entry.yr-search, searchentry.yr-search {
+.yr-search, entry.yr-search, searchentry.yr-search {
   background-color: alpha(#E8DDD5, 0.08);
+  color: @yr_text;
   border-radius: 10px;
-  border: none;
+  border: 1px solid alpha(#E8DDD5, 0.12);
   box-shadow: none;
   min-height: 36px;
   padding: 0 14px;
+}
+.yr-search:focus-within {
+  border-color: @yr_accent;
 }
 .yr-chip {
   border-radius: 999px;

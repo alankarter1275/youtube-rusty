@@ -1,7 +1,9 @@
 use crate::backend::history::HistoryEntry;
 use crate::backend::models::VideoSummary;
 use adw::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, GestureClick, Label, Orientation, Overlay, Picture};
+use gtk4::{
+    Align, AspectFrame, Box as GtkBox, Button, GestureClick, Label, Orientation, Overlay, Picture,
+};
 use libadwaita as adw;
 
 pub struct VideoCard {
@@ -17,17 +19,20 @@ impl VideoCard {
     /// 36px circular adw::Avatar, title (max 2 lines), `Channel · views`.
     pub fn new_grid(summary: &VideoSummary) -> Self {
         let root_box = GtkBox::new(Orientation::Vertical, 10);
-        root_box.set_width_request(280);
+        root_box.set_width_request(140);
+        root_box.set_hexpand(true);
         root_box.add_css_class("yr-card");
 
         let picture = Picture::new();
-        picture.set_width_request(280);
-        picture.set_height_request(158);
-        picture.set_can_shrink(false);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
         picture.set_content_fit(gtk4::ContentFit::Cover);
 
         let overlay = Overlay::new();
         overlay.set_child(Some(&picture));
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
         overlay.add_css_class("yr-thumb");
 
         if !summary.duration_text.is_empty() {
@@ -37,6 +42,10 @@ impl VideoCard {
             duration_label.set_valign(Align::End);
             overlay.add_overlay(&duration_label);
         }
+
+        let aspect = AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
+        aspect.set_hexpand(true);
+        aspect.set_child(Some(&overlay));
 
         let details_box = GtkBox::new(Orientation::Horizontal, 12);
         details_box.set_valign(Align::Start);
@@ -69,10 +78,12 @@ impl VideoCard {
         details_box.append(&avatar);
         details_box.append(&text_col);
 
-        root_box.append(&overlay);
+        root_box.append(&aspect);
         root_box.append(&details_box);
 
         let container = gtk4::FlowBoxChild::new();
+        container.set_hexpand(true);
+        container.set_valign(Align::Start);
         container.set_child(Some(&root_box));
 
         Self {
@@ -86,32 +97,39 @@ impl VideoCard {
     /// Loading Skeleton Card (opacity pulse 900ms)
     pub fn new_skeleton() -> gtk4::FlowBoxChild {
         let root_box = GtkBox::new(Orientation::Vertical, 10);
-        root_box.set_width_request(280);
+        root_box.set_width_request(140);
+        root_box.set_hexpand(true);
         root_box.add_css_class("yr-card");
 
         let thumb_box = GtkBox::new(Orientation::Vertical, 0);
-        thumb_box.set_width_request(280);
-        thumb_box.set_height_request(158);
+        thumb_box.set_hexpand(true);
+        thumb_box.set_vexpand(true);
         thumb_box.add_css_class("yr-thumb");
         thumb_box.add_css_class("yr-skeleton");
 
+        let aspect = AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
+        aspect.set_hexpand(true);
+        aspect.set_child(Some(&thumb_box));
+
         let details_box = GtkBox::new(Orientation::Horizontal, 12);
+
         let avatar_box = GtkBox::new(Orientation::Vertical, 0);
-        avatar_box.set_width_request(36);
-        avatar_box.set_height_request(36);
-        avatar_box.add_css_class("yr-skeleton");
+        avatar_box.set_size_request(36, 36);
         avatar_box.set_valign(Align::Start);
+        avatar_box.add_css_class("yr-skeleton");
+        avatar_box.add_css_class("yr-skeleton-circle");
 
         let text_col = GtkBox::new(Orientation::Vertical, 6);
         text_col.set_hexpand(true);
 
         let line1 = GtkBox::new(Orientation::Horizontal, 0);
-        line1.set_height_request(14);
+        line1.set_height_request(15);
+        line1.set_hexpand(true);
         line1.add_css_class("yr-skeleton");
 
         let line2 = GtkBox::new(Orientation::Horizontal, 0);
-        line2.set_height_request(12);
-        line2.set_width_request(140);
+        line2.set_height_request(13);
+        line2.set_width_request(110);
         line2.set_halign(Align::Start);
         line2.add_css_class("yr-skeleton");
 
@@ -121,10 +139,12 @@ impl VideoCard {
         details_box.append(&avatar_box);
         details_box.append(&text_col);
 
-        root_box.append(&thumb_box);
+        root_box.append(&aspect);
         root_box.append(&details_box);
 
         let container = gtk4::FlowBoxChild::new();
+        container.set_hexpand(true);
+        container.set_valign(Align::Start);
         container.set_child(Some(&root_box));
         container
     }
@@ -138,9 +158,9 @@ impl VideoCard {
         root_box.add_css_class("search-card");
 
         let picture = Picture::new();
-        picture.set_width_request(300);
-        picture.set_height_request(169);
-        picture.set_can_shrink(false);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
         picture.set_content_fit(gtk4::ContentFit::Cover);
 
         let overlay = Overlay::new();
@@ -155,6 +175,8 @@ impl VideoCard {
             duration_label.set_valign(Align::End);
             overlay.add_overlay(&duration_label);
         }
+
+        let thumb_clamped = clamp_fixed_size(&overlay, 300, 169);
 
         let info_box = GtkBox::new(Orientation::Vertical, 6);
         info_box.set_hexpand(true);
@@ -207,7 +229,7 @@ impl VideoCard {
             info_box.append(&desc_label);
         }
 
-        root_box.append(&overlay);
+        root_box.append(&thumb_clamped);
         root_box.append(&info_box);
 
         let container = gtk4::FlowBoxChild::new();
@@ -232,6 +254,7 @@ impl VideoCard {
         thumb_box.set_size_request(300, 169);
         thumb_box.add_css_class("yr-thumb");
         thumb_box.add_css_class("yr-skeleton");
+        let thumb_clamped = clamp_fixed_size(&thumb_box, 300, 169);
 
         let info_box = GtkBox::new(Orientation::Vertical, 10);
         info_box.set_hexpand(true);
@@ -240,7 +263,7 @@ impl VideoCard {
 
         let line_title = GtkBox::new(Orientation::Horizontal, 0);
         line_title.set_height_request(18);
-        line_title.set_width_request(360);
+        line_title.set_width_request(320);
         line_title.set_halign(Align::Start);
         line_title.add_css_class("yr-skeleton");
 
@@ -256,7 +279,7 @@ impl VideoCard {
 
         let line_desc = GtkBox::new(Orientation::Horizontal, 0);
         line_desc.set_height_request(14);
-        line_desc.set_width_request(420);
+        line_desc.set_width_request(380);
         line_desc.set_halign(Align::Start);
         line_desc.add_css_class("yr-skeleton");
 
@@ -264,7 +287,7 @@ impl VideoCard {
         info_box.append(&ch_row);
         info_box.append(&line_desc);
 
-        root_box.append(&thumb_box);
+        root_box.append(&thumb_clamped);
         root_box.append(&info_box);
 
         let container = gtk4::FlowBoxChild::new();
@@ -284,9 +307,9 @@ impl VideoCard {
         click_target.set_hexpand(true);
 
         let picture = Picture::new();
-        picture.set_width_request(200);
-        picture.set_height_request(112);
-        picture.set_can_shrink(false);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
         picture.set_content_fit(gtk4::ContentFit::Cover);
 
         let overlay = Overlay::new();
@@ -301,6 +324,8 @@ impl VideoCard {
             duration_label.set_valign(Align::End);
             overlay.add_overlay(&duration_label);
         }
+
+        let thumb_clamped = clamp_fixed_size(&overlay, 200, 112);
 
         let info_box = GtkBox::new(Orientation::Vertical, 4);
         info_box.set_hexpand(true);
@@ -332,7 +357,7 @@ impl VideoCard {
         info_box.append(&meta_label);
         info_box.append(&watched_label);
 
-        click_target.append(&overlay);
+        click_target.append(&thumb_clamped);
         click_target.append(&info_box);
 
         let remove_btn = Button::builder()
@@ -365,17 +390,20 @@ impl VideoCard {
     /// Shorts Card: 6-column 9:16 aspect ratio vertical card
     pub fn new_short(summary: &VideoSummary) -> Self {
         let root_box = GtkBox::new(Orientation::Vertical, 8);
-        root_box.set_width_request(180);
+        root_box.set_width_request(100);
+        root_box.set_hexpand(true);
         root_box.add_css_class("yr-card");
 
         let picture = Picture::new();
-        picture.set_width_request(180);
-        picture.set_height_request(320);
-        picture.set_can_shrink(false);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
         picture.set_content_fit(gtk4::ContentFit::Cover);
 
         let overlay = Overlay::new();
         overlay.set_child(Some(&picture));
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
         overlay.add_css_class("yr-thumb");
 
         if !summary.duration_text.is_empty() {
@@ -385,6 +413,10 @@ impl VideoCard {
             duration_label.set_valign(Align::End);
             overlay.add_overlay(&duration_label);
         }
+
+        let aspect = AspectFrame::new(0.5, 0.5, 9.0 / 16.0, false);
+        aspect.set_hexpand(true);
+        aspect.set_child(Some(&overlay));
 
         let title_label = Label::new(Some(&summary.title));
         title_label.set_wrap(true);
@@ -398,13 +430,16 @@ impl VideoCard {
         let views_label = Label::new(Some(&summary.view_count_text));
         views_label.set_halign(Align::Start);
         views_label.set_xalign(0.0);
+        views_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         views_label.add_css_class("yr-meta");
 
-        root_box.append(&overlay);
+        root_box.append(&aspect);
         root_box.append(&title_label);
         root_box.append(&views_label);
 
         let container = gtk4::FlowBoxChild::new();
+        container.set_hexpand(true);
+        container.set_valign(Align::Start);
         container.set_child(Some(&root_box));
 
         let avatar = adw::Avatar::new(24, Some(&summary.channel_name), true);
@@ -425,6 +460,24 @@ impl VideoCard {
         });
         self.click_target.add_controller(click);
     }
+}
+
+fn clamp_fixed_size(widget: &impl IsA<gtk4::Widget>, width: i32, height: i32) -> adw::Clamp {
+    let v_clamp = adw::Clamp::builder()
+        .orientation(Orientation::Vertical)
+        .maximum_size(height)
+        .tightening_threshold(height)
+        .child(widget)
+        .build();
+    adw::Clamp::builder()
+        .orientation(Orientation::Horizontal)
+        .maximum_size(width)
+        .tightening_threshold(width)
+        .halign(Align::Start)
+        .valign(Align::Start)
+        .hexpand(false)
+        .child(&v_clamp)
+        .build()
 }
 
 fn join_non_empty(parts: &[&str]) -> String {

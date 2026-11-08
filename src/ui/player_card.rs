@@ -1,10 +1,11 @@
 use crate::backend::models::{format_duration, format_queue_total_duration, VideoSummary};
 use crate::ui::image_loader::ImageLoader;
-use gtk4::prelude::*;
+use adw::prelude::*;
 use gtk4::{
     gdk, glib, Align, Box as GtkBox, Button, DragSource, DropTarget, EventControllerKey,
     GestureClick, Label, Orientation, Overlay, Picture, ProgressBar, ScrolledWindow, Separator,
 };
+use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +15,12 @@ static SHUFFLE_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct PlayerCard {
     pub root: GtkBox,
+    inner_clamp: adw::Clamp,
     image_loader: Rc<ImageLoader>,
     thumb_pic: Picture,
+    thumb_overlay: Overlay,
+    thumb_h_clamp: adw::Clamp,
+    thumb_v_clamp: adw::Clamp,
     title_label: Label,
     channel_btn: Button,
     queue_pos_label: Label,
@@ -50,7 +55,7 @@ pub struct PlayerCard {
 
 impl PlayerCard {
     pub fn new(image_loader: Rc<ImageLoader>) -> Rc<Self> {
-        let root = GtkBox::new(Orientation::Vertical, 10);
+        let root = GtkBox::new(Orientation::Vertical, 0);
         root.set_width_request(370);
         root.set_halign(Align::End);
         root.set_valign(Align::End);
@@ -58,19 +63,44 @@ impl PlayerCard {
         root.add_css_class("yr-player");
         root.set_visible(false);
 
+        let body = GtkBox::new(Orientation::Vertical, 10);
+        body.set_hexpand(true);
+        let inner_clamp = adw::Clamp::builder()
+            .maximum_size(342)
+            .tightening_threshold(342)
+            .child(&body)
+            .build();
+        root.append(&inner_clamp);
+
         // --- Collapsed Top Row ---
         let top_row = GtkBox::new(Orientation::Horizontal, 12);
         top_row.set_valign(Align::Center);
 
         let thumb_pic = Picture::new();
-        thumb_pic.set_width_request(96);
-        thumb_pic.set_height_request(54);
-        thumb_pic.set_can_shrink(false);
+        thumb_pic.set_can_shrink(true);
+        thumb_pic.set_hexpand(true);
+        thumb_pic.set_vexpand(true);
         thumb_pic.set_content_fit(gtk4::ContentFit::Cover);
 
         let thumb_overlay = Overlay::new();
         thumb_overlay.set_child(Some(&thumb_pic));
+        thumb_overlay.set_size_request(96, 54);
         thumb_overlay.add_css_class("yr-thumb");
+
+        let thumb_v_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Vertical)
+            .maximum_size(54)
+            .tightening_threshold(54)
+            .child(&thumb_overlay)
+            .build();
+        let thumb_h_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Horizontal)
+            .maximum_size(96)
+            .tightening_threshold(96)
+            .halign(Align::Start)
+            .valign(Align::Center)
+            .child(&thumb_v_clamp)
+            .build();
 
         let text_col = GtkBox::new(Orientation::Vertical, 2);
         text_col.set_hexpand(true);
@@ -116,17 +146,17 @@ impl PlayerCard {
         close_btn.add_css_class("flat");
         close_btn.add_css_class("circular");
 
-        top_row.append(&thumb_overlay);
+        top_row.append(&thumb_h_clamp);
         top_row.append(&text_col);
         top_row.append(&narrow_play_pause_btn);
         top_row.append(&close_btn);
-        root.append(&top_row);
+        body.append(&top_row);
 
         // --- Progress Bar & Times ---
         let progress_bar = ProgressBar::new();
         progress_bar.add_css_class("yr-progress");
         progress_bar.set_fraction(0.0);
-        root.append(&progress_bar);
+        body.append(&progress_bar);
 
         let times_row = GtkBox::new(Orientation::Horizontal, 0);
         let time_elapsed_label = Label::new(Some("0:00"));
@@ -143,7 +173,7 @@ impl PlayerCard {
         times_row.append(&time_elapsed_label);
         times_row.append(&spacer);
         times_row.append(&time_total_label);
-        root.append(&times_row);
+        body.append(&times_row);
 
         // --- Controls Row ---
         let controls_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -182,7 +212,7 @@ impl PlayerCard {
         controls_row.append(&next_btn);
         controls_row.append(&ctrl_spacer);
         controls_row.append(&expand_btn);
-        root.append(&controls_row);
+        body.append(&controls_row);
 
         // --- Expanded Queue Section ---
         let queue_box = GtkBox::new(Orientation::Vertical, 8);
@@ -226,12 +256,16 @@ impl PlayerCard {
         let queue_list = GtkBox::new(Orientation::Vertical, 4);
         scrolled.set_child(Some(&queue_list));
         queue_box.append(&scrolled);
-        root.append(&queue_box);
+        body.append(&queue_box);
 
         let card = Rc::new(Self {
             root,
+            inner_clamp,
             image_loader,
             thumb_pic,
+            thumb_overlay,
+            thumb_h_clamp,
+            thumb_v_clamp,
             title_label,
             channel_btn,
             queue_pos_label,
@@ -405,8 +439,13 @@ impl PlayerCard {
             self.root.set_width_request(-1);
             self.root.set_halign(Align::Fill);
             self.root.add_css_class("yr-player-narrow");
-            self.thumb_pic.set_width_request(64);
-            self.thumb_pic.set_height_request(36);
+            self.inner_clamp.set_maximum_size(2400);
+            self.inner_clamp.set_tightening_threshold(2400);
+            self.thumb_overlay.set_size_request(64, 36);
+            self.thumb_h_clamp.set_maximum_size(64);
+            self.thumb_h_clamp.set_tightening_threshold(64);
+            self.thumb_v_clamp.set_maximum_size(36);
+            self.thumb_v_clamp.set_tightening_threshold(36);
             self.close_btn.set_valign(Align::Center);
             self.narrow_play_pause_btn.set_visible(true);
             self.progress_bar.set_visible(false);
@@ -417,8 +456,13 @@ impl PlayerCard {
             self.root.set_width_request(370);
             self.root.set_halign(Align::End);
             self.root.remove_css_class("yr-player-narrow");
-            self.thumb_pic.set_width_request(96);
-            self.thumb_pic.set_height_request(54);
+            self.inner_clamp.set_maximum_size(342);
+            self.inner_clamp.set_tightening_threshold(342);
+            self.thumb_overlay.set_size_request(96, 54);
+            self.thumb_h_clamp.set_maximum_size(96);
+            self.thumb_h_clamp.set_tightening_threshold(96);
+            self.thumb_v_clamp.set_maximum_size(54);
+            self.thumb_v_clamp.set_tightening_threshold(54);
             self.close_btn.set_valign(Align::Start);
             self.narrow_play_pause_btn.set_visible(false);
             self.progress_bar.set_visible(true);
@@ -668,15 +712,29 @@ impl PlayerCard {
             handle.set_tooltip_text(Some("Drag to reorder"));
 
             let thumb = Picture::new();
-            thumb.set_width_request(64);
-            thumb.set_height_request(36);
-            thumb.set_can_shrink(false);
+            thumb.set_can_shrink(true);
+            thumb.set_hexpand(true);
+            thumb.set_vexpand(true);
             thumb.set_content_fit(gtk4::ContentFit::Cover);
 
             let row_thumb_overlay = Overlay::new();
             row_thumb_overlay.set_child(Some(&thumb));
             row_thumb_overlay.add_css_class("yr-thumb");
             row_thumb_overlay.set_size_request(64, 36);
+
+            let row_v_clamp = adw::Clamp::builder()
+                .orientation(Orientation::Vertical)
+                .maximum_size(36)
+                .tightening_threshold(36)
+                .child(&row_thumb_overlay)
+                .build();
+            let row_h_clamp = adw::Clamp::builder()
+                .orientation(Orientation::Horizontal)
+                .maximum_size(64)
+                .tightening_threshold(64)
+                .valign(Align::Center)
+                .child(&row_v_clamp)
+                .build();
 
             if !item.thumbnail_url.is_empty() {
                 self.image_loader
@@ -709,7 +767,7 @@ impl PlayerCard {
             text_box.append(&row_chan);
 
             click_area.append(&handle);
-            click_area.append(&row_thumb_overlay);
+            click_area.append(&row_h_clamp);
             click_area.append(&text_box);
 
             // Click row -> jump to track `i`

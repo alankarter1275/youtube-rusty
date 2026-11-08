@@ -3,8 +3,8 @@ use crate::player::mpv::Quality;
 use crate::ui::image_loader::ImageLoader;
 use gtk4::gdk::Rectangle;
 use gtk4::{
-    Align, Box as GtkBox, Button, GestureClick, GestureLongPress, Label, Orientation, Overlay,
-    Picture, Popover, Separator, ToggleButton,
+    Align, AspectFrame, Box as GtkBox, Button, GestureClick, GestureLongPress, Label, Orientation,
+    Overlay, Picture, Popover, Separator, ToggleButton,
 };
 use libadwaita as adw;
 use adw::prelude::*;
@@ -45,8 +45,9 @@ impl DetailsSheet {
 
         // Top Thumbnail (16:9)
         let picture = Picture::new();
-        picture.set_width_request(480);
-        picture.set_height_request(270);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(true);
+        picture.set_vexpand(true);
         picture.set_content_fit(gtk4::ContentFit::Cover);
         actions
             .image_loader
@@ -54,6 +55,8 @@ impl DetailsSheet {
 
         let thumb_overlay = Overlay::new();
         thumb_overlay.set_child(Some(&picture));
+        thumb_overlay.set_hexpand(true);
+        thumb_overlay.set_vexpand(true);
         thumb_overlay.add_css_class("yr-thumb");
 
         if !summary.duration_text.is_empty() {
@@ -64,7 +67,24 @@ impl DetailsSheet {
             thumb_overlay.add_overlay(&dur_label);
         }
 
-        content_box.append(&thumb_overlay);
+        let thumb_aspect = AspectFrame::new(0.5, 0.5, 16.0 / 9.0, false);
+        thumb_aspect.set_hexpand(true);
+        thumb_aspect.set_child(Some(&thumb_overlay));
+
+        let thumb_v_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Vertical)
+            .maximum_size(270)
+            .tightening_threshold(270)
+            .child(&thumb_aspect)
+            .build();
+        let thumb_h_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Horizontal)
+            .maximum_size(480)
+            .tightening_threshold(480)
+            .child(&thumb_v_clamp)
+            .build();
+
+        content_box.append(&thumb_h_clamp);
 
         // Title (Playfair 22, max 2 lines)
         let title_label = Label::new(Some(&summary.title));
