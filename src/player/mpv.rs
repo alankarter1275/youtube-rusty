@@ -35,13 +35,42 @@ impl Quality {
         }
     }
 
-    pub fn ytdl_format(self) -> Option<&'static str> {
+    pub fn target_height(self) -> Option<u32> {
         match self {
-            Quality::P360 => Some("bestvideo[height<=360]+bestaudio/best[height<=360]/best"),
-            Quality::P720 => Some("bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
-            Quality::P1080 => Some("bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
+            Quality::P360 => Some(360),
+            Quality::P720 => Some(720),
+            Quality::P1080 => Some(1080),
             Quality::AudioOnly => None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPlayback {
+    pub primary_url: String,
+    pub audio_url: Option<String>,
+    pub user_agent: String,
+    pub is_audio_only: bool,
+    pub duration_secs: Option<u64>,
+}
+
+impl ResolvedPlayback {
+    /// Builds either a direct stream URL (for muxed MP4, HLS manifests, or audio-only)
+    /// or MPV's native multi-track `edl://` timeline URL when separate adaptive video + audio
+    /// streams are combined (works across all MPV versions with `--ytdl=no`).
+    pub fn to_loadfile_url(&self) -> String {
+        if let Some(ref aud) = self.audio_url {
+            if !aud.is_empty() && !self.is_audio_only {
+                return format!(
+                    "edl://!new_stream;!no_clip;!no_chapters;%{}%{};!new_stream;!no_clip;!no_chapters;%{}%{}",
+                    self.primary_url.len(),
+                    self.primary_url,
+                    aud.len(),
+                    aud,
+                );
+            }
+        }
+        self.primary_url.clone()
     }
 }
 
@@ -57,5 +86,31 @@ mod tests {
         assert_eq!(Quality::from_setting("audio"), Quality::AudioOnly);
         assert_eq!(Quality::from_setting("Audio only"), Quality::AudioOnly);
         assert_eq!(Quality::from_setting("unknown"), Quality::P360);
+        assert_eq!(Quality::P720.target_height(), Some(720));
+        assert_eq!(Quality::AudioOnly.target_height(), None);
+    }
+
+    #[test]
+    fn test_edl_loadfile_url() {
+        let muxed = ResolvedPlayback {
+            primary_url: "https://example.com/v.mp4".to_string(),
+            audio_url: None,
+            user_agent: "UA".to_string(),
+            is_audio_only: false,
+            duration_secs: Some(60),
+        };
+        assert_eq!(muxed.to_loadfile_url(), "https://example.com/v.mp4");
+
+        let adaptive = ResolvedPlayback {
+            primary_url: "https://example.com/video".to_string(),
+            audio_url: Some("https://example.com/audio".to_string()),
+            user_agent: "UA".to_string(),
+            is_audio_only: false,
+            duration_secs: Some(60),
+        };
+        assert_eq!(
+            adaptive.to_loadfile_url(),
+            "edl://!new_stream;!no_clip;!no_chapters;%25%https://example.com/video;!new_stream;!no_clip;!no_chapters;%25%https://example.com/audio"
+        );
     }
 }

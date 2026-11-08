@@ -1,12 +1,14 @@
 use crate::backend::history::HistoryEntry;
-use crate::backend::models::VideoSummary;
+use crate::backend::models::{ChannelSearchSummary, PlaylistSearchSummary, VideoSummary};
+use crate::backend::playlists::SavedPlaylist;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use adw::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, EventSequenceState, GestureClick, Label, Orientation, Overflow,
-    Overlay, Picture, PropagationPhase,
+    Align, Box as GtkBox, Button, EventSequenceState, GestureClick, GestureLongPress, Label,
+    Orientation, Overflow, Overlay, Picture, PropagationPhase,
 };
 use libadwaita as adw;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ListCardLayout {
@@ -17,6 +19,7 @@ pub enum ListCardLayout {
 
 pub struct VideoCard {
     pub container: gtk4::FlowBoxChild,
+    pub highlight_target: GtkBox,
     pub click_target: GtkBox,
     pub channel_target: Option<GtkBox>,
     pub picture: Picture,
@@ -24,9 +27,7 @@ pub struct VideoCard {
 }
 
 impl VideoCard {
-    /// Grid View Card (Kalam Spec):
-    /// 16:9 thumbnail (radius 14, ContentFit::Cover), duration badge bottom-right,
-    /// 36px circular adw::Avatar, title (max 2 lines), `Channel · views`.
+    /// Grid View Card (Kalam Spec)
     pub fn new_grid(summary: &VideoSummary) -> Self {
         let root_box = GtkBox::new(Orientation::Vertical, 10);
         root_box.set_width_request(132);
@@ -113,6 +114,7 @@ impl VideoCard {
 
         Self {
             container,
+            highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
             picture,
@@ -120,7 +122,7 @@ impl VideoCard {
         }
     }
 
-    /// Loading Skeleton Card (opacity pulse 900ms)
+    /// Static Loading Skeleton Card (zero continuous frame-clock animation)
     pub fn new_skeleton() -> gtk4::FlowBoxChild {
         let root_box = GtkBox::new(Orientation::Vertical, 10);
         root_box.set_width_request(132);
@@ -180,10 +182,7 @@ impl VideoCard {
         container
     }
 
-    /// Responsive Search Result Card:
-    /// - Wide (>780px): 300x169 thumbnail left, rich metadata right (matches Search results.png)
-    /// - Compact (601..=780px): 208x117 thumbnail left so half-screen tiled windows never overflow
-    /// - Stacked (<=600px): vertical full-width card matching Narrow window.png
+    /// Responsive Search Result Card
     pub fn new_search(summary: &VideoSummary, layout: ListCardLayout) -> Self {
         if layout == ListCardLayout::Stacked {
             return Self::new_grid(summary);
@@ -286,6 +285,7 @@ impl VideoCard {
 
         Self {
             container,
+            highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
             picture,
@@ -293,7 +293,7 @@ impl VideoCard {
         }
     }
 
-    /// Responsive Search Skeleton Card (fluid width, zero fixed horizontal overflow)
+    /// Responsive Search Skeleton Card
     pub fn new_search_skeleton(layout: ListCardLayout) -> gtk4::FlowBoxChild {
         if layout == ListCardLayout::Stacked {
             return Self::new_skeleton();
@@ -354,7 +354,7 @@ impl VideoCard {
         container
     }
 
-    /// History Row Card (matches History.png, responsive down to narrow widths)
+    /// History Row Card
     pub fn new_history(
         entry: &HistoryEntry,
         layout: ListCardLayout,
@@ -438,6 +438,127 @@ impl VideoCard {
 
         Self {
             container,
+            highlight_target: root_box,
+            click_target,
+            channel_target: None,
+            picture,
+            avatar,
+        }
+    }
+
+    /// Playlist Track Row (supports editing controls on saved playlists)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_playlist_track(
+        video: &VideoSummary,
+        index: usize,
+        total: usize,
+        layout: ListCardLayout,
+        editable: bool,
+        on_move_up: impl Fn() + 'static,
+        on_move_down: impl Fn() + 'static,
+        on_remove: impl Fn() + 'static,
+    ) -> Self {
+        let (thumb_w, thumb_h, gap) = match layout {
+            ListCardLayout::Wide => (184, 104, 14),
+            ListCardLayout::Compact => (156, 88, 12),
+            ListCardLayout::Stacked => (120, 68, 10),
+        };
+
+        let root_box = GtkBox::new(Orientation::Horizontal, 8);
+        root_box.set_hexpand(true);
+        root_box.add_css_class("yr-history-row");
+
+        let click_target = GtkBox::new(Orientation::Horizontal, gap);
+        click_target.set_hexpand(true);
+        set_pointer(&click_target);
+
+        let idx_lbl = Label::new(Some(&format!("{}", index + 1)));
+        idx_lbl.add_css_class("yr-meta");
+        idx_lbl.set_width_chars(2);
+        idx_lbl.set_valign(Align::Center);
+        click_target.append(&idx_lbl);
+
+        let (picture, overlay) = make_thumb_overlay(&video.duration_text);
+        overlay.set_size_request(thumb_w, thumb_h);
+        let thumb_clamped = clamp_fixed_size(&overlay, thumb_w, thumb_h);
+        click_target.append(&thumb_clamped);
+
+        let info_box = GtkBox::new(Orientation::Vertical, 3);
+        info_box.set_hexpand(true);
+        info_box.set_valign(Align::Center);
+
+        let title_label = Label::new(Some(&video.title));
+        title_label.set_wrap(true);
+        title_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+        title_label.set_lines(2);
+        title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title_label.set_halign(Align::Start);
+        title_label.set_xalign(0.0);
+        title_label.add_css_class("yr-title");
+        info_box.append(&title_label);
+
+        let meta_text = join_non_empty(&[&video.channel_name, &video.view_count_text]);
+        if !meta_text.is_empty() {
+            let meta_label = Label::new(Some(&meta_text));
+            meta_label.add_css_class("yr-meta");
+            meta_label.set_halign(Align::Start);
+            meta_label.set_xalign(0.0);
+            meta_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            info_box.append(&meta_label);
+        }
+
+        click_target.append(&info_box);
+        root_box.append(&click_target);
+
+        if editable {
+            let controls = GtkBox::new(Orientation::Horizontal, 2);
+            controls.set_valign(Align::Center);
+
+            let up_btn = Button::builder()
+                .icon_name("go-up-symbolic")
+                .tooltip_text("Move up")
+                .sensitive(index > 0)
+                .build();
+            up_btn.add_css_class("flat");
+            up_btn.add_css_class("circular");
+            set_pointer(&up_btn);
+            up_btn.connect_clicked(move |_| on_move_up());
+
+            let down_btn = Button::builder()
+                .icon_name("go-down-symbolic")
+                .tooltip_text("Move down")
+                .sensitive(index + 1 < total)
+                .build();
+            down_btn.add_css_class("flat");
+            down_btn.add_css_class("circular");
+            set_pointer(&down_btn);
+            down_btn.connect_clicked(move |_| on_move_down());
+
+            let rm_btn = Button::builder()
+                .icon_name("window-close-symbolic")
+                .tooltip_text("Remove from playlist")
+                .build();
+            rm_btn.add_css_class("flat");
+            rm_btn.add_css_class("circular");
+            set_pointer(&rm_btn);
+            rm_btn.connect_clicked(move |_| on_remove());
+
+            controls.append(&up_btn);
+            controls.append(&down_btn);
+            controls.append(&rm_btn);
+            root_box.append(&controls);
+        }
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_focusable(false);
+        container.set_child(Some(&root_box));
+        container.set_hexpand(true);
+
+        let avatar = adw::Avatar::new(24, Some(&video.channel_name), true);
+
+        Self {
+            container,
+            highlight_target: root_box,
             click_target,
             channel_target: None,
             picture,
@@ -496,6 +617,7 @@ impl VideoCard {
 
         Self {
             container,
+            highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target: None,
             picture,
@@ -503,25 +625,72 @@ impl VideoCard {
         }
     }
 
-    pub fn connect_primary_click(&self, on_click: impl Fn() + 'static) {
-        let click = GestureClick::new();
-        click.set_button(1);
-        click.connect_released(move |gesture, _, _, _| {
-            gesture.set_state(EventSequenceState::Claimed);
-            on_click();
-        });
-        self.click_target.add_controller(click);
-    }
+    /// Unified mouse interaction model:
+    /// - Single left-click (`n_press == 1`): selects/highlights card ONLY
+    /// - Double left-click (`n_press == 2`) or middle-click: plays immediately in MPV
+    /// - Right-click (`button == 3`) or touch long-press: opens Video Details popup
+    pub fn connect_card_interactions(
+        &self,
+        on_select: impl Fn(&GtkBox) + 'static,
+        on_double_play: impl Fn() + 'static,
+        on_right_details: impl Fn() + 'static,
+    ) {
+        let on_select_rc = Rc::new(on_select);
+        let on_play_rc = Rc::new(on_double_play);
+        let on_details_rc = Rc::new(on_right_details);
 
-    /// Middle-click on any card plays immediately in MPV at default quality.
-    pub fn connect_middle_click(&self, on_middle: impl Fn() + 'static) {
-        let click = GestureClick::new();
-        click.set_button(2);
-        click.connect_released(move |gesture, _, _, _| {
-            gesture.set_state(EventSequenceState::Claimed);
-            on_middle();
+        // Button 1: single-click highlights, double-click plays in MPV
+        let left_click = GestureClick::new();
+        left_click.set_button(1);
+        let hl_left = self.highlight_target.clone();
+        let sel_left = on_select_rc.clone();
+        let play_left = on_play_rc.clone();
+        left_click.connect_pressed(move |gesture, n_press, _, _| {
+            sel_left(&hl_left);
+            if n_press == 2 {
+                gesture.set_state(EventSequenceState::Claimed);
+                play_left();
+            }
         });
-        self.click_target.add_controller(click);
+        self.click_target.add_controller(left_click);
+
+        // Button 2 (middle-click): play immediately in MPV
+        let mid_click = GestureClick::new();
+        mid_click.set_button(2);
+        let hl_mid = self.highlight_target.clone();
+        let sel_mid = on_select_rc.clone();
+        let play_mid = on_play_rc;
+        mid_click.connect_released(move |gesture, _, _, _| {
+            gesture.set_state(EventSequenceState::Claimed);
+            sel_mid(&hl_mid);
+            play_mid();
+        });
+        self.click_target.add_controller(mid_click);
+
+        // Button 3 (right-click): select + open DetailsSheet popup
+        let right_click = GestureClick::new();
+        right_click.set_button(3);
+        let hl_right = self.highlight_target.clone();
+        let sel_right = on_select_rc.clone();
+        let det_right = on_details_rc.clone();
+        right_click.connect_pressed(move |gesture, _, _, _| {
+            gesture.set_state(EventSequenceState::Claimed);
+            sel_right(&hl_right);
+            det_right();
+        });
+        self.click_target.add_controller(right_click);
+
+        // Long-press (touchscreens): open DetailsSheet popup
+        let long_press = GestureLongPress::new();
+        let hl_lp = self.highlight_target.clone();
+        let sel_lp = on_select_rc;
+        let det_lp = on_details_rc;
+        long_press.connect_pressed(move |gesture, _, _| {
+            gesture.set_state(EventSequenceState::Claimed);
+            sel_lp(&hl_lp);
+            det_lp();
+        });
+        self.click_target.add_controller(long_press);
     }
 
     /// Direct click on avatar / channel name navigates straight to the channel page.
@@ -539,6 +708,358 @@ impl VideoCard {
     }
 }
 
+pub struct ChannelResultCard {
+    pub container: gtk4::FlowBoxChild,
+    pub avatar: adw::Avatar,
+}
+
+impl ChannelResultCard {
+    pub fn new(
+        channel: &ChannelSearchSummary,
+        layout: ListCardLayout,
+        initially_subscribed: bool,
+        on_select: impl Fn(&GtkBox) + 'static,
+        on_open: impl Fn() + 'static,
+        on_toggle_sub: impl Fn() -> bool + 'static,
+    ) -> Self {
+        let av_size = if layout == ListCardLayout::Stacked { 52 } else { 72 };
+        let root_box = GtkBox::new(Orientation::Horizontal, 16);
+        root_box.set_hexpand(true);
+        root_box.add_css_class("yr-entity-card");
+
+        let click_area = GtkBox::new(Orientation::Horizontal, 16);
+        click_area.set_hexpand(true);
+        click_area.set_valign(Align::Center);
+        set_pointer(&click_area);
+
+        let avatar = adw::Avatar::new(av_size, Some(&channel.name), true);
+        avatar.set_valign(Align::Center);
+        click_area.append(&avatar);
+
+        let text_col = GtkBox::new(Orientation::Vertical, 4);
+        text_col.set_hexpand(true);
+        text_col.set_valign(Align::Center);
+
+        let name_lbl = Label::new(Some(&channel.name));
+        name_lbl.add_css_class("yr-search-title");
+        name_lbl.set_halign(Align::Start);
+        name_lbl.set_xalign(0.0);
+        name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        text_col.append(&name_lbl);
+
+        let meta_txt = join_non_empty(&[&channel.handle, &channel.subscriber_count_text]);
+        if !meta_txt.is_empty() {
+            let meta_lbl = Label::new(Some(&meta_txt));
+            meta_lbl.add_css_class("yr-meta");
+            meta_lbl.set_halign(Align::Start);
+            meta_lbl.set_xalign(0.0);
+            meta_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            text_col.append(&meta_lbl);
+        }
+
+        if !channel.description.is_empty() && layout != ListCardLayout::Stacked {
+            let desc_lbl = Label::new(Some(&channel.description));
+            desc_lbl.add_css_class("video-description");
+            desc_lbl.set_halign(Align::Start);
+            desc_lbl.set_xalign(0.0);
+            desc_lbl.set_lines(2);
+            desc_lbl.set_wrap(true);
+            desc_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            text_col.append(&desc_lbl);
+        }
+
+        click_area.append(&text_col);
+
+        let sub_btn = Button::with_label(if initially_subscribed {
+            "Subscribed"
+        } else {
+            "Subscribe"
+        });
+        sub_btn.add_css_class("yr-btn");
+        if !initially_subscribed {
+            sub_btn.add_css_class("primary");
+        }
+        sub_btn.set_valign(Align::Center);
+        set_pointer(&sub_btn);
+
+        sub_btn.connect_clicked(move |btn| {
+            let subbed = on_toggle_sub();
+            if subbed {
+                btn.set_label("Subscribed");
+                btn.remove_css_class("primary");
+            } else {
+                btn.set_label("Subscribe");
+                btn.add_css_class("primary");
+            }
+        });
+
+        let open_btn = Button::with_label("Open");
+        open_btn.add_css_class("yr-btn");
+        open_btn.set_valign(Align::Center);
+        set_pointer(&open_btn);
+
+        let on_open_rc = Rc::new(on_open);
+        let open_cb = on_open_rc.clone();
+        open_btn.connect_clicked(move |_| open_cb());
+
+        let click = GestureClick::new();
+        click.set_button(1);
+        let hl = root_box.clone();
+        click.connect_pressed(move |gesture, n_press, _, _| {
+            on_select(&hl);
+            if n_press == 2 {
+                gesture.set_state(EventSequenceState::Claimed);
+                on_open_rc();
+            }
+        });
+        click_area.add_controller(click);
+
+        root_box.append(&click_area);
+        if layout != ListCardLayout::Stacked {
+            root_box.append(&open_btn);
+        }
+        root_box.append(&sub_btn);
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_focusable(false);
+        container.set_hexpand(true);
+        container.set_child(Some(&root_box));
+
+        Self { container, avatar }
+    }
+}
+
+pub struct PlaylistResultCard {
+    pub container: gtk4::FlowBoxChild,
+    pub picture: Picture,
+}
+
+impl PlaylistResultCard {
+    pub fn new(
+        playlist: &PlaylistSearchSummary,
+        layout: ListCardLayout,
+        initially_saved: bool,
+        on_select: impl Fn(&GtkBox) + 'static,
+        on_open: impl Fn() + 'static,
+        on_save: impl Fn() + 'static,
+    ) -> Self {
+        let (thumb_w, thumb_h, gap) = match layout {
+            ListCardLayout::Wide => (260, 146, 18),
+            ListCardLayout::Compact => (196, 110, 14),
+            ListCardLayout::Stacked => (144, 81, 12),
+        };
+
+        let root_box = GtkBox::new(Orientation::Horizontal, gap);
+        root_box.set_hexpand(true);
+        root_box.add_css_class("yr-entity-card");
+
+        let click_area = GtkBox::new(Orientation::Horizontal, gap);
+        click_area.set_hexpand(true);
+        set_pointer(&click_area);
+
+        let (picture, overlay) = make_thumb_overlay(&playlist.video_count_text);
+        overlay.set_size_request(thumb_w, thumb_h);
+        let thumb_clamped = clamp_fixed_size(&overlay, thumb_w, thumb_h);
+        click_area.append(&thumb_clamped);
+
+        let info_col = GtkBox::new(Orientation::Vertical, 6);
+        info_col.set_hexpand(true);
+        info_col.set_valign(Align::Center);
+
+        let title_lbl = Label::new(Some(&playlist.name));
+        title_lbl.add_css_class("yr-search-title");
+        title_lbl.set_wrap(true);
+        title_lbl.set_lines(2);
+        title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title_lbl.set_halign(Align::Start);
+        title_lbl.set_xalign(0.0);
+        info_col.append(&title_lbl);
+
+        let sub_txt = join_non_empty(&[&playlist.channel_name, &playlist.video_count_text]);
+        if !sub_txt.is_empty() {
+            let meta_lbl = Label::new(Some(&sub_txt));
+            meta_lbl.add_css_class("yr-meta");
+            meta_lbl.set_halign(Align::Start);
+            meta_lbl.set_xalign(0.0);
+            meta_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            info_col.append(&meta_lbl);
+        }
+
+        let btn_row = GtkBox::new(Orientation::Horizontal, 8);
+        btn_row.set_margin_top(4);
+
+        let open_btn = Button::with_label("Open playlist");
+        open_btn.add_css_class("yr-btn");
+        open_btn.add_css_class("primary");
+        set_pointer(&open_btn);
+
+        let save_btn = Button::with_label(if initially_saved {
+            "Saved ✓"
+        } else {
+            "Save playlist"
+        });
+        save_btn.add_css_class("yr-btn");
+        set_pointer(&save_btn);
+
+        let on_open_rc = Rc::new(on_open);
+        let open_cb = on_open_rc.clone();
+        open_btn.connect_clicked(move |_| open_cb());
+
+        save_btn.connect_clicked(move |btn| {
+            btn.set_label("Saved ✓");
+            on_save();
+        });
+
+        btn_row.append(&open_btn);
+        btn_row.append(&save_btn);
+        info_col.append(&btn_row);
+
+        click_area.append(&info_col);
+
+        let click = GestureClick::new();
+        click.set_button(1);
+        let hl = root_box.clone();
+        click.connect_pressed(move |gesture, n_press, _, _| {
+            on_select(&hl);
+            if n_press == 2 {
+                gesture.set_state(EventSequenceState::Claimed);
+                on_open_rc();
+            }
+        });
+        click_area.add_controller(click);
+
+        root_box.append(&click_area);
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_focusable(false);
+        container.set_hexpand(true);
+        container.set_child(Some(&root_box));
+
+        Self { container, picture }
+    }
+}
+
+pub struct SavedPlaylistCard {
+    pub container: gtk4::FlowBoxChild,
+    pub picture: Picture,
+}
+
+impl SavedPlaylistCard {
+    pub fn new(
+        playlist: &SavedPlaylist,
+        on_select: impl Fn(&GtkBox) + 'static,
+        on_open: impl Fn() + 'static,
+        on_play_all: impl Fn() + 'static,
+        on_delete: impl Fn() + 'static,
+    ) -> Self {
+        let root_box = GtkBox::new(Orientation::Vertical, 10);
+        root_box.set_width_request(132);
+        root_box.set_hexpand(true);
+        root_box.set_valign(Align::Start);
+        root_box.add_css_class("yr-playlist-card");
+        root_box.add_css_class("yr-card");
+
+        let click_area = GtkBox::new(Orientation::Vertical, 8);
+        click_area.set_hexpand(true);
+        set_pointer(&click_area);
+
+        let count = playlist.videos.len();
+        let badge_txt = if count == 1 {
+            "1 video".to_string()
+        } else {
+            format!("{count} videos")
+        };
+
+        let (picture, overlay) = make_thumb_overlay(&badge_txt);
+        overlay.set_hexpand(true);
+        overlay.set_height_request(156);
+
+        let thumb_v_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Vertical)
+            .maximum_size(156)
+            .tightening_threshold(156)
+            .hexpand(true)
+            .child(&overlay)
+            .build();
+        click_area.append(&thumb_v_clamp);
+
+        let title_lbl = Label::new(Some(&playlist.name));
+        title_lbl.add_css_class("yr-title");
+        title_lbl.set_halign(Align::Start);
+        title_lbl.set_xalign(0.0);
+        title_lbl.set_lines(2);
+        title_lbl.set_wrap(true);
+        title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        click_area.append(&title_lbl);
+
+        let sub_txt = if !playlist.author.is_empty() {
+            format!("{} · {badge_txt}", playlist.author)
+        } else {
+            badge_txt
+        };
+        let meta_lbl = Label::new(Some(&sub_txt));
+        meta_lbl.add_css_class("yr-meta");
+        meta_lbl.set_halign(Align::Start);
+        meta_lbl.set_xalign(0.0);
+        meta_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        click_area.append(&meta_lbl);
+
+        let on_open_rc = Rc::new(on_open);
+        let click = GestureClick::new();
+        click.set_button(1);
+        let hl = root_box.clone();
+        let open_dbl = on_open_rc.clone();
+        click.connect_pressed(move |gesture, n_press, _, _| {
+            on_select(&hl);
+            if n_press == 2 {
+                gesture.set_state(EventSequenceState::Claimed);
+                open_dbl();
+            }
+        });
+        click_area.add_controller(click);
+
+        let actions_row = GtkBox::new(Orientation::Horizontal, 6);
+        let open_btn = Button::with_label("Open");
+        open_btn.add_css_class("yr-btn");
+        open_btn.add_css_class("yr-btn-compact");
+        open_btn.set_hexpand(true);
+        set_pointer(&open_btn);
+        let open_cb = on_open_rc;
+        open_btn.connect_clicked(move |_| open_cb());
+
+        let play_btn = Button::with_label("Play");
+        play_btn.add_css_class("yr-btn");
+        play_btn.add_css_class("yr-btn-compact");
+        play_btn.add_css_class("primary");
+        play_btn.set_sensitive(!playlist.videos.is_empty());
+        set_pointer(&play_btn);
+        play_btn.connect_clicked(move |_| on_play_all());
+
+        let del_btn = Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete playlist")
+            .build();
+        del_btn.add_css_class("flat");
+        del_btn.add_css_class("circular");
+        set_pointer(&del_btn);
+        del_btn.connect_clicked(move |_| on_delete());
+
+        actions_row.append(&open_btn);
+        actions_row.append(&play_btn);
+        actions_row.append(&del_btn);
+
+        root_box.append(&click_area);
+        root_box.append(&actions_row);
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_focusable(false);
+        container.set_hexpand(true);
+        container.set_child(Some(&root_box));
+
+        Self { container, picture }
+    }
+}
+
 fn make_thumb_overlay(duration_text: &str) -> (Picture, Overlay) {
     let picture = Picture::new();
     picture.set_can_shrink(true);
@@ -551,7 +1072,6 @@ fn make_thumb_overlay(duration_text: &str) -> (Picture, Overlay) {
     overlay.set_overflow(Overflow::Hidden);
     overlay.add_css_class("yr-thumb");
 
-    // Subtle hover play badge in center
     let play_badge = GtkBox::new(Orientation::Vertical, 0);
     play_badge.add_css_class("yr-play-badge");
     play_badge.set_halign(Align::Center);

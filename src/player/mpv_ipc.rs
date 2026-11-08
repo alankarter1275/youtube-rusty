@@ -1,5 +1,5 @@
 use crate::backend::settings::AppSettings;
-use crate::player::mpv::Quality;
+use crate::player::mpv::ResolvedPlayback;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -17,7 +17,7 @@ pub enum MpvEvent {
     TimePos(f64),
     Duration(f64),
     Pause(bool),
-    PlaylistPos(usize),
+    TrackEnded,
     Idle(bool),
     Error(String),
     ProcessExited,
@@ -31,8 +31,8 @@ pub struct MpvSession {
 }
 
 impl MpvSession {
-    /// Creates an `MpvSession` handle immediately so commands (`play`, `append`, etc.)
-    /// are buffered in order while `mpv` launches and opens its IPC socket.
+    /// Creates an `MpvSession` handle immediately (`--ytdl=no`, zero Python / `yt-dlp`).
+    /// Commands sent before MPV finishes opening its Unix socket are queued and flushed in order.
     pub fn spawn(
         runtime: &Runtime,
         settings: &AppSettings,
@@ -62,7 +62,6 @@ impl MpvSession {
             "--hwdec=no"
         }
         .to_string();
-        let initial_quality = Quality::from_setting(&settings.default_quality);
 
         let sock_for_task = sock_path.clone();
         let proc_for_task = process_slot.clone();
@@ -78,20 +77,12 @@ impl MpvSession {
             cmd.arg("--idle=yes")
                 .arg("--force-window=no")
                 .arg("--keep-open=no")
+                .arg("--ytdl=no")
                 .arg(format!("--input-ipc-server={}", sock_for_task.display()))
                 .arg(&hwdec_arg)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-
-            match initial_quality.ytdl_format() {
-                Some(fmt) => {
-                    cmd.arg(format!("--ytdl-format={fmt}"));
-                }
-                None => {
-                    cmd.arg("--vid=no");
-                }
-            }
 
             let child = match cmd.spawn() {
                 Ok(c) => c,
@@ -157,13 +148,11 @@ impl MpvSession {
 
             let (reader, mut writer) = stream.into_split();
 
-            // Register property observers before flushing queued playback commands
             let init_cmds = [
                 json!({"command": ["observe_property", 1, "time-pos"]}).to_string(),
                 json!({"command": ["observe_property", 2, "duration"]}).to_string(),
                 json!({"command": ["observe_property", 3, "pause"]}).to_string(),
-                json!({"command": ["observe_property", 4, "playlist-pos"]}).to_string(),
-                json!({"command": ["observe_property", 5, "idle-active"]}).to_string(),
+                json!({"command": ["observe_property", 4, "idle-active"]}).to_string(),
             ];
             for ic in init_cmds {
                 let line = format!("{ic}\n");
@@ -209,16 +198,22 @@ impl MpvSession {
                             }
                             Some("end-file") => {
                                 let _ = ev_tx.send(MpvEvent::Loaded).await;
-                                if v.get("reason").and_then(|r| r.as_str()) == Some("error") {
-                                    let detail = v
-                                        .get("file_error")
-                                        .and_then(|e| e.as_str())
-                                        .unwrap_or("stream unavailable");
-                                    let _ = ev_tx
-                                        .send(MpvEvent::Error(format!(
-                                            "MPV could not play this video ({detail})"
-                                        )))
-                                        .await;
+                                match v.get("reason").and_then(|r| r.as_str()) {
+                                    Some("eof") => {
+                                        let _ = ev_tx.send(MpvEvent::TrackEnded).await;
+                                    }
+                                    Some("error") => {
+                                        let detail = v
+                                            .get("file_error")
+                                            .and_then(|e| e.as_str())
+                                            .unwrap_or("stream unavailable");
+                                        let _ = ev_tx
+                                            .send(MpvEvent::Error(format!(
+                                                "MPV could not play this stream ({detail})"
+                                            )))
+                                            .await;
+                                    }
+                                    _ => {}
                                 }
                             }
                             Some("property-change") => {
@@ -239,15 +234,6 @@ impl MpvSession {
                                     "pause" => {
                                         if let Some(p) = data.and_then(|d| d.as_bool()) {
                                             let _ = ev_tx.send(MpvEvent::Pause(p)).await;
-                                        }
-                                    }
-                                    "playlist-pos" => {
-                                        if let Some(idx) = data.and_then(|d| d.as_i64()) {
-                                            if idx >= 0 {
-                                                let _ = ev_tx
-                                                    .send(MpvEvent::PlaylistPos(idx as usize))
-                                                    .await;
-                                            }
                                         }
                                     }
                                     "idle-active" => {
@@ -290,38 +276,27 @@ impl MpvSession {
         let _ = self.cmd_sender.send(value.to_string());
     }
 
-    pub fn play(&self, video_id: &str, title: &str, quality: Quality) {
-        let url = format!("https://www.youtube.com/watch?v={video_id}");
-        self.set_quality(quality);
+    pub fn play_resolved(&self, resolved: &ResolvedPlayback, title: &str) {
+        if !resolved.user_agent.is_empty() {
+            self.send_json(json!({
+                "command": ["set_property", "user-agent", resolved.user_agent]
+            }));
+        }
+        self.send_json(json!({
+            "command": ["set_property", "referrer", "https://www.youtube.com/"]
+        }));
+        if resolved.is_audio_only {
+            self.send_json(json!({ "command": ["set_property", "vid", "no"] }));
+            self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
+        } else {
+            self.send_json(json!({ "command": ["set_property", "vid", "auto"] }));
+            self.send_json(json!({ "command": ["set_property", "force-window", "immediate"] }));
+        }
         self.send_json(json!({ "command": ["set_property", "pause", false] }));
         self.send_json(json!({ "command": ["set_property", "force-media-title", title] }));
-        self.send_json(json!({ "command": ["loadfile", url, "replace"] }));
-    }
 
-    pub fn append(&self, video_id: &str) {
-        let url = format!("https://www.youtube.com/watch?v={video_id}");
-        self.send_json(json!({ "command": ["loadfile", url, "append-play"] }));
-    }
-
-    pub fn set_media_title(&self, title: &str) {
-        self.send_json(json!({ "command": ["set_property", "force-media-title", title] }));
-    }
-
-    pub fn set_quality(&self, quality: Quality) {
-        match quality.ytdl_format() {
-            Some(fmt) => {
-                self.send_json(json!({ "command": ["set_property", "ytdl-format", fmt] }));
-                self.send_json(json!({ "command": ["set_property", "vid", "auto"] }));
-                self.send_json(json!({ "command": ["set_property", "force-window", "immediate"] }));
-            }
-            None => {
-                self.send_json(json!({
-                    "command": ["set_property", "ytdl-format", "bestaudio/best"]
-                }));
-                self.send_json(json!({ "command": ["set_property", "vid", "no"] }));
-                self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
-            }
-        }
+        let load_url = resolved.to_loadfile_url();
+        self.send_json(json!({ "command": ["loadfile", load_url, "replace"] }));
     }
 
     pub fn set_hardware_decoding(&self, enabled: bool) {
@@ -331,40 +306,6 @@ impl MpvSession {
 
     pub fn toggle_pause(&self) {
         self.send_json(json!({ "command": ["cycle", "pause"] }));
-    }
-
-    pub fn next(&self) {
-        self.send_json(json!({ "command": ["playlist-next"] }));
-    }
-
-    pub fn prev(&self) {
-        self.send_json(json!({ "command": ["playlist-prev"] }));
-    }
-
-    pub fn jump_to(&self, index: usize) {
-        self.send_json(json!({ "command": ["set_property", "playlist-pos", index] }));
-        self.send_json(json!({ "command": ["set_property", "pause", false] }));
-    }
-
-    /// Moves entry at `from_idx` so its final index in the playlist is `to_idx`.
-    pub fn move_item(&self, from_idx: usize, to_idx: usize) {
-        if from_idx == to_idx {
-            return;
-        }
-        let mpv_target = if to_idx > from_idx {
-            to_idx + 1
-        } else {
-            to_idx
-        };
-        self.send_json(json!({ "command": ["playlist-move", from_idx, mpv_target] }));
-    }
-
-    pub fn remove_at(&self, index: usize) {
-        self.send_json(json!({ "command": ["playlist-remove", index] }));
-    }
-
-    pub fn clear(&self) {
-        self.send_json(json!({ "command": ["playlist-clear"] }));
     }
 
     pub fn stop(&self) {

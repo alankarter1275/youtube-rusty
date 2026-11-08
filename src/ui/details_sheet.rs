@@ -1,19 +1,21 @@
 use crate::backend::models::VideoSummary;
+use crate::backend::playlists::PlaylistStore;
 use crate::player::mpv::Quality;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::image_loader::ImageLoader;
 use adw::prelude::*;
-use gtk4::gdk::Rectangle;
 use gtk4::{
-    Align, Box as GtkBox, Button, GestureClick, GestureLongPress, Label, Orientation, Overflow,
-    Overlay, Picture, Popover, Separator, ToggleButton,
+    Align, Box as GtkBox, Button, Entry, GestureClick, Label, Orientation, Overflow, Overlay,
+    Picture, Popover, ScrolledWindow, Separator, ToggleButton,
 };
 use libadwaita as adw;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct CardActions {
     pub image_loader: Rc<ImageLoader>,
+    pub playlist_store: Arc<PlaylistStore>,
     pub default_quality: Rc<dyn Fn() -> Quality>,
     pub is_watch_later: Rc<dyn Fn(&str) -> bool>,
     pub on_play: Rc<dyn Fn(VideoSummary, Quality)>,
@@ -21,6 +23,7 @@ pub struct CardActions {
     pub on_toggle_watch_later: Rc<dyn Fn(VideoSummary) -> bool>,
     pub on_download: Rc<dyn Fn(VideoSummary, Quality)>,
     pub on_open_channel: Rc<dyn Fn(String, String)>,
+    pub on_playlists_changed: Rc<dyn Fn()>,
     pub on_toast: Rc<dyn Fn(String)>,
 }
 
@@ -35,7 +38,7 @@ impl DetailsSheet {
         let is_compact = parent.width() > 0 && parent.width() < 540;
 
         let dialog = adw::Dialog::builder()
-            .content_width(520)
+            .content_width(530)
             .title(&summary.title)
             .build();
         dialog.add_css_class("yr-sheet");
@@ -46,8 +49,8 @@ impl DetailsSheet {
         content_box.set_margin_start(20);
         content_box.set_margin_end(20);
 
-        // Top Thumbnail (fluid width, clamped 16:9 height — zero horizontal width overflow!)
-        let thumb_h = if is_compact { 196 } else { 256 };
+        // Top Thumbnail (fluid width, clamped 16:9 height)
+        let thumb_h = if is_compact { 196 } else { 252 };
         let picture = Picture::new();
         picture.set_can_shrink(true);
         picture.set_hexpand(true);
@@ -243,27 +246,45 @@ impl DetailsSheet {
         play_row.append(&quality_box);
         content_box.append(&play_row);
 
-        // Secondary actions: 4 clean single-line buttons (2x2 grid when compact)
-        let queue_btn = make_compact_action_btn(if is_compact { "Queue" } else { "Add to queue" });
+        // Secondary actions: Queue, Playlist+, Watch later, Copy link, Download
+        let queue_btn = make_compact_action_btn("Queue");
+        let playlist_btn = make_compact_action_btn("Playlist +");
         let initially_saved = (actions.is_watch_later)(&summary.id);
         let watch_later_btn = make_compact_action_btn(if initially_saved {
             "Saved ✓"
-        } else if is_compact {
-            "Save"
         } else {
             "Watch later"
         });
         let copy_btn = make_compact_action_btn("Copy link");
         let download_btn = make_compact_action_btn("Download");
 
-        let actions_box = GtkBox::new(Orientation::Horizontal, 8);
-        actions_box.set_homogeneous(true);
-        actions_box.set_margin_top(2);
-        actions_box.append(&queue_btn);
-        actions_box.append(&watch_later_btn);
-        actions_box.append(&copy_btn);
-        actions_box.append(&download_btn);
-        content_box.append(&actions_box);
+        attach_playlist_picker_popover(&playlist_btn, summary, actions);
+
+        if is_compact {
+            let row_a = GtkBox::new(Orientation::Horizontal, 8);
+            row_a.set_homogeneous(true);
+            row_a.append(&queue_btn);
+            row_a.append(&playlist_btn);
+            row_a.append(&watch_later_btn);
+
+            let row_b = GtkBox::new(Orientation::Horizontal, 8);
+            row_b.set_homogeneous(true);
+            row_b.append(&copy_btn);
+            row_b.append(&download_btn);
+
+            content_box.append(&row_a);
+            content_box.append(&row_b);
+        } else {
+            let actions_box = GtkBox::new(Orientation::Horizontal, 8);
+            actions_box.set_homogeneous(true);
+            actions_box.set_margin_top(2);
+            actions_box.append(&queue_btn);
+            actions_box.append(&playlist_btn);
+            actions_box.append(&watch_later_btn);
+            actions_box.append(&copy_btn);
+            actions_box.append(&download_btn);
+            content_box.append(&actions_box);
+        }
 
         dialog.set_child(Some(&content_box));
         dialog.set_default_widget(Some(&play_btn));
@@ -326,13 +347,7 @@ impl DetailsSheet {
         let on_wl = actions.on_toggle_watch_later.clone();
         watch_later_btn.connect_clicked(move |btn| {
             let now_saved = on_wl(sum_wl.clone());
-            btn.set_label(if now_saved {
-                "Saved ✓"
-            } else if is_compact {
-                "Save"
-            } else {
-                "Watch later"
-            });
+            btn.set_label(if now_saved { "Saved ✓" } else { "Watch later" });
         });
 
         let vid_id = summary.id.clone();
@@ -345,7 +360,7 @@ impl DetailsSheet {
 
         let sum_dl = summary.clone();
         let on_dl = actions.on_download.clone();
-        let sel_q_dl = selected_quality.clone();
+        let sel_q_dl = selected_quality;
         let dlg_weak_dl = dialog.downgrade();
         download_btn.connect_clicked(move |_| {
             let q = sel_q_dl();
@@ -359,6 +374,158 @@ impl DetailsSheet {
     }
 }
 
+fn attach_playlist_picker_popover(
+    button: &Button,
+    summary: &VideoSummary,
+    actions: &CardActions,
+) {
+    let popover = Popover::new();
+    popover.set_parent(button);
+    popover.set_has_arrow(false);
+
+    let pop_cleanup = popover.clone();
+    button.connect_destroy(move |_| {
+        pop_cleanup.unparent();
+    });
+
+    let root = GtkBox::new(Orientation::Vertical, 6);
+    root.set_width_request(248);
+
+    let head = Label::new(Some("SAVE TO PLAYLIST"));
+    head.add_css_class("yr-popover-head");
+    head.set_halign(Align::Start);
+    root.append(&head);
+
+    let create_row = GtkBox::new(Orientation::Horizontal, 6);
+    create_row.set_margin_start(6);
+    create_row.set_margin_end(6);
+
+    let name_entry = Entry::builder()
+        .placeholder_text("New playlist name…")
+        .hexpand(true)
+        .build();
+    name_entry.add_css_class("yr-search");
+
+    let create_btn = Button::with_label("Create");
+    create_btn.add_css_class("yr-chip");
+    create_btn.add_css_class("active");
+    set_pointer(&create_btn);
+
+    create_row.append(&name_entry);
+    create_row.append(&create_btn);
+    root.append(&create_row);
+
+    let sep = Separator::new(Orientation::Horizontal);
+    sep.set_margin_top(2);
+    sep.set_margin_bottom(2);
+    root.append(&sep);
+
+    let list_box = GtkBox::new(Orientation::Vertical, 2);
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .max_content_height(180)
+        .propagate_natural_height(true)
+        .child(&list_box)
+        .build();
+    scrolled.add_css_class("yr-no-scrollbar");
+    root.append(&scrolled);
+
+    popover.set_child(Some(&root));
+
+    // Create + add handler
+    let store_create = actions.playlist_store.clone();
+    let sum_create = summary.clone();
+    let on_changed_create = actions.on_playlists_changed.clone();
+    let on_toast_create = actions.on_toast.clone();
+    let pop_weak_create = popover.downgrade();
+    let entry_cl = name_entry.clone();
+    let trigger_create = Rc::new(move || {
+        let name = entry_cl.text().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let created = store_create.create_with_videos(&name, vec![sum_create.clone()], None, "");
+        entry_cl.set_text("");
+        on_changed_create();
+        on_toast_create(format!("Saved to “{}”", created.name));
+        if let Some(p) = pop_weak_create.upgrade() {
+            p.popdown();
+        }
+    });
+
+    let tc_btn = trigger_create.clone();
+    create_btn.connect_clicked(move |_| tc_btn());
+    name_entry.connect_activate(move |_| trigger_create());
+
+    // Populate saved playlists fresh each time button is clicked
+    let pop_weak = popover.downgrade();
+    let store_open = actions.playlist_store.clone();
+    let sum_open = summary.clone();
+    let on_changed_open = actions.on_playlists_changed.clone();
+    let on_toast_open = actions.on_toast.clone();
+    button.connect_clicked(move |_| {
+        let Some(pop) = pop_weak.upgrade() else {
+            return;
+        };
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
+
+        let playlists = store_open.load_all();
+        if playlists.is_empty() {
+            let empty_lbl = Label::new(Some("No playlists yet — type a name above"));
+            empty_lbl.add_css_class("yr-meta");
+            empty_lbl.set_margin_top(8);
+            empty_lbl.set_margin_bottom(8);
+            list_box.append(&empty_lbl);
+        } else {
+            for pl in playlists {
+                let already = pl.videos.iter().any(|v| v.id == sum_open.id);
+                let label = if already {
+                    format!("{} ✓", pl.name)
+                } else {
+                    pl.name.clone()
+                };
+                let item_btn = Button::builder().label(&label).halign(Align::Fill).build();
+                item_btn.add_css_class("flat");
+                item_btn.add_css_class("yr-menu-item");
+                if already {
+                    item_btn.add_css_class("selected");
+                }
+                set_pointer(&item_btn);
+                if let Some(lbl) = item_btn.child().and_then(|c| c.downcast::<Label>().ok()) {
+                    lbl.set_halign(Align::Start);
+                    lbl.set_xalign(0.0);
+                    lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                }
+
+                let st = store_open.clone();
+                let pid = pl.id.clone();
+                let pname = pl.name.clone();
+                let vid = sum_open.clone();
+                let on_ch = on_changed_open.clone();
+                let on_t = on_toast_open.clone();
+                let pw = pop.downgrade();
+                item_btn.connect_clicked(move |_| {
+                    if st.add_video(&pid, vid.clone()) {
+                        on_ch();
+                        on_t(format!("Added to “{pname}”"));
+                    } else {
+                        on_t(format!("Already in “{pname}”"));
+                    }
+                    if let Some(p) = pw.upgrade() {
+                        p.popdown();
+                    }
+                });
+                list_box.append(&item_btn);
+            }
+        }
+
+        pop.popup();
+    });
+}
+
 fn make_compact_action_btn(label: &str) -> Button {
     let btn = Button::with_label(label);
     btn.add_css_class("yr-btn");
@@ -369,181 +536,4 @@ fn make_compact_action_btn(label: &str) -> Button {
         lbl.set_single_line_mode(true);
     }
     btn
-}
-
-pub struct ContextMenu;
-
-impl ContextMenu {
-    pub fn attach(
-        target: &impl IsA<gtk4::Widget>,
-        summary: &VideoSummary,
-        actions: &CardActions,
-    ) {
-        let popover = Popover::new();
-        popover.set_parent(target);
-        popover.set_has_arrow(false);
-
-        let pop_cleanup = popover.clone();
-        target.connect_destroy(move |_| {
-            pop_cleanup.unparent();
-        });
-
-        let menu_box = GtkBox::new(Orientation::Vertical, 2);
-        menu_box.set_width_request(210);
-
-        let play_btn = create_menu_item("Play in MPV");
-        let queue_btn = create_menu_item("Add to queue");
-        let watch_later_btn = create_menu_item("Watch later");
-        let sep = Separator::new(Orientation::Horizontal);
-        sep.set_margin_top(4);
-        sep.set_margin_bottom(4);
-        let copy_btn = create_menu_item("Copy link");
-        let channel_btn = create_menu_item("Open channel");
-        channel_btn.set_sensitive(!summary.channel_id.is_empty());
-        let dl_btn = create_menu_item("Download");
-
-        menu_box.append(&play_btn);
-        menu_box.append(&queue_btn);
-        menu_box.append(&watch_later_btn);
-        menu_box.append(&sep);
-        menu_box.append(&copy_btn);
-        menu_box.append(&channel_btn);
-        menu_box.append(&dl_btn);
-
-        popover.set_child(Some(&menu_box));
-
-        let pop_weak = popover.downgrade();
-        let sum_play = summary.clone();
-        let on_play = actions.on_play.clone();
-        let def_q = actions.default_quality.clone();
-        play_btn.connect_clicked(move |_| {
-            if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
-            }
-            on_play(sum_play.clone(), def_q());
-        });
-
-        let pop_weak = popover.downgrade();
-        let sum_q = summary.clone();
-        let on_add_q = actions.on_add_queue.clone();
-        queue_btn.connect_clicked(move |_| {
-            if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
-            }
-            on_add_q(sum_q.clone());
-        });
-
-        let pop_weak = popover.downgrade();
-        let sum_wl = summary.clone();
-        let on_wl = actions.on_toggle_watch_later.clone();
-        watch_later_btn.connect_clicked(move |_| {
-            if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
-            }
-            let _ = on_wl(sum_wl.clone());
-        });
-
-        let pop_weak = popover.downgrade();
-        let vid_id = summary.id.clone();
-        let on_toast = actions.on_toast.clone();
-        copy_btn.connect_clicked(move |btn| {
-            if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
-            }
-            let url = format!("https://www.youtube.com/watch?v={vid_id}");
-            btn.display().clipboard().set_text(&url);
-            on_toast("Copied link to clipboard".to_string());
-        });
-
-        let pop_weak = popover.downgrade();
-        let cid = summary.channel_id.clone();
-        let cname = summary.channel_name.clone();
-        let on_chan = actions.on_open_channel.clone();
-        channel_btn.connect_clicked(move |_| {
-            if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
-            }
-            on_chan(cid.clone(), cname.clone());
-        });
-
-        let pop_weak = popover.downgrade();
-        let sum_dl = summary.clone();
-        let on_dl = actions.on_download.clone();
-        let def_q_dl = actions.default_quality.clone();
-        dl_btn.connect_clicked(move |_| {
-            if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
-            }
-            on_dl(sum_dl.clone(), def_q_dl());
-        });
-
-        let right_click = GestureClick::new();
-        right_click.set_button(3);
-        let pop_weak = popover.downgrade();
-        let wl_btn_rc = watch_later_btn.clone();
-        let is_wl_rc = actions.is_watch_later.clone();
-        let vid_rc = summary.id.clone();
-        right_click.connect_pressed(move |_, _, x, y| {
-            if let Some(pop) = pop_weak.upgrade() {
-                update_menu_item_label(
-                    &wl_btn_rc,
-                    if is_wl_rc(&vid_rc) {
-                        "Remove Watch later"
-                    } else {
-                        "Watch later"
-                    },
-                );
-                let rect = Rectangle::new(x as i32, y as i32, 1, 1);
-                pop.set_pointing_to(Some(&rect));
-                pop.popup();
-            }
-        });
-        target.add_controller(right_click);
-
-        let long_press = GestureLongPress::new();
-        let pop_weak2 = popover.downgrade();
-        let wl_btn_lp = watch_later_btn;
-        let is_wl_lp = actions.is_watch_later.clone();
-        let vid_lp = summary.id.clone();
-        long_press.connect_pressed(move |_, x, y| {
-            if let Some(pop) = pop_weak2.upgrade() {
-                update_menu_item_label(
-                    &wl_btn_lp,
-                    if is_wl_lp(&vid_lp) {
-                        "Remove Watch later"
-                    } else {
-                        "Watch later"
-                    },
-                );
-                let rect = Rectangle::new(x as i32, y as i32, 1, 1);
-                pop.set_pointing_to(Some(&rect));
-                pop.popup();
-            }
-        });
-        target.add_controller(long_press);
-    }
-}
-
-fn create_menu_item(label: &str) -> Button {
-    let btn = Button::builder().label(label).halign(Align::Fill).build();
-    btn.add_css_class("flat");
-    btn.add_css_class("yr-menu-item");
-    set_pointer(&btn);
-    if let Some(child) = btn.child() {
-        if let Some(lbl) = child.downcast_ref::<Label>() {
-            lbl.set_halign(Align::Start);
-            lbl.set_xalign(0.0);
-        }
-    }
-    btn
-}
-
-fn update_menu_item_label(btn: &Button, text: &str) {
-    btn.set_label(text);
-    if let Some(child) = btn.child() {
-        if let Some(lbl) = child.downcast_ref::<Label>() {
-            lbl.set_halign(Align::Start);
-            lbl.set_xalign(0.0);
-        }
-    }
 }

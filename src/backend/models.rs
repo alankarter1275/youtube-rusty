@@ -33,6 +33,41 @@ pub struct ChannelDetails {
     pub avatar_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelSearchSummary {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    pub subscriber_count_text: String,
+    pub description: String,
+    pub avatar_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaylistSearchSummary {
+    pub id: String,
+    pub name: String,
+    pub channel_name: String,
+    pub video_count_text: String,
+    pub thumbnail_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchItem {
+    Video(VideoSummary),
+    Channel(ChannelSearchSummary),
+    Playlist(PlaylistSearchSummary),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchTab {
+    #[default]
+    All,
+    Videos,
+    Channels,
+    Playlists,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UploadDateFilter {
     #[default]
@@ -116,6 +151,20 @@ pub fn format_queue_total_duration(total_secs: u64) -> String {
     } else {
         format!("{total_secs} sec")
     }
+}
+
+pub fn looks_like_youtube_url(input: &str) -> bool {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let stripped = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    stripped.starts_with("youtube.com/")
+        || stripped.starts_with("www.youtube.com/")
+        || stripped.starts_with("m.youtube.com/")
+        || stripped.starts_with("music.youtube.com/")
+        || stripped.starts_with("youtu.be/")
 }
 
 pub fn matches_local_filters(
@@ -216,5 +265,13 @@ mod tests {
         assert_eq!(format_queue_total_duration(0), "");
         assert_eq!(format_queue_total_duration(45), "45 sec");
         assert_eq!(format_queue_total_duration(6120), "1 h 42 min");
+    }
+
+    #[test]
+    fn test_youtube_url_detection() {
+        assert!(looks_like_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(looks_like_youtube_url("https://youtu.be/dQw4w9WgXcQ"));
+        assert!(looks_like_youtube_url("youtube.com/playlist?list=PL123"));
+        assert!(!looks_like_youtube_url("rust gtk4 tutorial"));
     }
 }

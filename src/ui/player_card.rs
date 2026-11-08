@@ -3,15 +3,15 @@ use crate::ui::icons::set_pointer;
 use crate::ui::image_loader::ImageLoader;
 use adw::prelude::*;
 use gtk4::{
-    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropTarget, EventControllerKey,
-    GestureClick, Label, Orientation, Overflow, Overlay, Picture, ProgressBar, ScrolledWindow,
-    Separator,
+    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropTarget, Entry, EventControllerKey,
+    GestureClick, Label, Orientation, Overflow, Overlay, Picture, Popover, ProgressBar,
+    ScrolledWindow, Separator,
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static SHUFFLE_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -40,20 +40,19 @@ pub struct PlayerCard {
     queue_box: GtkBox,
     queue_list: GtkBox,
     queue_summary_label: Label,
+    save_btn: Button,
     shuffle_btn: Button,
     clear_btn: Button,
     is_expanded: Cell<bool>,
     is_playing: Cell<bool>,
     is_loading: Cell<bool>,
-    pulse_running: Cell<bool>,
     is_narrow: Cell<bool>,
     is_shorts_mode: Cell<bool>,
     queue: RefCell<Vec<VideoSummary>>,
     current_index: Cell<usize>,
     on_open_channel: RefCell<Option<Rc<dyn Fn(String, String)>>>,
     on_jump_to: RefCell<Option<Rc<dyn Fn(usize)>>>,
-    on_remove_at: RefCell<Option<Rc<dyn Fn(usize)>>>,
-    on_move_item: RefCell<Option<Rc<dyn Fn(usize, usize)>>>,
+    on_save_playlist: RefCell<Option<Rc<dyn Fn(String, Vec<VideoSummary>)>>>,
     on_empty_stop: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
@@ -133,7 +132,6 @@ impl PlayerCard {
         text_col.append(&channel_btn);
         text_col.append(&queue_pos_label);
 
-        // Slim narrow-mode play/pause button (hidden in wide mode)
         let narrow_play_pause_btn = Button::builder()
             .icon_name("media-playback-pause-symbolic")
             .tooltip_text("Play / Pause")
@@ -228,15 +226,19 @@ impl PlayerCard {
         divider.set_margin_bottom(4);
         queue_box.append(&divider);
 
-        let queue_header = GtkBox::new(Orientation::Horizontal, 8);
+        let queue_header = GtkBox::new(Orientation::Horizontal, 6);
         queue_header.set_valign(Align::Center);
 
-        let queue_summary_label = Label::new(Some("0 videos · drag to reorder"));
+        let queue_summary_label = Label::new(Some("0 videos"));
         queue_summary_label.add_css_class("yr-meta");
         queue_summary_label.set_halign(Align::Start);
         queue_summary_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         queue_summary_label.set_hexpand(true);
         queue_summary_label.set_xalign(0.0);
+
+        let save_btn = Button::with_label("Save");
+        save_btn.add_css_class("yr-chip");
+        save_btn.set_tooltip_text(Some("Save queue as playlist"));
 
         let shuffle_btn = Button::with_label("Shuffle");
         shuffle_btn.add_css_class("yr-chip");
@@ -247,6 +249,7 @@ impl PlayerCard {
         clear_btn.set_tooltip_text(Some("Clear queue"));
 
         queue_header.append(&queue_summary_label);
+        queue_header.append(&save_btn);
         queue_header.append(&shuffle_btn);
         queue_header.append(&clear_btn);
         queue_box.append(&queue_header);
@@ -257,6 +260,7 @@ impl PlayerCard {
             .max_content_height(220)
             .propagate_natural_height(true)
             .build();
+        scrolled.add_css_class("yr-no-scrollbar");
 
         let queue_list = GtkBox::new(Orientation::Vertical, 4);
         scrolled.set_child(Some(&queue_list));
@@ -288,20 +292,19 @@ impl PlayerCard {
             queue_box,
             queue_list,
             queue_summary_label,
+            save_btn,
             shuffle_btn,
             clear_btn,
             is_expanded: Cell::new(false),
             is_playing: Cell::new(true),
             is_loading: Cell::new(false),
-            pulse_running: Cell::new(false),
             is_narrow: Cell::new(false),
             is_shorts_mode: Cell::new(false),
             queue: RefCell::new(Vec::new()),
             current_index: Cell::new(0),
             on_open_channel: RefCell::new(None),
             on_jump_to: RefCell::new(None),
-            on_remove_at: RefCell::new(None),
-            on_move_item: RefCell::new(None),
+            on_save_playlist: RefCell::new(None),
             on_empty_stop: RefCell::new(None),
         });
 
@@ -312,8 +315,12 @@ impl PlayerCard {
         set_pointer(&card.next_btn);
         set_pointer(&card.close_btn);
         set_pointer(&card.expand_btn);
+        set_pointer(&card.save_btn);
         set_pointer(&card.shuffle_btn);
         set_pointer(&card.clear_btn);
+
+        // Save queue as playlist popover
+        card.setup_save_queue_popover();
 
         // Expand/collapse toggle
         let card_weak = Rc::downgrade(&card);
@@ -374,7 +381,82 @@ impl PlayerCard {
         card
     }
 
-    pub fn set_queue(self: &Rc<Self>, items: Vec<VideoSummary>, current_pos: usize, shorts_mode: bool) {
+    fn setup_save_queue_popover(self: &Rc<Self>) {
+        let popover = Popover::new();
+        popover.set_parent(&self.save_btn);
+        popover.set_has_arrow(false);
+
+        let pop_cleanup = popover.clone();
+        self.save_btn.connect_destroy(move |_| {
+            pop_cleanup.unparent();
+        });
+
+        let vbox = GtkBox::new(Orientation::Vertical, 6);
+        vbox.set_width_request(230);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+        vbox.set_margin_start(4);
+        vbox.set_margin_end(4);
+
+        let head = Label::new(Some("SAVE QUEUE AS PLAYLIST"));
+        head.add_css_class("yr-popover-head");
+        head.set_halign(Align::Start);
+        vbox.append(&head);
+
+        let entry = Entry::builder()
+            .placeholder_text("Playlist name…")
+            .text("Queue Mix")
+            .build();
+        entry.add_css_class("yr-search");
+        vbox.append(&entry);
+
+        let confirm_btn = Button::with_label("Save playlist");
+        confirm_btn.add_css_class("yr-btn");
+        confirm_btn.add_css_class("primary");
+        set_pointer(&confirm_btn);
+        vbox.append(&confirm_btn);
+
+        popover.set_child(Some(&vbox));
+
+        let card_weak = Rc::downgrade(self);
+        let pop_weak = popover.downgrade();
+        let entry_cl = entry.clone();
+        let do_save = Rc::new(move || {
+            let name = entry_cl.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            if let Some(c) = card_weak.upgrade() {
+                let items = c.queue.borrow().clone();
+                if !items.is_empty() {
+                    if let Some(cb) = c.on_save_playlist.borrow().as_ref().cloned() {
+                        cb(name, items);
+                    }
+                }
+            }
+            if let Some(p) = pop_weak.upgrade() {
+                p.popdown();
+            }
+        });
+
+        let ds_btn = do_save.clone();
+        confirm_btn.connect_clicked(move |_| ds_btn());
+        entry.connect_activate(move |_| do_save());
+
+        let pop_open = popover.downgrade();
+        self.save_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_open.upgrade() {
+                p.popup();
+            }
+        });
+    }
+
+    pub fn set_queue(
+        self: &Rc<Self>,
+        items: Vec<VideoSummary>,
+        current_pos: usize,
+        shorts_mode: bool,
+    ) {
         self.is_shorts_mode.set(shorts_mode);
         let clamped_pos = if items.is_empty() {
             0
@@ -398,6 +480,34 @@ impl PlayerCard {
 
     pub fn is_empty(&self) -> bool {
         self.queue.borrow().is_empty()
+    }
+
+    /// Advances to the next queued video if available. Returns `Some(video)` when advanced.
+    pub fn advance_next(self: &Rc<Self>) -> Option<VideoSummary> {
+        let len = self.queue.borrow().len();
+        let cur = self.current_index.get();
+        if cur + 1 < len {
+            self.current_index.set(cur + 1);
+            self.reset_progress_labels();
+            self.update_ui();
+            self.current_video()
+        } else {
+            None
+        }
+    }
+
+    /// Moves to the previous queued video (or restarts index 0).
+    pub fn advance_prev(self: &Rc<Self>) -> Option<VideoSummary> {
+        let len = self.queue.borrow().len();
+        if len == 0 {
+            return None;
+        }
+        let cur = self.current_index.get();
+        let next_idx = cur.saturating_sub(1);
+        self.current_index.set(next_idx);
+        self.reset_progress_labels();
+        self.update_ui();
+        self.current_video()
     }
 
     pub fn set_current_index(self: &Rc<Self>, index: usize) {
@@ -424,28 +534,11 @@ impl PlayerCard {
         self.time_total_label.set_text(&dur_txt);
     }
 
+    /// Static loading state — no continuous 120ms pulse timer (prevents Gdk frame timing warnings).
     pub fn set_loading(self: &Rc<Self>, loading: bool) {
         self.is_loading.set(loading);
         self.update_header_labels();
         if loading {
-            self.progress_bar.set_pulse_step(0.18);
-            if !self.pulse_running.get() {
-                self.pulse_running.set(true);
-                let weak = Rc::downgrade(self);
-                glib::timeout_add_local(Duration::from_millis(120), move || {
-                    let Some(c) = weak.upgrade() else {
-                        return glib::ControlFlow::Break;
-                    };
-                    if c.is_loading.get() && c.root.is_visible() {
-                        c.progress_bar.pulse();
-                        glib::ControlFlow::Continue
-                    } else {
-                        c.pulse_running.set(false);
-                        glib::ControlFlow::Break
-                    }
-                });
-            }
-        } else {
             self.progress_bar.set_fraction(0.0);
         }
     }
@@ -551,12 +644,8 @@ impl PlayerCard {
         *self.on_jump_to.borrow_mut() = Some(Rc::new(callback));
     }
 
-    pub fn connect_remove_at(&self, callback: impl Fn(usize) + 'static) {
-        *self.on_remove_at.borrow_mut() = Some(Rc::new(callback));
-    }
-
-    pub fn connect_move_item(&self, callback: impl Fn(usize, usize) + 'static) {
-        *self.on_move_item.borrow_mut() = Some(Rc::new(callback));
+    pub fn connect_save_playlist(&self, callback: impl Fn(String, Vec<VideoSummary>) + 'static) {
+        *self.on_save_playlist.borrow_mut() = Some(Rc::new(callback));
     }
 
     pub fn connect_empty_stop(&self, callback: impl Fn() + 'static) {
@@ -583,11 +672,6 @@ impl PlayerCard {
             cur
         };
         self.current_index.set(new_cur);
-        drop(q);
-
-        if let Some(cb) = self.on_move_item.borrow().as_ref().cloned() {
-            cb(from_idx, to_idx);
-        }
         true
     }
 
@@ -598,6 +682,7 @@ impl PlayerCard {
     }
 
     pub fn remove_item_at(self: &Rc<Self>, index: usize) {
+        let was_current = index == self.current_index.get();
         let len_after = {
             let mut q = self.queue.borrow_mut();
             if index >= q.len() {
@@ -606,10 +691,6 @@ impl PlayerCard {
             q.remove(index);
             q.len()
         };
-
-        if let Some(cb) = self.on_remove_at.borrow().as_ref().cloned() {
-            cb(index);
-        }
 
         if len_after == 0 {
             self.current_index.set(0);
@@ -628,6 +709,11 @@ impl PlayerCard {
         }
 
         self.update_ui();
+        if was_current {
+            if let Some(cb) = self.on_jump_to.borrow().as_ref().cloned() {
+                cb(self.current_index.get());
+            }
+        }
     }
 
     pub fn shuffle_queue(self: &Rc<Self>) {
@@ -636,7 +722,6 @@ impl PlayerCard {
             return;
         }
 
-        // Keep currently playing video at index 0 so playback continues smoothly
         let cur = self.current_index.get();
         if cur != 0 {
             self.move_item_internal(cur, 0);
@@ -681,7 +766,7 @@ impl PlayerCard {
             self.channel_btn.set_sensitive(!cur.channel_id.is_empty());
 
             if self.is_loading.get() {
-                self.queue_pos_label.set_text("Loading in MPV…");
+                self.queue_pos_label.set_text("Opening in MPV…");
             } else {
                 let prefix = if self.is_shorts_mode.get() {
                     "Short"
@@ -736,14 +821,12 @@ impl PlayerCard {
         let word = if count == 1 { "video" } else { "videos" };
         let dur_part = format_queue_total_duration(total_secs);
         if dur_part.is_empty() {
-            self.queue_summary_label
-                .set_text(&format!("{count} {word} · drag to reorder"));
+            self.queue_summary_label.set_text(&format!("{count} {word}"));
         } else {
             self.queue_summary_label
-                .set_text(&format!("{count} {word} · {dur_part} · drag to reorder"));
+                .set_text(&format!("{count} {word} · {dur_part}"));
         }
 
-        // Rebuild queue rows
         while let Some(child) = self.queue_list.first_child() {
             self.queue_list.remove(&child);
         }
@@ -824,7 +907,6 @@ impl PlayerCard {
             click_area.append(&row_h_clamp);
             click_area.append(&text_box);
 
-            // Click row -> jump to track `i`
             let row_click = GestureClick::new();
             row_click.set_button(1);
             let card_weak = Rc::downgrade(self);
@@ -838,7 +920,6 @@ impl PlayerCard {
             });
             click_area.add_controller(row_click);
 
-            // Remove (x) button -> remove track `i`
             let remove_btn = Button::builder()
                 .icon_name("window-close-symbolic")
                 .tooltip_text("Remove from queue")
@@ -855,7 +936,6 @@ impl PlayerCard {
             row.append(&click_area);
             row.append(&remove_btn);
 
-            // Drag-and-drop reordering
             let drag_source = DragSource::new();
             drag_source.set_actions(gdk::DragAction::MOVE);
             let drag_idx = i as u32;

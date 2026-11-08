@@ -4,14 +4,15 @@ use crate::backend::models::{
     VideoSummary,
 };
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
-use crate::ui::details_sheet::{CardActions, ContextMenu, DetailsSheet};
+use crate::ui::details_sheet::{CardActions, DetailsSheet};
 use crate::ui::icons::set_pointer;
 use crate::ui::video_card::VideoCard;
-use gtk4::glib;
 use adw::prelude::*;
+use gtk4::gdk;
+use gtk4::glib;
 use gtk4::{
-    Align, Box as GtkBox, Button, FlowBox, Label, Orientation, Popover, ScrolledWindow,
-    SearchEntry, SelectionMode, Separator, ToggleButton,
+    Align, Box as GtkBox, Button, Editable, EventControllerKey, FlowBox, Label, Orientation,
+    Popover, ScrolledWindow, SearchEntry, SelectionMode, Separator, ToggleButton,
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
@@ -49,8 +50,8 @@ pub struct ChannelPage {
     compact_search_entry: SearchEntry,
     filter_btn: Button,
     sort_btn: Button,
+    scrolled: ScrolledWindow,
     flow_box: FlowBox,
-    load_more_btn: Button,
     status_box: GtkBox,
     status_page: adw::StatusPage,
     active_tab: Cell<ChannelTab>,
@@ -70,6 +71,8 @@ pub struct ChannelPage {
     videos_cursor: RefCell<Option<PageCursor>>,
     shorts_cursor: RefCell<Option<PageCursor>>,
     search_results: RefCell<Option<Vec<VideoSummary>>>,
+    selected_box: RefCell<Option<GtkBox>>,
+    selected_play_cb: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl ChannelPage {
@@ -194,7 +197,6 @@ impl ChannelPage {
 
         root_box.append(&toolbar_box);
 
-        // Compact second-row search bar for half-screen / narrow windows (prevents horizontal overflow)
         let compact_search_box = GtkBox::new(Orientation::Horizontal, 0);
         compact_search_box.set_margin_start(28);
         compact_search_box.set_margin_end(28);
@@ -236,19 +238,10 @@ impl ChannelPage {
         flow_box.set_homogeneous(true);
         flow_box.set_margin_start(28);
         flow_box.set_margin_end(28);
-        flow_box.set_margin_bottom(16);
-
-        let load_more_btn = Button::with_label("Load more");
-        load_more_btn.add_css_class("yr-btn");
-        load_more_btn.set_halign(Align::Center);
-        load_more_btn.set_margin_top(4);
-        load_more_btn.set_margin_bottom(32);
-        load_more_btn.set_visible(false);
-        set_pointer(&load_more_btn);
+        flow_box.set_margin_bottom(32);
 
         body_box.append(&status_box);
         body_box.append(&flow_box);
-        body_box.append(&load_more_btn);
 
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -257,6 +250,7 @@ impl ChannelPage {
             .vexpand(true)
             .hexpand(true)
             .build();
+        scrolled.add_css_class("yr-no-scrollbar");
 
         root_box.append(&scrolled);
 
@@ -297,8 +291,8 @@ impl ChannelPage {
             compact_search_entry,
             filter_btn,
             sort_btn,
+            scrolled,
             flow_box,
-            load_more_btn,
             status_box,
             status_page,
             active_tab: Cell::new(ChannelTab::Videos),
@@ -318,16 +312,57 @@ impl ChannelPage {
             videos_cursor: RefCell::new(None),
             shorts_cursor: RefCell::new(None),
             search_results: RefCell::new(None),
+            selected_box: RefCell::new(None),
+            selected_play_cb: RefCell::new(None),
         });
 
-        this.wire_signals();
+        this.wire_signals(&root_box);
         this.set_layout(narrow, compact, grid_cols, shorts_cols);
         this.show_skeletons();
 
         this
     }
 
-    fn wire_signals(self: &Rc<Self>) {
+    fn wire_signals(self: &Rc<Self>, root_box: &GtkBox) {
+        // Enter key plays currently selected card
+        let key_ctrl = EventControllerKey::new();
+        let weak_key = Rc::downgrade(self);
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+                let Some(cp) = weak_key.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if let Some(win) = cp.parent_window.upgrade() {
+                    if let Some(root) = win.root() {
+                        if root.focus().map(|f| f.is::<Editable>()).unwrap_or(false) {
+                            return glib::Propagation::Proceed;
+                        }
+                    }
+                }
+                if let Some(cb) = cp.selected_play_cb.borrow().as_ref().cloned() {
+                    cb();
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        root_box.add_controller(key_ctrl);
+
+        // Infinite scroll: load next page only when scrolling near the bottom
+        let weak_scroll = Rc::downgrade(self);
+        self.scrolled
+            .vadjustment()
+            .connect_value_changed(move |adj| {
+                let val = adj.value();
+                let page = adj.page_size();
+                let upper = adj.upper();
+                if val > 0.0 && upper > page && val + page >= upper - 420.0 {
+                    if let Some(cp) = weak_scroll.upgrade() {
+                        cp.load_more_active_tab();
+                    }
+                }
+            });
+
         // Tab switching: Videos
         let weak = Rc::downgrade(self);
         self.tab_videos.connect_toggled(move |btn| {
@@ -336,6 +371,7 @@ impl ChannelPage {
                     cp.active_tab.set(ChannelTab::Videos);
                     cp.play_all_btn.set_visible(false);
                     cp.update_grid_columns();
+                    cp.scrolled.vadjustment().set_value(0.0);
                     if cp.sort_order.get() != ChannelSortOrder::Newest
                         && cp.search_results.borrow().is_none()
                     {
@@ -355,6 +391,7 @@ impl ChannelPage {
                     cp.active_tab.set(ChannelTab::Shorts);
                     cp.play_all_btn.set_visible(true);
                     cp.update_grid_columns();
+                    cp.scrolled.vadjustment().set_value(0.0);
                     if cp.sort_order.get() != ChannelSortOrder::Newest
                         && cp.search_results.borrow().is_none()
                     {
@@ -366,7 +403,7 @@ impl ChannelPage {
             }
         });
 
-        // Play all Shorts button (reads current shorts list lazily on click!)
+        // Play all Shorts button
         let weak = Rc::downgrade(self);
         self.play_all_btn.connect_clicked(move |_| {
             if let Some(cp) = weak.upgrade() {
@@ -425,7 +462,7 @@ impl ChannelPage {
             }
         });
 
-        // Search in channel (both wide & compact entries stay synced)
+        // Search in channel
         for entry in [&self.search_entry, &self.compact_search_entry] {
             let weak = Rc::downgrade(self);
             let other = if entry == &self.search_entry {
@@ -469,15 +506,25 @@ impl ChannelPage {
             });
         }
 
-        let weak = Rc::downgrade(self);
-        self.load_more_btn.connect_clicked(move |_| {
-            if let Some(cp) = weak.upgrade() {
-                cp.load_more_active_tab();
-            }
-        });
-
         self.setup_filter_popover();
         self.setup_sort_popover();
+    }
+
+    fn select_card_box(&self, target: &GtkBox, play_cb: Rc<dyn Fn()>) {
+        if let Some(prev) = self.selected_box.borrow_mut().replace(target.clone()) {
+            if prev != *target {
+                prev.remove_css_class("selected");
+            }
+        }
+        target.add_css_class("selected");
+        *self.selected_play_cb.borrow_mut() = Some(play_cb);
+    }
+
+    fn clear_selection(&self) {
+        if let Some(prev) = self.selected_box.borrow_mut().take() {
+            prev.remove_css_class("selected");
+        }
+        *self.selected_play_cb.borrow_mut() = None;
     }
 
     fn setup_filter_popover(self: &Rc<Self>) {
@@ -608,7 +655,6 @@ impl ChannelPage {
 
         popover.set_child(Some(&content));
 
-        // Reset handler
         let weak_reset = Rc::downgrade(self);
         let pop_reset = popover.downgrade();
         let pd_reset = pending_date.clone();
@@ -620,11 +666,27 @@ impl ChannelPage {
             pdur_reset.set(DurationFilter::AnyLength);
             for (v, lbl, b) in db_reset.iter() {
                 let sel = *v == UploadDateFilter::AnyTime;
-                set_pop_item_text(b, &if sel { format!("{lbl} ✓") } else { lbl.to_string() }, sel);
+                set_pop_item_text(
+                    b,
+                    &if sel {
+                        format!("{lbl} ✓")
+                    } else {
+                        lbl.to_string()
+                    },
+                    sel,
+                );
             }
             for (v, lbl, b) in durb_reset.iter() {
                 let sel = *v == DurationFilter::AnyLength;
-                set_pop_item_text(b, &if sel { format!("{lbl} ✓") } else { lbl.to_string() }, sel);
+                set_pop_item_text(
+                    b,
+                    &if sel {
+                        format!("{lbl} ✓")
+                    } else {
+                        lbl.to_string()
+                    },
+                    sel,
+                );
             }
             if let Some(pop) = pop_reset.upgrade() {
                 pop.popdown();
@@ -637,7 +699,6 @@ impl ChannelPage {
             }
         });
 
-        // Apply handler
         let weak_apply = Rc::downgrade(self);
         let pop_apply = popover.downgrade();
         let pd_apply = pending_date;
@@ -804,7 +865,10 @@ impl ChannelPage {
     }
 
     fn load_more_active_tab(self: &Rc<Self>) {
-        if self.is_loading.get() || self.is_loading_more.get() || self.search_results.borrow().is_some() {
+        if self.is_loading.get()
+            || self.is_loading_more.get()
+            || self.search_results.borrow().is_some()
+        {
             return;
         }
         let is_shorts = self.active_tab.get() == ChannelTab::Shorts;
@@ -814,13 +878,10 @@ impl ChannelPage {
             self.videos_cursor.borrow().clone()
         };
         let Some(cursor) = cursor_opt else {
-            self.load_more_btn.set_visible(false);
             return;
         };
 
         self.is_loading_more.set(true);
-        self.load_more_btn.set_sensitive(false);
-        self.load_more_btn.set_label("Loading more…");
 
         let fallback = self.channel_details.borrow().clone();
         let engine = self.engine.clone();
@@ -841,19 +902,32 @@ impl ChannelPage {
                 return;
             };
             cp.is_loading_more.set(false);
-            cp.load_more_btn.set_sensitive(true);
-            cp.load_more_btn.set_label("Load more");
 
             match res {
                 Ok(paged) => {
+                    let df = cp.date_filter.get();
+                    let duf = cp.duration_filter.get();
+                    let visible_new: Vec<VideoSummary> = paged
+                        .items
+                        .iter()
+                        .filter(|v| matches_local_filters(v, df, duf))
+                        .cloned()
+                        .collect();
+
                     if is_shorts {
+                        let start_idx = cp.filtered_active_items().len();
                         cp.shorts_list.borrow_mut().extend(paged.items);
                         *cp.shorts_cursor.borrow_mut() = paged.next;
+                        if cp.active_tab.get() == ChannelTab::Shorts {
+                            cp.append_items_to_flow(&visible_new, true, start_idx);
+                        }
                     } else {
                         cp.videos_list.borrow_mut().extend(paged.items);
                         *cp.videos_cursor.borrow_mut() = paged.next;
+                        if cp.active_tab.get() == ChannelTab::Videos {
+                            cp.append_items_to_flow(&visible_new, false, 0);
+                        }
                     }
-                    cp.render_active_tab();
                 }
                 Err(err) => {
                     (cp.actions.on_toast)(err);
@@ -912,7 +986,13 @@ impl ChannelPage {
         self.search_entry.set_visible(!show_compact_search);
         self.compact_search_box.set_visible(show_compact_search);
 
-        let side = if narrow { 16 } else if compact { 20 } else { 28 };
+        let side = if narrow {
+            16
+        } else if compact {
+            20
+        } else {
+            28
+        };
         self.header_box.set_margin_start(side);
         self.header_box.set_margin_end(side);
         self.toolbar_box.set_margin_start(side);
@@ -963,7 +1043,6 @@ impl ChannelPage {
                 .load_into_avatar(&details.id, &details.avatar_url, &self.avatar);
         }
 
-        // Refresh saved subscription metadata if already subscribed
         if self.store.is_subscribed(&details.id) {
             self.store.subscribe(SubscribedChannel {
                 id: details.id.clone(),
@@ -976,7 +1055,7 @@ impl ChannelPage {
         *self.channel_details.borrow_mut() = Some(details);
     }
 
-    pub fn set_videos(&self, paged: PagedVideos) {
+    pub fn set_videos(self: &Rc<Self>, paged: PagedVideos) {
         self.is_loading.set(false);
         *self.videos_list.borrow_mut() = paged.items;
         *self.videos_cursor.borrow_mut() = paged.next;
@@ -985,7 +1064,7 @@ impl ChannelPage {
         }
     }
 
-    pub fn set_shorts(&self, paged: PagedVideos) {
+    pub fn set_shorts(self: &Rc<Self>, paged: PagedVideos) {
         *self.shorts_list.borrow_mut() = paged.items;
         *self.shorts_cursor.borrow_mut() = paged.next;
         if self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none() {
@@ -1001,8 +1080,8 @@ impl ChannelPage {
     }
 
     fn show_skeletons(&self) {
+        self.clear_selection();
         self.status_box.set_visible(false);
-        self.load_more_btn.set_visible(false);
         self.flow_box.set_visible(true);
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
@@ -1017,11 +1096,11 @@ impl ChannelPage {
     }
 
     fn show_status(&self, title: &str, description: &str) {
+        self.clear_selection();
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
         self.flow_box.set_visible(false);
-        self.load_more_btn.set_visible(false);
         self.status_page.set_title(title);
         self.status_page.set_description(Some(description));
         self.status_box.set_visible(true);
@@ -1064,11 +1143,12 @@ impl ChannelPage {
             .collect()
     }
 
-    pub fn render_active_tab(&self) {
+    pub fn render_active_tab(self: &Rc<Self>) {
         if self.is_loading.get() {
             return;
         }
 
+        self.clear_selection();
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
@@ -1100,9 +1180,18 @@ impl ChannelPage {
         let is_shorts_tab =
             self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none();
 
+        self.append_items_to_flow(&items, is_shorts_tab, 0);
+    }
+
+    fn append_items_to_flow(
+        self: &Rc<Self>,
+        items: &[VideoSummary],
+        is_shorts_tab: bool,
+        start_offset: usize,
+    ) {
         if is_shorts_tab {
-            let all_shorts = Rc::new(items.clone());
-            for (idx, short) in items.iter().enumerate() {
+            for (i, short) in items.iter().enumerate() {
+                let idx = start_offset + i;
                 let card = VideoCard::new_short(short);
                 self.actions.image_loader.load_into_picture(
                     &short.id,
@@ -1110,17 +1199,41 @@ impl ChannelPage {
                     &card.picture,
                 );
 
-                let on_play_shorts = self.on_play_shorts_queue.clone();
-                let list_cl = all_shorts.clone();
-                card.connect_primary_click(move || {
-                    on_play_shorts((*list_cl).clone(), idx);
+                let cp_weak_play = Rc::downgrade(self);
+                let play_cb: Rc<dyn Fn()> = Rc::new(move || {
+                    if let Some(cp) = cp_weak_play.upgrade() {
+                        let current_all = cp.filtered_active_items();
+                        if !current_all.is_empty() {
+                            (cp.on_play_shorts_queue)(current_all, idx);
+                        }
+                    }
                 });
 
-                ContextMenu::attach(&card.container, short, &self.actions);
+                let cp_weak_sel = Rc::downgrade(self);
+                let play_for_enter = play_cb.clone();
+                let play_for_dbl = play_cb;
+                let parent_weak = self.parent_window.clone();
+                let sum_det = short.clone();
+                let act_det = self.actions.clone();
+
+                card.connect_card_interactions(
+                    move |hl| {
+                        if let Some(cp) = cp_weak_sel.upgrade() {
+                            cp.select_card_box(hl, play_for_enter.clone());
+                        }
+                    },
+                    move || play_for_dbl(),
+                    move || {
+                        if let Some(win) = parent_weak.upgrade() {
+                            DetailsSheet::show(&win, &sum_det, &act_det);
+                        }
+                    },
+                );
+
                 self.flow_box.append(&card.container);
             }
         } else {
-            for video in &items {
+            for video in items {
                 let card = VideoCard::new_grid(video);
                 self.actions.image_loader.load_into_picture(
                     &video.id,
@@ -1133,33 +1246,37 @@ impl ChannelPage {
                     &card.avatar,
                 );
 
+                let sum_play = video.clone();
+                let on_play = self.actions.on_play.clone();
+                let def_q = self.actions.default_quality.clone();
+                let play_cb: Rc<dyn Fn()> = Rc::new(move || {
+                    on_play(sum_play.clone(), def_q());
+                });
+
+                let cp_weak_sel = Rc::downgrade(self);
+                let play_for_enter = play_cb.clone();
+                let play_for_dbl = play_cb;
                 let parent_weak = self.parent_window.clone();
-                let sum_cl = video.clone();
-                let act_cl = self.actions.clone();
-                card.connect_primary_click(move || {
-                    if let Some(win) = parent_weak.upgrade() {
-                        DetailsSheet::show(&win, &sum_cl, &act_cl);
-                    }
-                });
+                let sum_det = video.clone();
+                let act_det = self.actions.clone();
 
-                let sum_mid = video.clone();
-                let on_play_mid = self.actions.on_play.clone();
-                let def_q_mid = self.actions.default_quality.clone();
-                card.connect_middle_click(move || {
-                    on_play_mid(sum_mid.clone(), def_q_mid());
-                });
+                card.connect_card_interactions(
+                    move |hl| {
+                        if let Some(cp) = cp_weak_sel.upgrade() {
+                            cp.select_card_box(hl, play_for_enter.clone());
+                        }
+                    },
+                    move || play_for_dbl(),
+                    move || {
+                        if let Some(win) = parent_weak.upgrade() {
+                            DetailsSheet::show(&win, &sum_det, &act_det);
+                        }
+                    },
+                );
 
-                ContextMenu::attach(&card.container, video, &self.actions);
                 self.flow_box.append(&card.container);
             }
         }
-
-        let has_more = self.search_results.borrow().is_none()
-            && match self.active_tab.get() {
-                ChannelTab::Videos => self.videos_cursor.borrow().is_some(),
-                ChannelTab::Shorts => self.shorts_cursor.borrow().is_some(),
-            };
-        self.load_more_btn.set_visible(has_more);
     }
 }
 

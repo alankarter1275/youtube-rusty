@@ -6,6 +6,7 @@ use gtk4::{Align, Box as GtkBox, Button, Orientation, Overlay};
 pub enum RailTab {
     Home,
     Subscriptions,
+    Playlists,
     History,
     Settings,
 }
@@ -15,6 +16,7 @@ pub struct Rail {
     pub logo_btn: Button,
     pub home_btn: Button,
     pub subs_btn: Button,
+    pub playlists_btn: Button,
     pub hist_btn: Button,
     pub settings_btn: Button,
 }
@@ -35,10 +37,12 @@ impl Rail {
 
         let home_btn = create_nav_btn(KalamIcon::Home, "Home", true);
         let subs_btn = create_nav_btn(KalamIcon::Subscriptions, "Subscriptions", false);
+        let playlists_btn = create_nav_btn(KalamIcon::Playlists, "Playlists", false);
         let hist_btn = create_nav_btn(KalamIcon::History, "History", false);
 
         center_box.append(&home_btn);
         center_box.append(&subs_btn);
+        center_box.append(&playlists_btn);
         center_box.append(&hist_btn);
         base_box.append(&center_box);
 
@@ -47,7 +51,7 @@ impl Rail {
         overlay.set_hexpand(false);
         overlay.set_child(Some(&base_box));
 
-        // Top App Logo: 38x38 terracotta badge pinned 24px from top (aligned with separator top)
+        // Top App Logo: 38x38 terracotta badge pinned 24px from top
         let logo_btn = Button::new();
         logo_btn.set_child(Some(&make_icon(KalamIcon::LogoPlay, 38)));
         logo_btn.add_css_class("yr-logo");
@@ -58,7 +62,7 @@ impl Rail {
         set_pointer(&logo_btn);
         overlay.add_overlay(&logo_btn);
 
-        // Bottom Settings Button: pinned 24px from bottom (aligned with separator bottom)
+        // Bottom Settings Button: pinned 24px from bottom
         let settings_btn = create_nav_btn(KalamIcon::Settings, "Preferences", false);
         settings_btn.set_halign(Align::Center);
         settings_btn.set_valign(Align::End);
@@ -81,6 +85,7 @@ impl Rail {
             logo_btn,
             home_btn,
             subs_btn,
+            playlists_btn,
             hist_btn,
             settings_btn,
         }
@@ -89,6 +94,7 @@ impl Rail {
     pub fn set_active(&self, active: Option<RailTab>) {
         self.home_btn.remove_css_class("active");
         self.subs_btn.remove_css_class("active");
+        self.playlists_btn.remove_css_class("active");
         self.hist_btn.remove_css_class("active");
         self.settings_btn.remove_css_class("active");
 
@@ -96,6 +102,7 @@ impl Rail {
             match tab {
                 RailTab::Home => self.home_btn.add_css_class("active"),
                 RailTab::Subscriptions => self.subs_btn.add_css_class("active"),
+                RailTab::Playlists => self.playlists_btn.add_css_class("active"),
                 RailTab::History => self.hist_btn.add_css_class("active"),
                 RailTab::Settings => self.settings_btn.add_css_class("active"),
             }

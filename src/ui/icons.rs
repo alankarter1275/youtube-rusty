@@ -8,6 +8,7 @@ pub enum KalamIcon {
     LogoPlay,
     Home,
     Subscriptions,
+    Playlists,
     History,
     Settings,
     Menu,
@@ -59,12 +60,10 @@ pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
             }
             KalamIcon::Home => {
                 setup_stroke(cr, w, h);
-                // M3 11 l9 -8 9 8
                 cr.move_to(3.0, 11.0);
                 cr.line_to(12.0, 3.0);
                 cr.line_to(21.0, 11.0);
                 let _ = cr.stroke();
-                // M5 10 v10 h14 V10
                 cr.move_to(5.0, 10.0);
                 cr.line_to(5.0, 20.0);
                 cr.line_to(19.0, 20.0);
@@ -73,31 +72,42 @@ pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
             }
             KalamIcon::Subscriptions => {
                 setup_stroke(cr, w, h);
-                // Top stacked bar: M6 4 h12
                 cr.move_to(6.0, 4.0);
                 cr.line_to(18.0, 4.0);
                 let _ = cr.stroke();
-                // Rounded rect x=3 y=8 w=18 h=12 rx=2
                 rounded_rect(cr, 3.0, 8.0, 18.0, 12.0, 2.0);
                 let _ = cr.stroke();
-                // Play triangle inside: M10 11.5 l5 2.5 -5 2.5 z
                 cr.move_to(10.0, 11.4);
                 cr.line_to(14.8, 14.0);
                 cr.line_to(10.0, 16.6);
                 cr.close_path();
                 let _ = cr.fill();
             }
+            KalamIcon::Playlists => {
+                setup_stroke(cr, w, h);
+                cr.move_to(4.0, 6.0);
+                cr.line_to(19.5, 6.0);
+                let _ = cr.stroke();
+                cr.move_to(4.0, 12.0);
+                cr.line_to(13.5, 12.0);
+                let _ = cr.stroke();
+                cr.move_to(4.0, 18.0);
+                cr.line_to(11.0, 18.0);
+                let _ = cr.stroke();
+                cr.move_to(14.8, 13.0);
+                cr.line_to(20.6, 16.5);
+                cr.line_to(14.8, 20.0);
+                cr.close_path();
+                let _ = cr.fill();
+            }
             KalamIcon::History => {
                 setup_stroke(cr, w, h);
-                // Circular rewind arc: center (12,12), r=8.5 from ~215 deg around to 150 deg
                 cr.arc(12.0, 12.0, 8.5, -0.78 * PI, 0.88 * PI);
                 let _ = cr.stroke();
-                // Arrowhead at top-left: M3.2 4.2 v4.6 h4.6
                 cr.move_to(3.2, 4.0);
                 cr.line_to(3.2, 8.6);
                 cr.line_to(7.8, 8.6);
                 let _ = cr.stroke();
-                // Clock hands: M12 7.2 v4.8 l3.2 2.0
                 cr.move_to(12.0, 7.2);
                 cr.line_to(12.0, 12.0);
                 cr.line_to(15.2, 14.0);
@@ -105,7 +115,6 @@ pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
             }
             KalamIcon::Settings => {
                 setup_stroke(cr, w, h);
-                // Upper slider: M4 7 h9.5, circle (16,7,2.2), M18.5 7 h1.8
                 cr.move_to(4.0, 7.0);
                 cr.line_to(13.5, 7.0);
                 let _ = cr.stroke();
@@ -115,7 +124,6 @@ pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
                 cr.line_to(20.0, 7.0);
                 let _ = cr.stroke();
 
-                // Lower slider: M4 17 h1.6, circle (8,17,2.2), M10.5 17 h9.5
                 cr.move_to(4.0, 17.0);
                 cr.line_to(5.6, 17.0);
                 let _ = cr.stroke();
