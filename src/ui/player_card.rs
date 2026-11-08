@@ -266,9 +266,28 @@ impl PlayerCard {
         if playing {
             self.play_pause_btn
                 .set_icon_name("media-playback-pause-symbolic");
+            self.root.set_visible(true);
         } else {
             self.play_pause_btn
                 .set_icon_name("media-playback-start-symbolic");
+        }
+    }
+
+    pub fn set_narrow_mode(&self, narrow: bool) {
+        if narrow {
+            self.root.set_width_request(-1);
+            self.root.set_halign(Align::Fill);
+            self.root.set_margin_start(0);
+            self.root.set_margin_end(0);
+            self.root.set_margin_bottom(0);
+            self.root.add_css_class("yr-player-narrow");
+        } else {
+            self.root.set_width_request(370);
+            self.root.set_halign(Align::End);
+            self.root.set_margin_start(20);
+            self.root.set_margin_end(20);
+            self.root.set_margin_bottom(20);
+            self.root.remove_css_class("yr-player-narrow");
         }
     }
 

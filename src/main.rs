@@ -264,6 +264,28 @@ fn main() {
                 win_clone.rail.settings_btn.emit_clicked();
             });
         }
+
+        if std::env::var("TEST_NARROW").is_ok() {
+            let win_clone = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let sample1 = backend::models::VideoSummary {
+                    id: "dQw4w9WgXcQ".to_string(),
+                    title: "Exploring the Ancient Terracotta Temples of Bishnupur".to_string(),
+                    channel_id: "UC_ancient_history".to_string(),
+                    channel_name: "Heritage Explorers".to_string(),
+                    channel_avatar_url: "".to_string(),
+                    duration_seconds: Some(742),
+                    duration_text: "12:22".to_string(),
+                    view_count_text: "1.4M views".to_string(),
+                    published_text: "3 days ago".to_string(),
+                    thumbnail_url: "".to_string(),
+                    description_snippet: "".to_string(),
+                };
+                win_clone.player_card.set_queue(vec![sample1], 0);
+                win_clone.player_card.set_progress(252.0, 742.0);
+                win_clone.player_card.set_playing(true);
+            });
+        }
     });
 
     app.run();

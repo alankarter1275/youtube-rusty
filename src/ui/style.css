@@ -139,3 +139,18 @@ preferencesgroup > box > box > list, .boxed-list { background-color: alpha(#E8DD
 .yr-avatar-btn:hover {
   background-color: alpha(#E8DDD5, 0.06);
 }
+
+/* ---------- narrow breakpoint & bottom nav ---------- */
+.yr-bottom-bar {
+  background-color: @yr_surface;
+  border-top: 1px solid alpha(#E8DDD5, 0.10);
+  padding: 6px 12px;
+}
+.yr-player-narrow {
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  margin: 0;
+  box-shadow: 0 -4px 16px alpha(black, 0.40);
+}

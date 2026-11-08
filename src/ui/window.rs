@@ -214,18 +214,40 @@ impl MainWindow {
         let player_card = PlayerCard::new();
         content_overlay.add_overlay(&player_card.root);
 
+        // Bottom Navigation Bar for Narrow Breakpoint (< 600px)
+        let bottom_bar = GtkBox::new(Orientation::Horizontal, 0);
+        bottom_bar.add_css_class("yr-bottom-bar");
+        bottom_bar.set_visible(false);
+
+        let bottom_home = create_bottom_nav_btn("user-home-symbolic", "Home", true);
+        let bottom_subs = create_bottom_nav_btn("starred-symbolic", "Subscriptions", false);
+        let bottom_hist = create_bottom_nav_btn("document-open-recent-symbolic", "History", false);
+        let bottom_settings = create_bottom_nav_btn("emblem-system-symbolic", "Settings", false);
+
+        bottom_bar.append(&bottom_home);
+        bottom_bar.append(&bottom_subs);
+        bottom_bar.append(&bottom_hist);
+        bottom_bar.append(&bottom_settings);
+
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.add_bottom_bar(&bottom_bar);
         toolbar_view.set_content(Some(&content_overlay));
 
         let toast_overlay = adw::ToastOverlay::new();
         toast_overlay.set_child(Some(&toolbar_view));
 
+        let (def_w, def_h) = if std::env::var("TEST_NARROW").is_ok() {
+            (460, 680)
+        } else {
+            (1280, 780)
+        };
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("youtube-rusty")
-            .default_width(1280)
-            .default_height(780)
+            .default_width(def_w)
+            .default_height(def_h)
             .content(&toast_overlay)
             .build();
 
@@ -271,6 +293,49 @@ impl MainWindow {
                 .toast_overlay
                 .add_toast(adw::Toast::new("Watch history cleared"));
             this_clear.load_history();
+        });
+
+        // Breakpoint for Narrow Layout (< 600px)
+        if let Ok(cond) = adw::BreakpointCondition::parse("max-width: 600px") {
+            let breakpoint = adw::Breakpoint::new(cond);
+
+            let this_narrow = this.clone();
+            let b_bar_narrow = bottom_bar.clone();
+            breakpoint.connect_apply(move |_| {
+                this_narrow.rail.container.set_visible(false);
+                b_bar_narrow.set_visible(true);
+                this_narrow.player_card.set_narrow_mode(true);
+                this_narrow.flow_box.set_max_children_per_line(1);
+            });
+
+            let this_wide = this.clone();
+            let b_bar_wide = bottom_bar.clone();
+            breakpoint.connect_unapply(move |_| {
+                this_wide.rail.container.set_visible(true);
+                b_bar_wide.set_visible(false);
+                this_wide.player_card.set_narrow_mode(false);
+                this_wide.flow_box.set_max_children_per_line(4);
+            });
+
+            this.window.add_breakpoint(breakpoint);
+        }
+
+        // Wire Bottom Navigation Bar buttons
+        let this_bh = this.clone();
+        bottom_home.connect_clicked(move |_| {
+            this_bh.load_trending();
+        });
+        let this_bs = this.clone();
+        bottom_subs.connect_clicked(move |_| {
+            this_bs.load_subscriptions();
+        });
+        let this_bhi = this.clone();
+        bottom_hist.connect_clicked(move |_| {
+            this_bhi.load_history();
+        });
+        let this_bset = this.clone();
+        bottom_settings.connect_clicked(move |_| {
+            this_bset.open_settings();
         });
 
         this.setup_events(&chip_trending, &chip_gaming, &chip_music, &chip_news);
@@ -1231,4 +1296,18 @@ fn load_custom_css() {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
+}
+
+fn create_bottom_nav_btn(icon_name: &str, tooltip: &str, is_active: bool) -> Button {
+    let btn = Button::from_icon_name(icon_name);
+    btn.add_css_class("yr-rail-btn");
+    btn.set_tooltip_text(Some(tooltip));
+    btn.set_hexpand(true);
+    btn.set_halign(Align::Center);
+    btn.set_width_request(44);
+    btn.set_height_request(44);
+    if is_active {
+        btn.add_css_class("active");
+    }
+    btn
 }
