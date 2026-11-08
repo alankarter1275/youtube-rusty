@@ -1319,17 +1319,17 @@ impl MainWindow {
         attach_choice_popover(
             &self.pref_quality_btn,
             &[
-                ("360p", "360p"),
-                ("720p", "720p"),
-                ("1080p", "1080p"),
-                ("audio", "Audio only"),
+                (Quality::P360.as_setting(), "360p"),
+                (Quality::P720.as_setting(), "720p"),
+                (Quality::P1080.as_setting(), "1080p"),
+                (Quality::AudioOnly.as_setting(), "Audio only"),
             ],
             {
                 let weak = Rc::downgrade(self);
                 move |key| {
                     if let Some(w) = weak.upgrade() {
                         let mut s = w.settings_store.load();
-                        s.default_quality = key.to_string();
+                        s.default_quality = Quality::from_setting(key).as_setting().to_string();
                         w.settings_store.save(&s);
                         w.sync_preferences_ui(&s);
                     }
