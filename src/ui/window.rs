@@ -3,6 +3,7 @@ use crate::backend::engine::Engine;
 use crate::backend::models::VideoSummary;
 use crate::player::mpv::Quality;
 use crate::player::mpv_ipc::{MpvEvent, MpvSession};
+use crate::ui::channel_page::ChannelPage;
 use crate::ui::details_sheet::{ContextMenu, DetailsSheet};
 use crate::ui::player_card::PlayerCard;
 use crate::ui::rail::{Rail, RailTab};
@@ -310,8 +311,9 @@ impl MainWindow {
                     this_queue.queue_video(sum);
                 };
 
-                let on_open_channel = move |_cid: String, _cname: String| {
-                    // Phase 5: channel page
+                let this_chan = this.clone();
+                let on_open_channel = move |cid: String, cname: String| {
+                    this_chan.open_channel(&cid, &cname);
                 };
 
                 DetailsSheet::show(
@@ -451,6 +453,64 @@ impl MainWindow {
                 }
             }
         });
+    }
+
+    pub fn open_channel(self: &Rc<Self>, channel_id: &str, channel_name: &str) -> Option<Rc<ChannelPage>> {
+        if channel_id.is_empty() {
+            return None;
+        }
+
+        let channel_page = ChannelPage::new(channel_id, channel_name);
+
+        let this_all = self.clone();
+        channel_page.connect_play_all(move |shorts| {
+            if let Some(first) = shorts.first() {
+                this_all.play_video(first.clone(), Quality::P360);
+                for item in shorts.iter().skip(1) {
+                    this_all.queue_video(item.clone());
+                }
+            }
+        });
+
+        self.nav_view.push(&channel_page.page);
+
+        // Fetch channel videos and shorts
+        let (ch_tx, ch_rx) = async_channel::bounded::<
+            Result<(crate::backend::models::ChannelDetails, Vec<VideoSummary>), String>,
+        >(1);
+        let (sh_tx, sh_rx) =
+            async_channel::bounded::<Result<Vec<VideoSummary>, String>>(1);
+
+        let engine = self.engine.clone();
+        let cid = channel_id.to_string();
+        self.runtime.spawn(async move {
+            let res = engine.channel_videos(&cid).await;
+            let _ = ch_tx.send(res).await;
+        });
+
+        let engine = self.engine.clone();
+        let cid2 = channel_id.to_string();
+        self.runtime.spawn(async move {
+            let res = engine.channel_shorts(&cid2).await;
+            let _ = sh_tx.send(res).await;
+        });
+
+        let cp_cl = channel_page.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Ok((details, videos))) = ch_rx.recv().await {
+                cp_cl.set_channel_details(details);
+                cp_cl.set_videos(videos);
+            }
+        });
+
+        let cp_sh = channel_page.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Ok(shorts)) = sh_rx.recv().await {
+                cp_sh.set_shorts(shorts);
+            }
+        });
+
+        Some(channel_page)
     }
 
     pub fn search(self: &Rc<Self>, query: &str) {
@@ -612,8 +672,9 @@ impl MainWindow {
                 this_queue.queue_video(sum);
             };
 
-            let on_open_channel = move |_cid: String, _cname: String| {
-                // Phase 5
+            let this_chan = self.clone();
+            let on_open_channel = move |cid: String, cname: String| {
+                this_chan.open_channel(&cid, &cname);
             };
 
             ContextMenu::attach(

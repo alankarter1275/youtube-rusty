@@ -199,4 +199,56 @@ impl VideoCard {
             summary: summary.clone(),
         }
     }
+
+    /// Shorts Card: 6-column 9:16 aspect ratio vertical card
+    pub fn new_short(summary: &VideoSummary) -> Self {
+        let root_box = GtkBox::new(Orientation::Vertical, 8);
+        root_box.set_width_request(180);
+        root_box.add_css_class("yr-card");
+
+        let picture = Picture::new();
+        picture.set_width_request(180);
+        picture.set_height_request(320);
+        picture.set_can_shrink(false);
+        picture.set_content_fit(gtk4::ContentFit::Cover);
+
+        let overlay = Overlay::new();
+        overlay.set_child(Some(&picture));
+        overlay.add_css_class("yr-thumb");
+
+        if !summary.duration_text.is_empty() {
+            let duration_label = Label::new(Some(&summary.duration_text));
+            duration_label.add_css_class("yr-duration");
+            duration_label.set_halign(Align::End);
+            duration_label.set_valign(Align::End);
+            overlay.add_overlay(&duration_label);
+        }
+
+        let title_label = Label::new(Some(&summary.title));
+        title_label.set_wrap(true);
+        title_label.set_lines(2);
+        title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        title_label.set_halign(Align::Start);
+        title_label.add_css_class("yr-title");
+
+        let views_label = Label::new(Some(&summary.view_count_text));
+        views_label.set_halign(Align::Start);
+        views_label.add_css_class("yr-meta");
+
+        root_box.append(&overlay);
+        root_box.append(&title_label);
+        root_box.append(&views_label);
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_child(Some(&root_box));
+
+        let avatar = adw::Avatar::new(24, Some(&summary.channel_name), true);
+
+        Self {
+            container,
+            picture,
+            avatar,
+            summary: summary.clone(),
+        }
+    }
 }

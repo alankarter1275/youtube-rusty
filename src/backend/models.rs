@@ -14,3 +14,13 @@ pub struct VideoSummary {
     pub thumbnail_url: String,
     pub description_snippet: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDetails {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    pub subscriber_count_text: String,
+    pub video_count_text: String,
+    pub avatar_url: String,
+}
