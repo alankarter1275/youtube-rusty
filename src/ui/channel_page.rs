@@ -1592,7 +1592,7 @@ impl ChannelPage {
                             pstore.create_with_videos(
                                 &pname,
                                 remote.videos,
-                                Some(pid),
+                                Some(remote.id),
                                 &pchan,
                             );
                             on_pl_changed();
