@@ -371,12 +371,13 @@ progressbar.yr-progress progress {
 }
 
 /* ---------- popovers, search dropdown, menus, sheet ---------- */
-popover > contents {
+popover > contents,
+.yr-search-dropdown {
   background-color: @yr_surface;
   border: 1px solid alpha(#E8DDD5, 0.14);
   border-radius: 14px;
   padding: 6px;
-  box-shadow: 0 8px 24px alpha(black, 0.5);
+  box-shadow: 0 10px 28px alpha(black, 0.52);
 }
 popover modelbutton, .yr-menu-item {
   border-radius: 10px;

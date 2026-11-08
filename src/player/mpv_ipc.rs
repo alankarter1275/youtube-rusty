@@ -32,7 +32,8 @@ pub struct MpvSession {
 
 impl MpvSession {
     /// Creates an `MpvSession` handle immediately (`--ytdl=no`, zero Python / `yt-dlp`).
-    /// Commands sent before MPV finishes opening its Unix socket are queued and flushed in order.
+    /// Keeps `--force-window=no` so MPV only shows a window when an actual video stream plays
+    /// (avoiding empty `"Drop files or URLs here to play"` idle windows on tiling WMs).
     pub fn spawn(
         runtime: &Runtime,
         settings: &AppSettings,
@@ -138,7 +139,7 @@ impl MpvSession {
                     let _ = std::fs::remove_file(&sock_for_task);
                     let _ = event_sender
                         .send(MpvEvent::Error(
-                            "Could not connect to MPV player window.".to_string(),
+                            "Could not connect to MPV player.".to_string(),
                         ))
                         .await;
                     let _ = event_sender.send(MpvEvent::ProcessExited).await;
@@ -283,14 +284,15 @@ impl MpvSession {
             }));
         }
         self.send_json(json!({
-            "command": ["set_property", "referrer", "https://www.youtube.com/"]
+            "command": ["set_property", "referrer", resolved.referer]
+        }));
+        self.send_json(json!({
+            "command": ["set_property", "force-window", "no"]
         }));
         if resolved.is_audio_only {
             self.send_json(json!({ "command": ["set_property", "vid", "no"] }));
-            self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
         } else {
             self.send_json(json!({ "command": ["set_property", "vid", "auto"] }));
-            self.send_json(json!({ "command": ["set_property", "force-window", "immediate"] }));
         }
         self.send_json(json!({ "command": ["set_property", "pause", false] }));
         self.send_json(json!({ "command": ["set_property", "force-media-title", title] }));
@@ -310,7 +312,6 @@ impl MpvSession {
 
     pub fn stop(&self) {
         self.send_json(json!({ "command": ["stop"] }));
-        self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
     }
 
     pub fn shutdown(&self) {
@@ -322,8 +323,12 @@ impl MpvSession {
                 let _ = proc.wait();
             }
         }
-        let _ = std::fs::remove_file(&self.sock_path);
+        let _ = std::fs::remove_file(&sock_path_clone(&self.sock_path));
     }
+}
+
+fn sock_path_clone(p: &PathBuf) -> PathBuf {
+    p.clone()
 }
 
 impl Drop for MpvSession {

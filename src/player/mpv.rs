@@ -50,12 +50,13 @@ pub struct ResolvedPlayback {
     pub primary_url: String,
     pub audio_url: Option<String>,
     pub user_agent: String,
+    pub referer: String,
     pub is_audio_only: bool,
     pub duration_secs: Option<u64>,
 }
 
 impl ResolvedPlayback {
-    /// Builds either a direct stream URL (for muxed MP4, HLS manifests, or audio-only)
+    /// Builds either a direct stream URL (for muxed MP4, HLS `.m3u8` playlists, or audio-only)
     /// or MPV's native multi-track `edl://` timeline URL when separate adaptive video + audio
     /// streams are combined (works across all MPV versions with `--ytdl=no`).
     pub fn to_loadfile_url(&self) -> String {
@@ -96,6 +97,7 @@ mod tests {
             primary_url: "https://example.com/v.mp4".to_string(),
             audio_url: None,
             user_agent: "UA".to_string(),
+            referer: String::new(),
             is_audio_only: false,
             duration_secs: Some(60),
         };
@@ -105,6 +107,7 @@ mod tests {
             primary_url: "https://example.com/video".to_string(),
             audio_url: Some("https://example.com/audio".to_string()),
             user_agent: "UA".to_string(),
+            referer: String::new(),
             is_audio_only: false,
             duration_secs: Some(60),
         };

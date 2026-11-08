@@ -26,9 +26,10 @@ use crate::ui::video_card::{
 use adw::prelude::*;
 use gtk4::gdk::{self, Display};
 use gtk4::{
-    gio, glib, Align, Box as GtkBox, Button, CssProvider, Editable, Entry, EventControllerFocus,
-    EventControllerKey, FlowBox, GestureClick, Image, Label, MenuButton, Orientation, Overlay,
-    Popover, PropagationPhase, ScrolledWindow, SearchEntry, SelectionMode, Separator, Switch,
+    gio, glib, Align, Box as GtkBox, Button, CssProvider, Editable, Entry, EntryIconPosition,
+    EventControllerFocus, EventControllerKey, FlowBox, GestureClick, Image, Label, MenuButton,
+    Orientation, Overlay, Popover, PropagationPhase, ScrolledWindow, SelectionMode, Separator,
+    Switch,
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
@@ -64,12 +65,13 @@ enum ActiveView {
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     back_btn: Button,
-    pub search_entry: SearchEntry,
-    search_suggest_pop: Popover,
+    pub search_entry: Entry,
+    search_dropdown_clamp: adw::Clamp,
     search_suggest_box: GtkBox,
     suggest_items: RefCell<Vec<(String, GtkBox)>>,
     suggest_selected_idx: Cell<isize>,
     suggest_seq: Cell<u64>,
+    typed_before_nav: RefCell<String>,
     suppress_search_clear: Cell<bool>,
     pub rail: Rail,
     bottom_home: Button,
@@ -186,40 +188,23 @@ impl MainWindow {
         set_pointer(&back_btn);
         header_bar.pack_start(&back_btn);
 
-        // Centered Search Bar + Non-autohide History/Suggestions Popover
+        // Centered Search Bar (synchronous Entry + in-window Overlay dropdown for flicker-free Wayland UX)
         let search_clamp = adw::Clamp::builder()
             .maximum_size(440)
             .tightening_threshold(240)
             .hexpand(true)
             .build();
-        let search_wrap = GtkBox::new(Orientation::Vertical, 0);
-        search_wrap.set_hexpand(true);
 
-        let search_entry = SearchEntry::builder()
+        let search_entry = Entry::builder()
             .placeholder_text("Search YouTube or paste link")
+            .primary_icon_name("system-search-symbolic")
+            .primary_icon_activatable(false)
+            .primary_icon_sensitive(false)
             .width_request(120)
             .hexpand(true)
             .build();
         search_entry.add_css_class("yr-search");
-        search_wrap.append(&search_entry);
-
-        let search_suggest_pop = Popover::new();
-        search_suggest_pop.set_parent(&search_wrap);
-        search_suggest_pop.set_has_arrow(false);
-        search_suggest_pop.set_autohide(false);
-        search_suggest_pop.set_can_focus(false);
-        search_suggest_pop.set_position(gtk4::PositionType::Bottom);
-
-        let pop_cleanup = search_suggest_pop.clone();
-        search_wrap.connect_destroy(move |_| {
-            pop_cleanup.unparent();
-        });
-
-        let search_suggest_box = GtkBox::new(Orientation::Vertical, 2);
-        search_suggest_box.set_width_request(340);
-        search_suggest_pop.set_child(Some(&search_suggest_box));
-
-        search_clamp.set_child(Some(&search_wrap));
+        search_clamp.set_child(Some(&search_entry));
         header_bar.set_title_widget(Some(&search_clamp));
 
         // Primary Menu Button at the top right
@@ -557,6 +542,24 @@ impl MainWindow {
         content_overlay.set_vexpand(true);
         content_overlay.set_child(Some(&nav_view));
 
+        let search_suggest_box = GtkBox::new(Orientation::Vertical, 2);
+        search_suggest_box.add_css_class("yr-search-dropdown");
+        search_suggest_box.set_hexpand(true);
+
+        let search_dropdown_clamp = adw::Clamp::builder()
+            .maximum_size(440)
+            .tightening_threshold(240)
+            .hexpand(true)
+            .halign(Align::Fill)
+            .valign(Align::Start)
+            .margin_top(6)
+            .margin_start(16)
+            .margin_end(16)
+            .visible(false)
+            .child(&search_suggest_box)
+            .build();
+        content_overlay.add_overlay(&search_dropdown_clamp);
+
         let player_card = PlayerCard::new(image_loader.clone());
         content_overlay.add_overlay(&player_card.root);
 
@@ -617,11 +620,12 @@ impl MainWindow {
             window,
             back_btn,
             search_entry,
-            search_suggest_pop,
+            search_dropdown_clamp,
             search_suggest_box,
             suggest_items: RefCell::new(Vec::new()),
             suggest_selected_idx: Cell::new(-1),
             suggest_seq: Cell::new(0),
+            typed_before_nav: RefCell::new(String::new()),
             suppress_search_clear: Cell::new(false),
             rail,
             bottom_home,
@@ -774,6 +778,8 @@ impl MainWindow {
                  .yr-segmented {{ background-color: alpha(#1C1512, 0.08); }}
                  .yr-segmented .yr-chip:checked {{ background-color: #1C1512; color: #FAF6F2; }}
                  .yr-search, entry.yr-search, searchentry.yr-search {{ background-color: alpha(#1C1512, 0.07); }}
+                 popover > contents, .yr-search-dropdown {{ border-color: alpha(#1C1512, 0.14); box-shadow: 0 10px 28px alpha(black, 0.16); }}
+                 .yr-suggest-row:hover, .yr-suggest-row.active {{ background-color: alpha(#1C1512, 0.08); }}
                  .yr-btn {{ background-color: alpha(#1C1512, 0.09); }}
                  .yr-pref-card, .yr-entity-card, .yr-playlist-card {{ background-color: alpha(#1C1512, 0.05); }}
                  .yr-pref-sep {{ background-color: alpha(#1C1512, 0.08); }}"
@@ -878,8 +884,6 @@ impl MainWindow {
                         w.rail.container.set_visible(!narrow);
                         b_bar.set_visible(narrow);
                         w.player_card.set_narrow_mode(narrow);
-                        w.search_suggest_box
-                            .set_width_request(if narrow { 250 } else { 360 });
                         w.apply_side_margins();
                         w.update_flow_columns();
                         w.notify_channels_layout(narrow, compact, g_cols, s_cols);
@@ -999,18 +1003,40 @@ impl MainWindow {
         }
     }
 
+    fn update_search_clear_icon(&self) {
+        if self.search_entry.text().is_empty() {
+            self.search_entry
+                .set_secondary_icon_name(Option::<&str>::None);
+            self.search_entry.set_secondary_icon_activatable(false);
+        } else {
+            self.search_entry
+                .set_secondary_icon_name(Some("edit-clear-symbolic"));
+            self.search_entry.set_secondary_icon_activatable(true);
+            self.search_entry
+                .set_secondary_icon_tooltip_text(Some("Clear search"));
+        }
+    }
+
+    fn hide_search_dropdown(&self) {
+        self.search_dropdown_clamp.set_visible(false);
+        self.suggest_selected_idx.set(-1);
+    }
+
     fn set_search_text_quietly(&self, text: &str) {
         self.suppress_search_clear.set(true);
         self.search_entry.set_text(text);
         self.search_entry.set_position(-1);
+        self.update_search_clear_icon();
         self.suppress_search_clear.set(false);
     }
 
     fn clear_search_bar_quietly(&self) {
-        self.search_suggest_pop.popdown();
+        self.hide_search_dropdown();
+        *self.typed_before_nav.borrow_mut() = String::new();
         if !self.search_entry.text().is_empty() {
             self.suppress_search_clear.set(true);
             self.search_entry.set_text("");
+            self.update_search_clear_icon();
             self.suppress_search_clear.set(false);
         }
     }
@@ -1139,34 +1165,53 @@ impl MainWindow {
     }
 
     fn setup_search_suggestions_bar(self: &Rc<Self>) {
-        // Show recent search history when focusing the search bar
+        // Secondary clear icon (`×`) inside Search Entry clears text without hijacking the active page
+        let weak_icon = Rc::downgrade(self);
+        self.search_entry.connect_icon_release(move |_, pos| {
+            if pos == EntryIconPosition::Secondary {
+                if let Some(w) = weak_icon.upgrade() {
+                    w.set_search_text_quietly("");
+                    *w.typed_before_nav.borrow_mut() = String::new();
+                    w.search_entry.grab_focus();
+                    w.refresh_search_dropdown();
+                }
+            }
+        });
+
+        // Show recent search history or current suggestions when focusing the search bar
         let focus_ctrl = EventControllerFocus::new();
         let weak_enter = Rc::downgrade(self);
         focus_ctrl.connect_enter(move |_| {
             if let Some(w) = weak_enter.upgrade() {
+                *w.typed_before_nav.borrow_mut() = w.search_entry.text().to_string();
                 w.refresh_search_dropdown();
             }
         });
-        let weak_leave = Rc::downgrade(self);
-        focus_ctrl.connect_leave(move |_| {
-            let wl = weak_leave.clone();
-            glib::timeout_add_local_once(Duration::from_millis(140), move || {
-                if let Some(w) = wl.upgrade() {
-                    let still_in_search = gtk4::prelude::GtkWindowExt::focus(&w.window)
+        self.search_entry.add_controller(focus_ctrl);
+
+        // Dismiss the in-window dropdown cleanly when clicking anywhere outside on the content view
+        let outside_click = GestureClick::new();
+        outside_click.set_propagation_phase(PropagationPhase::Capture);
+        let weak_out = Rc::downgrade(self);
+        outside_click.connect_pressed(move |_, _, _, _| {
+            if let Some(w) = weak_out.upgrade() {
+                if w.search_dropdown_clamp.is_visible() {
+                    w.hide_search_dropdown();
+                    let in_search = gtk4::prelude::GtkWindowExt::focus(&w.window)
                         .map(|f| {
                             f.is_ancestor(&w.search_entry)
                                 || &f == w.search_entry.upcast_ref::<gtk4::Widget>()
                         })
                         .unwrap_or(false);
-                    if !still_in_search {
-                        w.search_suggest_pop.popdown();
+                    if in_search {
+                        gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     }
                 }
-            });
+            }
         });
-        self.search_entry.add_controller(focus_ctrl);
+        self.nav_view.add_controller(outside_click);
 
-        // Up / Down / Escape keyboard navigation inside SearchEntry
+        // Up / Down / Escape keyboard navigation inside Search Entry
         let key_ctrl = EventControllerKey::new();
         key_ctrl.set_propagation_phase(PropagationPhase::Capture);
         let weak_key = Rc::downgrade(self);
@@ -1176,25 +1221,26 @@ impl MainWindow {
             };
             match key {
                 gdk::Key::Down => {
-                    if !w.search_suggest_pop.is_visible() {
+                    if !w.search_dropdown_clamp.is_visible() {
                         w.refresh_search_dropdown();
                     }
                     w.step_suggestion_selection(1);
                     glib::Propagation::Stop
                 }
                 gdk::Key::Up => {
-                    if w.search_suggest_pop.is_visible() {
+                    if w.search_dropdown_clamp.is_visible() {
                         w.step_suggestion_selection(-1);
                         return glib::Propagation::Stop;
                     }
                     glib::Propagation::Proceed
                 }
                 gdk::Key::Escape => {
-                    if w.search_suggest_pop.is_visible() {
-                        w.search_suggest_pop.popdown();
+                    if w.search_dropdown_clamp.is_visible() {
+                        w.hide_search_dropdown();
                         return glib::Propagation::Stop;
                     }
-                    glib::Propagation::Proceed
+                    gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
+                    glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
             }
@@ -1209,6 +1255,9 @@ impl MainWindow {
             return;
         }
         let cur = self.suggest_selected_idx.get();
+        if cur == -1 && delta > 0 {
+            *self.typed_before_nav.borrow_mut() = self.search_entry.text().to_string();
+        }
         let next = (cur + delta).clamp(-1, len - 1);
         self.suggest_selected_idx.set(next);
 
@@ -1224,6 +1273,9 @@ impl MainWindow {
             if let Some((txt, _)) = items.get(next as usize) {
                 self.set_search_text_quietly(txt);
             }
+        } else {
+            let draft = self.typed_before_nav.borrow().clone();
+            self.set_search_text_quietly(&draft);
         }
     }
 
@@ -1243,7 +1295,7 @@ impl MainWindow {
             return;
         }
 
-        // Immediate local history prefix/substring matches while remote suggestions debounce
+        // Immediate local history matches without hiding/blinking if remote suggestions are in flight
         let lower = typed.to_lowercase();
         let local_matches: Vec<String> = self
             .search_history_store
@@ -1252,11 +1304,13 @@ impl MainWindow {
             .filter(|h| h.to_lowercase().contains(&lower))
             .take(3)
             .collect();
-        self.render_suggestions_dropdown(&local_matches, &[]);
+        if !local_matches.is_empty() {
+            self.render_suggestions_dropdown(&local_matches, &[]);
+        }
 
         let weak = Rc::downgrade(self);
         let query_owned = typed;
-        glib::timeout_add_local_once(Duration::from_millis(180), move || {
+        glib::timeout_add_local_once(Duration::from_millis(160), move || {
             let Some(w) = weak.upgrade() else {
                 return;
             };
@@ -1326,6 +1380,8 @@ impl MainWindow {
             .label("Open YouTube link directly ↵")
             .hexpand(true)
             .build();
+        btn.set_can_focus(false);
+        btn.set_focus_on_click(false);
         btn.add_css_class("flat");
         set_pointer(&btn);
         if let Some(lbl) = btn.child().and_then(|c| c.downcast::<Label>().ok()) {
@@ -1337,7 +1393,8 @@ impl MainWindow {
         let url_owned = url.to_string();
         btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.search_suggest_pop.popdown();
+                w.hide_search_dropdown();
+                gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                 w.submit_search_or_url(&url_owned);
             }
         });
@@ -1346,13 +1403,13 @@ impl MainWindow {
         self.suggest_items
             .borrow_mut()
             .push((url.to_string(), row));
-        self.search_suggest_pop.popup();
+        self.search_dropdown_clamp.set_visible(true);
     }
 
     fn render_history_dropdown(self: &Rc<Self>, history: &[String]) {
         self.clear_suggest_box();
         if history.is_empty() {
-            self.search_suggest_pop.popdown();
+            self.hide_search_dropdown();
             return;
         }
 
@@ -1369,6 +1426,8 @@ impl MainWindow {
         head_lbl.set_halign(Align::Start);
 
         let clear_all_btn = Button::with_label("Clear all");
+        clear_all_btn.set_can_focus(false);
+        clear_all_btn.set_focus_on_click(false);
         clear_all_btn.add_css_class("flat");
         clear_all_btn.add_css_class("yr-link");
         set_pointer(&clear_all_btn);
@@ -1376,7 +1435,7 @@ impl MainWindow {
         clear_all_btn.connect_clicked(move |_| {
             if let Some(w) = weak_clear.upgrade() {
                 w.search_history_store.clear();
-                w.search_suggest_pop.popdown();
+                w.hide_search_dropdown();
                 w.search_entry.grab_focus();
             }
         });
@@ -1395,6 +1454,8 @@ impl MainWindow {
             row.append(&icon);
 
             let pick_btn = Button::builder().label(item).hexpand(true).build();
+            pick_btn.set_can_focus(false);
+            pick_btn.set_focus_on_click(false);
             pick_btn.add_css_class("flat");
             set_pointer(&pick_btn);
             if let Some(lbl) = pick_btn.child().and_then(|c| c.downcast::<Label>().ok()) {
@@ -1408,7 +1469,8 @@ impl MainWindow {
             pick_btn.connect_clicked(move |_| {
                 if let Some(w) = weak_pick.upgrade() {
                     w.set_search_text_quietly(&q_pick);
-                    w.search_suggest_pop.popdown();
+                    *w.typed_before_nav.borrow_mut() = q_pick.clone();
+                    w.hide_search_dropdown();
                     gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     w.submit_search_or_url(&q_pick);
                 }
@@ -1418,6 +1480,8 @@ impl MainWindow {
                 .icon_name("window-close-symbolic")
                 .tooltip_text("Remove from search history")
                 .build();
+            rm_btn.set_can_focus(false);
+            rm_btn.set_focus_on_click(false);
             rm_btn.add_css_class("flat");
             rm_btn.add_css_class("circular");
             set_pointer(&rm_btn);
@@ -1428,7 +1492,6 @@ impl MainWindow {
                     w.search_history_store.remove(&q_rm);
                     let updated = w.search_history_store.load_all();
                     w.render_history_dropdown(&updated);
-                    w.search_entry.grab_focus();
                 }
             });
 
@@ -1440,7 +1503,7 @@ impl MainWindow {
                 .push((item.clone(), row));
         }
 
-        self.search_suggest_pop.popup();
+        self.search_dropdown_clamp.set_visible(true);
     }
 
     fn render_suggestions_dropdown(self: &Rc<Self>, local_hist: &[String], remote: &[String]) {
@@ -1463,7 +1526,7 @@ impl MainWindow {
         }
 
         if combined.is_empty() {
-            self.search_suggest_pop.popdown();
+            self.hide_search_dropdown();
             return;
         }
 
@@ -1481,6 +1544,8 @@ impl MainWindow {
             row.append(&icon);
 
             let btn = Button::builder().label(&text).hexpand(true).build();
+            btn.set_can_focus(false);
+            btn.set_focus_on_click(false);
             btn.add_css_class("flat");
             set_pointer(&btn);
             if let Some(lbl) = btn.child().and_then(|c| c.downcast::<Label>().ok()) {
@@ -1494,7 +1559,8 @@ impl MainWindow {
             btn.connect_clicked(move |_| {
                 if let Some(w) = weak_pick.upgrade() {
                     w.set_search_text_quietly(&q_pick);
-                    w.search_suggest_pop.popdown();
+                    *w.typed_before_nav.borrow_mut() = q_pick.clone();
+                    w.hide_search_dropdown();
                     gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     w.submit_search_or_url(&q_pick);
                 }
@@ -1506,6 +1572,8 @@ impl MainWindow {
                     .icon_name("window-close-symbolic")
                     .tooltip_text("Remove from search history")
                     .build();
+                rm_btn.set_can_focus(false);
+                rm_btn.set_focus_on_click(false);
                 rm_btn.add_css_class("flat");
                 rm_btn.add_css_class("circular");
                 set_pointer(&rm_btn);
@@ -1515,7 +1583,6 @@ impl MainWindow {
                     if let Some(w) = weak_rm.upgrade() {
                         w.search_history_store.remove(&q_rm);
                         w.refresh_search_dropdown();
-                        w.search_entry.grab_focus();
                     }
                 });
                 row.append(&rm_btn);
@@ -1525,7 +1592,7 @@ impl MainWindow {
             self.suggest_items.borrow_mut().push((text, row));
         }
 
-        self.search_suggest_pop.popup();
+        self.search_dropdown_clamp.set_visible(true);
     }
 
     fn setup_playlist_popovers(self: &Rc<Self>) {
@@ -1764,8 +1831,8 @@ impl MainWindow {
                             || &f == w.search_entry.upcast_ref::<gtk4::Widget>()
                     })
                     .unwrap_or(false);
-                if search_focused {
-                    w.search_suggest_pop.popdown();
+                if search_focused || w.search_dropdown_clamp.is_visible() {
+                    w.hide_search_dropdown();
                     gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     return glib::Propagation::Stop;
                 }
@@ -1823,12 +1890,12 @@ impl MainWindow {
             }
         });
 
-        // Search activation + live suggestions + clearing search
+        // Search activation + synchronous live suggestions (no delayed phantom signals or page hijacks)
         let weak = Rc::downgrade(self);
         self.search_entry.connect_activate(move |entry| {
             let query = entry.text().trim().to_string();
             if let Some(w) = weak.upgrade() {
-                w.search_suggest_pop.popdown();
+                w.hide_search_dropdown();
                 if !query.is_empty() {
                     gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     w.submit_search_or_url(&query);
@@ -1837,17 +1904,15 @@ impl MainWindow {
         });
 
         let weak = Rc::downgrade(self);
-        self.search_entry.connect_search_changed(move |entry| {
+        self.search_entry.connect_changed(move |entry| {
             let Some(w) = weak.upgrade() else {
                 return;
             };
+            w.update_search_clear_icon();
             if w.suppress_search_clear.get() {
                 return;
             }
-            let text = entry.text();
-            if text.is_empty() && matches!(*w.active_view.borrow(), ActiveView::Search(_)) {
-                w.restore_previous_non_search_view();
-            }
+            *w.typed_before_nav.borrow_mut() = entry.text().to_string();
             let search_focused = gtk4::prelude::GtkWindowExt::focus(&w.window)
                 .map(|f| {
                     f.is_ancestor(&w.search_entry)

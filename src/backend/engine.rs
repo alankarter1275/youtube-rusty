@@ -17,23 +17,59 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 
-const RP_IOS_UA: &str =
-    "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X)";
-const RP_ANDROID_UA: &str = "com.google.android.youtube/19.44.38 (Linux; U; Android 11) gzip";
+const VISIONOS_APP_VERSION: &str = "1.04";
+const VISIONOS_APP_UA: &str =
+    "com.google.visionos.youtube/1.04(RealityDevice17,1; U; CPU visionOS 26_6_0 like Mac OS X; US)";
+
+const VISIONOS_SAFARI_VERSION: &str = "1.02";
+const VISIONOS_SAFARI_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+
 const RP_TV_UA: &str = "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 NativeTVAds Safari/538.1";
+const RP_DESKTOP_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+const YT_WEB_REFERER: &str = "https://www.youtube.com/";
 
-const VR_CLIENT_VERSION: &str = "1.62.27";
-const VR_UA: &str = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-const MODERN_IOS_VERSION: &str = "20.22.1";
-const MODERN_IOS_UA: &str =
-    "com.google.ios.youtube/20.22.1 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)";
+fn random_innertube_token(len: usize) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e3779b97f4a7c15);
+    let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut state = nanos ^ seq.wrapping_mul(0x9e3779b97f4a7c15) ^ (std::process::id() as u64);
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        out.push(ALPHABET[(z & 63) as usize] as char);
+    }
+    out
+}
+
+fn append_cpn_param(url: &str, cpn: &str) -> String {
+    if cpn.is_empty() || url.contains("&cpn=") || url.contains("?cpn=") || url.contains("/cpn/") {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{url}&cpn={cpn}")
+    } else {
+        format!("{url}?cpn={cpn}")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PageCursor {
@@ -132,6 +168,7 @@ struct CandidatePool {
     audio: Vec<RawAudioCandidate>,
     hls_url: Option<String>,
     user_agent: String,
+    referer: String,
     duration_secs: Option<u64>,
     title: Option<String>,
     channel_id: String,
@@ -160,6 +197,7 @@ fn cursor_from_paginator<T>(p: &Paginator<T>) -> Option<PageCursor> {
 pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
+    visitor_data: RwLock<Option<String>>,
 }
 
 impl Engine {
@@ -174,45 +212,153 @@ impl Engine {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { rp, http }
+        Self {
+            rp,
+            http,
+            visitor_data: RwLock::new(None),
+        }
     }
 
-    /// Resolves direct YouTube media stream URLs in pure Rust without `yt-dlp` or Python.
+    async fn ensure_visitor_data(&self) -> Option<String> {
+        if let Some(cached) = self.visitor_data.read().await.clone() {
+            return Some(cached);
+        }
+
+        let body = json!({
+            "context": {
+                "client": {
+                    "clientName": "VISIONOS",
+                    "clientVersion": VISIONOS_APP_VERSION,
+                    "clientScreen": "WATCH",
+                    "platform": "MOBILE",
+                    "deviceMake": "Apple",
+                    "deviceModel": "RealityDevice17,1",
+                    "osName": "visionOS",
+                    "osVersion": "26.6.0.23O770",
+                    "hl": "en",
+                    "gl": "US",
+                    "utcOffsetMinutes": 0
+                }
+            }
+        });
+
+        let fetched = self
+            .http
+            .post("https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
+            .timeout(Duration::from_secs(5))
+            .header("User-Agent", VISIONOS_APP_UA)
+            .header("Content-Type", "application/json")
+            .header("X-Goog-Api-Format-Version", "2")
+            .json(&body)
+            .send()
+            .await
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?
+            .pointer("/responseContext/visitorData")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        if let Some(ref vd) = fetched {
+            *self.visitor_data.write().await = Some(vd.clone());
+        }
+        fetched
+    }
+
+    /// Resolves direct YouTube media stream URLs in pure Rust without `yt-dlp` or Python,
+    /// verifying HTTP reachability (`200`/`206`) before handing the URL to MPV so 403/POT-gated
+    /// streams are transparently skipped in favor of working streams or HLS variants.
     pub async fn resolve_playback(
         &self,
         video_id: &str,
         quality: Quality,
     ) -> Result<ResolvedPlayback, String> {
-        let pool = self.fetch_candidate_pool(video_id).await?;
-        select_best_playback(&pool, quality)
-            .ok_or_else(|| "No playable streams available for this video.".to_string())
-    }
+        let mut last_err = String::new();
 
-    async fn fetch_candidate_pool(&self, video_id: &str) -> Result<CandidatePool, String> {
-        // 1. Direct Innertube ANDROID_VR (fast single POST, un-ciphered 360p/720p/1080p H.264/VP9 + AAC/Opus)
-        let mut last_err = match self.fetch_innertube_vr(video_id).await {
-            Ok(pool) if pool.has_playable_streams() => return Ok(pool),
-            Ok(_) => "No streams returned by VR player".to_string(),
-            Err(e) => e,
-        };
-
-        // 2. Modern iOS Innertube (fast single POST, un-ciphered streams + HLS live manifests)
-        match self.fetch_innertube_modern_ios(video_id).await {
-            Ok(pool) if pool.has_playable_streams() => return Ok(pool),
+        // 1. VISIONOS App (NewPipe 2026.11 spec: POT-free & JS-free direct MP4 + HLS)
+        match self.fetch_innertube_visionos_app(video_id).await {
+            Ok(pool) if pool.has_playable_streams() => {
+                if let Some(play) = self.verify_and_select_playback(&pool, quality).await {
+                    return Ok(play);
+                }
+                last_err = "VisionOS app streams returned HTTP 403".to_string();
+            }
             Ok(_) => {}
             Err(e) => last_err = e,
         }
 
-        // 3. RustyPipe built-in clients (iOS -> Android -> TV)
+        // 2. VISIONOS Safari (yt-dlp 2026.10 `_DEFAULT_JSLESS_CLIENTS` spec)
+        match self.fetch_innertube_visionos_safari(video_id).await {
+            Ok(pool) if pool.has_playable_streams() => {
+                if let Some(play) = self.verify_and_select_playback(&pool, quality).await {
+                    return Ok(play);
+                }
+                last_err = "VisionOS Safari streams returned HTTP 403".to_string();
+            }
+            Ok(_) => {}
+            Err(e) => last_err = e,
+        }
+
+        // 3. RustyPipe pure-Rust JS player deobfuscation (TV & Desktop — covers "Made for Kids" videos too)
         for (ctype, ua) in [
-            (ClientType::Ios, RP_IOS_UA),
-            (ClientType::Android, RP_ANDROID_UA),
             (ClientType::Tv, RP_TV_UA),
+            (ClientType::Desktop, RP_DESKTOP_UA),
         ] {
             match self.rp.query().player_from_clients(video_id, &[ctype]).await {
                 Ok(player) => {
-                    let pool = pool_from_rustypipe(player, ua);
+                    let pool = pool_from_rustypipe(player, ua, YT_WEB_REFERER);
                     if pool.has_playable_streams() {
+                        if let Some(play) = self.verify_and_select_playback(&pool, quality).await {
+                            return Ok(play);
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+
+        if last_err.is_empty() {
+            Err("No playable streams available for this video.".to_string())
+        } else {
+            Err(format!("Stream extraction failed: {last_err}"))
+        }
+    }
+
+    async fn fetch_candidate_pool(&self, video_id: &str) -> Result<CandidatePool, String> {
+        let mut last_err = String::new();
+
+        match self.fetch_innertube_visionos_app(video_id).await {
+            Ok(pool) if pool.has_playable_streams() => {
+                if self.pool_has_reachable_media(&pool).await {
+                    return Ok(pool);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => last_err = e,
+        }
+
+        match self.fetch_innertube_visionos_safari(video_id).await {
+            Ok(pool) if pool.has_playable_streams() => {
+                if self.pool_has_reachable_media(&pool).await {
+                    return Ok(pool);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => last_err = e,
+        }
+
+        for (ctype, ua) in [
+            (ClientType::Tv, RP_TV_UA),
+            (ClientType::Desktop, RP_DESKTOP_UA),
+        ] {
+            match self.rp.query().player_from_clients(video_id, &[ctype]).await {
+                Ok(player) => {
+                    let pool = pool_from_rustypipe(player, ua, YT_WEB_REFERER);
+                    if pool.has_playable_streams() && self.pool_has_reachable_media(&pool).await {
                         return Ok(pool);
                     }
                 }
@@ -229,67 +375,263 @@ impl Engine {
         }
     }
 
-    async fn fetch_innertube_vr(&self, video_id: &str) -> Result<CandidatePool, String> {
+    async fn verify_and_select_playback(
+        &self,
+        pool: &CandidatePool,
+        quality: Quality,
+    ) -> Option<ResolvedPlayback> {
+        // 1. Try direct HTTP candidate (adaptive or progressive MP4)
+        if let Some(direct) = select_direct_playback(pool, quality) {
+            if self.verify_resolved_urls(&direct).await {
+                return Some(direct);
+            }
+            // If adaptive pair failed (e.g. 403 on adaptive), try progressive muxed MP4 before HLS
+            if direct.audio_url.is_some() {
+                if let Some(muxed_only) = select_muxed_fallback(pool, quality) {
+                    if self.verify_resolved_urls(&muxed_only).await {
+                        return Some(muxed_only);
+                    }
+                }
+            }
+        }
+
+        // 2. Try Apple/YouTube HLS master manifest (`hlsManifestUrl`), picking exact target quality
+        if let Some(ref hls_master) = pool.hls_url {
+            if let Some(hls_play) = self.resolve_hls_playback(hls_master, pool, quality).await {
+                return Some(hls_play);
+            }
+        }
+
+        None
+    }
+
+    async fn verify_resolved_urls(&self, play: &ResolvedPlayback) -> bool {
+        if let Some(ref aud_url) = play.audio_url {
+            let (v_ok, a_ok) = tokio::join!(
+                self.probe_media_url(&play.primary_url, &play.user_agent, &play.referer),
+                self.probe_media_url(aud_url, &play.user_agent, &play.referer)
+            );
+            v_ok && a_ok
+        } else {
+            self.probe_media_url(&play.primary_url, &play.user_agent, &play.referer)
+                .await
+        }
+    }
+
+    async fn pool_has_reachable_media(&self, pool: &CandidatePool) -> bool {
+        if let Some(m) = pool.muxed.first() {
+            if self
+                .probe_media_url(&m.url, &pool.user_agent, &pool.referer)
+                .await
+            {
+                return true;
+            }
+        }
+        if let Some(a) = pool.audio.first() {
+            if self
+                .probe_media_url(&a.url, &pool.user_agent, &pool.referer)
+                .await
+            {
+                return true;
+            }
+        }
+        if let Some(ref hls) = pool.hls_url {
+            if self
+                .fetch_text_checked(hls, &pool.user_agent, &pool.referer)
+                .await
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn probe_media_url(&self, url: &str, ua: &str, referer: &str) -> bool {
+        let mut req = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(6))
+            .header("User-Agent", ua)
+            .header("Range", "bytes=0-1");
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
+        match req.send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    async fn fetch_text_checked(&self, url: &str, ua: &str, referer: &str) -> Option<String> {
+        let mut req = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(6))
+            .header("User-Agent", ua);
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.text().await.ok()
+    }
+
+    async fn resolve_hls_playback(
+        &self,
+        hls_master_url: &str,
+        pool: &CandidatePool,
+        quality: Quality,
+    ) -> Option<ResolvedPlayback> {
+        let manifest = self
+            .fetch_text_checked(hls_master_url, &pool.user_agent, &pool.referer)
+            .await?;
+
+        if let Some((primary_url, audio_url)) = parse_hls_master_playlist(&manifest, quality) {
+            return Some(ResolvedPlayback {
+                primary_url,
+                audio_url,
+                user_agent: pool.user_agent.clone(),
+                referer: pool.referer.clone(),
+                is_audio_only: quality == Quality::AudioOnly,
+                duration_secs: pool.duration_secs,
+            });
+        }
+
+        Some(ResolvedPlayback {
+            primary_url: hls_master_url.to_string(),
+            audio_url: None,
+            user_agent: pool.user_agent.clone(),
+            referer: pool.referer.clone(),
+            is_audio_only: quality == Quality::AudioOnly,
+            duration_secs: pool.duration_secs,
+        })
+    }
+
+    async fn fetch_innertube_visionos_app(&self, video_id: &str) -> Result<CandidatePool, String> {
+        let visitor_data = self.ensure_visitor_data().await;
+        let cpn = random_innertube_token(16);
+        let t_param = random_innertube_token(12);
+
+        let mut client_obj = json!({
+            "clientName": "VISIONOS",
+            "clientVersion": VISIONOS_APP_VERSION,
+            "clientScreen": "WATCH",
+            "platform": "MOBILE",
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "osName": "visionOS",
+            "osVersion": "26.6.0.23O770",
+            "hl": "en",
+            "gl": "US",
+            "utcOffsetMinutes": 0
+        });
+        if let (Some(ref vd), Some(map)) = (&visitor_data, client_obj.as_object_mut()) {
+            map.insert("visitorData".to_string(), Value::String(vd.clone()));
+        }
+
         let body = json!({
             "videoId": video_id,
+            "cpn": cpn,
             "contentCheckOk": true,
             "racyCheckOk": true,
             "context": {
-                "client": {
-                    "clientName": "ANDROID_VR",
-                    "clientVersion": VR_CLIENT_VERSION,
-                    "deviceMake": "Oculus",
-                    "deviceModel": "Quest 3",
-                    "osName": "Android",
-                    "osVersion": "12L",
-                    "androidSdkVersion": 32,
-                    "hl": "en",
-                    "gl": "US"
-                }
+                "client": client_obj
             }
         });
-        self.post_innertube_player(&body, VR_UA, "28").await
+
+        let endpoint = format!(
+            "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false&t={t_param}&id={video_id}"
+        );
+        self.post_innertube_player(
+            &endpoint,
+            video_id,
+            &body,
+            VISIONOS_APP_UA,
+            "101",
+            visitor_data.as_deref(),
+            &cpn,
+        )
+        .await
     }
 
-    async fn fetch_innertube_modern_ios(&self, video_id: &str) -> Result<CandidatePool, String> {
+    async fn fetch_innertube_visionos_safari(
+        &self,
+        video_id: &str,
+    ) -> Result<CandidatePool, String> {
+        let visitor_data = self.ensure_visitor_data().await;
+        let cpn = random_innertube_token(16);
+
+        let mut client_obj = json!({
+            "clientName": "VISIONOS",
+            "clientVersion": VISIONOS_SAFARI_VERSION,
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "userAgent": VISIONOS_SAFARI_UA,
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471",
+            "hl": "en",
+            "gl": "US",
+            "utcOffsetMinutes": 0
+        });
+        if let (Some(ref vd), Some(map)) = (&visitor_data, client_obj.as_object_mut()) {
+            map.insert("visitorData".to_string(), Value::String(vd.clone()));
+        }
+
         let body = json!({
             "videoId": video_id,
+            "cpn": cpn,
             "contentCheckOk": true,
             "racyCheckOk": true,
             "context": {
-                "client": {
-                    "clientName": "IOS",
-                    "clientVersion": MODERN_IOS_VERSION,
-                    "deviceMake": "Apple",
-                    "deviceModel": "iPhone16,2",
-                    "osName": "iPhone",
-                    "osVersion": "18.3.2.22D82",
-                    "hl": "en",
-                    "gl": "US"
-                }
+                "client": client_obj
             }
         });
-        self.post_innertube_player(&body, MODERN_IOS_UA, "5").await
+
+        self.post_innertube_player(
+            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+            video_id,
+            &body,
+            VISIONOS_SAFARI_UA,
+            "101",
+            visitor_data.as_deref(),
+            &cpn,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn post_innertube_player(
         &self,
+        endpoint: &str,
+        expected_video_id: &str,
         body: &Value,
         ua: &str,
         client_name_id: &str,
+        visitor_data: Option<&str>,
+        cpn: &str,
     ) -> Result<CandidatePool, String> {
         let client_ver = body
             .pointer("/context/client/clientVersion")
             .and_then(|v| v.as_str())
             .unwrap_or("1.0");
 
-        let resp = self
+        let mut req = self
             .http
-            .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .post(endpoint)
             .header("User-Agent", ua)
             .header("Content-Type", "application/json")
+            .header("X-Goog-Api-Format-Version", "2")
             .header("X-YouTube-Client-Name", client_name_id)
-            .header("X-YouTube-Client-Version", client_ver)
+            .header("X-YouTube-Client-Version", client_ver);
+
+        if let Some(vd) = visitor_data {
+            req = req.header("X-Goog-Visitor-Id", vd);
+        }
+
+        let resp = req
             .json(body)
             .send()
             .await
@@ -301,6 +643,23 @@ impl Engine {
             .json()
             .await
             .map_err(|e| format!("Invalid player JSON: {e}"))?;
+
+        if let Some(returned_id) = val.pointer("/videoDetails/videoId").and_then(|s| s.as_str()) {
+            if !returned_id.is_empty() && returned_id != expected_video_id {
+                return Err("YouTube returned a fallback/mismatch video response".to_string());
+            }
+        }
+
+        // Capture fresh visitorData if returned in responseContext
+        if visitor_data.is_none() {
+            if let Some(vd) = val
+                .pointer("/responseContext/visitorData")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                *self.visitor_data.write().await = Some(vd.to_string());
+            }
+        }
 
         let status = val
             .pointer("/playabilityStatus/status")
@@ -323,7 +682,8 @@ impl Engine {
             .and_then(|f| f.as_array())
         {
             for fmt in formats {
-                if let Some(vc) = parse_json_video_stream(fmt) {
+                if let Some(mut vc) = parse_json_video_stream(fmt) {
+                    vc.url = append_cpn_param(&vc.url, cpn);
                     muxed.push(vc);
                 }
             }
@@ -336,11 +696,13 @@ impl Engine {
             for fmt in adap {
                 let mime = fmt.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
                 if mime.starts_with("video/") {
-                    if let Some(vc) = parse_json_video_stream(fmt) {
+                    if let Some(mut vc) = parse_json_video_stream(fmt) {
+                        vc.url = append_cpn_param(&vc.url, cpn);
                         adaptive_video.push(vc);
                     }
                 } else if mime.starts_with("audio/") {
-                    if let Some(ac) = parse_json_audio_stream(fmt) {
+                    if let Some(mut ac) = parse_json_audio_stream(fmt) {
+                        ac.url = append_cpn_param(&ac.url, cpn);
                         audio.push(ac);
                     }
                 }
@@ -393,6 +755,7 @@ impl Engine {
             audio,
             hls_url,
             user_agent: ua.to_string(),
+            referer: String::new(),
             duration_secs,
             title,
             channel_id,
@@ -402,8 +765,8 @@ impl Engine {
         })
     }
 
-    /// Pure-Rust downloader using `RustyPipe`/Innertube stream resolution + `reqwest` chunk streaming.
-    /// Zero `yt-dlp` or Python required. Uses `ffmpeg -c copy` only if available for HD adaptive streams.
+    /// Pure-Rust downloader using verified `VISIONOS`/`RustyPipe` stream resolution + `reqwest` chunk streaming.
+    /// Zero `yt-dlp` or Python required. Uses `ffmpeg -c copy` only if available for HD adaptive/HLS streams.
     pub async fn download_video(
         &self,
         video_id: &str,
@@ -423,13 +786,30 @@ impl Engine {
         });
 
         if quality == Quality::AudioOnly {
-            let best_aud = pick_best_audio(&pool.audio)
-                .ok_or_else(|| "No downloadable audio stream found.".to_string())?;
-            let ext = if best_aud.is_m4a { "m4a" } else { "webm" };
-            let out_path = downloads_dir.join(format!("{base_name} [{video_id}].{ext}"));
-            self.stream_url_to_file(&best_aud.url, &pool.user_agent, &out_path)
-                .await?;
-            return Ok(out_path);
+            if let Some(best_aud) = pick_best_audio(&pool.audio) {
+                let ext = if best_aud.is_m4a { "m4a" } else { "webm" };
+                let out_path = downloads_dir.join(format!("{base_name} [{video_id}].{ext}"));
+                if self
+                    .stream_url_to_file(&best_aud.url, &pool.user_agent, &pool.referer, &out_path)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(out_path);
+                }
+            }
+            if let Some(ref hls_master) = pool.hls_url {
+                if has_ffmpeg().await {
+                    let out_path = downloads_dir.join(format!("{base_name} [{video_id}].m4a"));
+                    if let Some(play) = self
+                        .resolve_hls_playback(hls_master, &pool, Quality::AudioOnly)
+                        .await
+                    {
+                        self.ffmpeg_remux_hls(&play, &out_path, true).await?;
+                        return Ok(out_path);
+                    }
+                }
+            }
+            return Err("No downloadable audio stream found.".to_string());
         }
 
         let target_h = quality.target_height().unwrap_or(360);
@@ -449,9 +829,9 @@ impl Engine {
                     let tmp_a = downloads_dir.join(format!(".yr_tmp_{video_id}_a.part"));
 
                     let dl_res = async {
-                        self.stream_url_to_file(&v.url, &pool.user_agent, &tmp_v)
+                        self.stream_url_to_file(&v.url, &pool.user_agent, &pool.referer, &tmp_v)
                             .await?;
-                        self.stream_url_to_file(&a.url, &pool.user_agent, &tmp_a)
+                        self.stream_url_to_file(&a.url, &pool.user_agent, &pool.referer, &tmp_a)
                             .await?;
                         let status = tokio::process::Command::new("ffmpeg")
                             .arg("-y")
@@ -491,25 +871,81 @@ impl Engine {
         if let Some(muxed) = best_muxed.or_else(|| pool.muxed.first()) {
             let ext = if muxed.is_mp4 { "mp4" } else { "webm" };
             let out_path = downloads_dir.join(format!("{base_name} [{video_id}].{ext}"));
-            self.stream_url_to_file(&muxed.url, &pool.user_agent, &out_path)
-                .await?;
-            return Ok(out_path);
+            if self
+                .stream_url_to_file(&muxed.url, &pool.user_agent, &pool.referer, &out_path)
+                .await
+                .is_ok()
+            {
+                return Ok(out_path);
+            }
+        }
+
+        // HLS fallback download via ffmpeg if direct HTTP streams were absent/blocked
+        if let Some(ref hls_master) = pool.hls_url {
+            if has_ffmpeg().await {
+                if let Some(play) = self.resolve_hls_playback(hls_master, &pool, quality).await {
+                    let out_path = downloads_dir.join(format!("{base_name} [{video_id}].mp4"));
+                    self.ffmpeg_remux_hls(&play, &out_path, false).await?;
+                    return Ok(out_path);
+                }
+            }
         }
 
         Err("No downloadable file stream available (install ffmpeg for HD adaptive downloads).".to_string())
+    }
+
+    async fn ffmpeg_remux_hls(
+        &self,
+        play: &ResolvedPlayback,
+        out_path: &Path,
+        audio_only: bool,
+    ) -> Result<(), String> {
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.arg("-y").arg("-loglevel").arg("error");
+        if !play.user_agent.is_empty() {
+            cmd.arg("-user_agent").arg(&play.user_agent);
+        }
+        cmd.arg("-i").arg(&play.primary_url);
+        if let Some(ref aud) = play.audio_url {
+            if !audio_only {
+                if !play.user_agent.is_empty() {
+                    cmd.arg("-user_agent").arg(&play.user_agent);
+                }
+                cmd.arg("-i").arg(aud);
+            }
+        }
+        if audio_only {
+            cmd.arg("-vn");
+        }
+        cmd.arg("-c")
+            .arg("copy")
+            .arg(out_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let status = cmd
+            .status()
+            .await
+            .map_err(|e| format!("ffmpeg error: {e}"))?;
+        if !status.success() {
+            return Err("ffmpeg could not save HLS stream".to_string());
+        }
+        Ok(())
     }
 
     async fn stream_url_to_file(
         &self,
         url: &str,
         user_agent: &str,
+        referer: &str,
         dest: &Path,
     ) -> Result<(), String> {
-        let mut resp = self
-            .http
-            .get(url)
-            .header("User-Agent", user_agent)
-            .header("Referer", "https://www.youtube.com/")
+        let mut req = self.http.get(url).header("User-Agent", user_agent);
+        if !referer.is_empty() {
+            req = req.header("Referer", referer);
+        }
+        let mut resp = req
             .send()
             .await
             .map_err(|e| format!("Connection error: {e}"))?
@@ -1563,7 +1999,7 @@ fn parse_json_audio_stream(fmt: &Value) -> Option<RawAudioCandidate> {
     })
 }
 
-fn pool_from_rustypipe(player: VideoPlayer, ua: &str) -> CandidatePool {
+fn pool_from_rustypipe(player: VideoPlayer, ua: &str, referer: &str) -> CandidatePool {
     let muxed = player
         .video_streams
         .into_iter()
@@ -1633,6 +2069,7 @@ fn pool_from_rustypipe(player: VideoPlayer, ua: &str) -> CandidatePool {
         audio,
         hls_url: player.hls_manifest_url,
         user_agent: ua.to_string(),
+        referer: referer.to_string(),
         duration_secs,
         title: player.details.name,
         channel_id: player.details.channel_id,
@@ -1712,8 +2149,22 @@ fn pick_best_audio(streams: &[RawAudioCandidate]) -> Option<&RawAudioCandidate> 
     })
 }
 
-fn select_best_playback(pool: &CandidatePool, quality: Quality) -> Option<ResolvedPlayback> {
+fn select_muxed_fallback(pool: &CandidatePool, quality: Quality) -> Option<ResolvedPlayback> {
+    let target_h = quality.target_height().unwrap_or(360);
+    let muxed = pick_best_video(&pool.muxed, target_h).or_else(|| pool.muxed.first())?;
+    Some(ResolvedPlayback {
+        primary_url: muxed.url.clone(),
+        audio_url: None,
+        user_agent: pool.user_agent.clone(),
+        referer: pool.referer.clone(),
+        is_audio_only: quality == Quality::AudioOnly,
+        duration_secs: pool.duration_secs,
+    })
+}
+
+fn select_direct_playback(pool: &CandidatePool, quality: Quality) -> Option<ResolvedPlayback> {
     let ua = pool.user_agent.clone();
+    let referer = pool.referer.clone();
     let duration_secs = pool.duration_secs;
 
     if quality == Quality::AudioOnly {
@@ -1722,6 +2173,7 @@ fn select_best_playback(pool: &CandidatePool, quality: Quality) -> Option<Resolv
                 primary_url: aud.url.clone(),
                 audio_url: None,
                 user_agent: ua,
+                referer,
                 is_audio_only: true,
                 duration_secs,
             });
@@ -1731,15 +2183,7 @@ fn select_best_playback(pool: &CandidatePool, quality: Quality) -> Option<Resolv
                 primary_url: muxed.url.clone(),
                 audio_url: None,
                 user_agent: ua,
-                is_audio_only: true,
-                duration_secs,
-            });
-        }
-        if let Some(ref hls) = pool.hls_url {
-            return Some(ResolvedPlayback {
-                primary_url: hls.clone(),
-                audio_url: None,
-                user_agent: ua,
+                referer,
                 is_audio_only: true,
                 duration_secs,
             });
@@ -1756,6 +2200,7 @@ fn select_best_playback(pool: &CandidatePool, quality: Quality) -> Option<Resolv
                 primary_url: muxed.url.clone(),
                 audio_url: None,
                 user_agent: ua,
+                referer,
                 is_audio_only: false,
                 duration_secs,
             });
@@ -1774,6 +2219,7 @@ fn select_best_playback(pool: &CandidatePool, quality: Quality) -> Option<Resolv
                     primary_url: m.url.clone(),
                     audio_url: None,
                     user_agent: ua,
+                    referer,
                     is_audio_only: false,
                     duration_secs,
                 });
@@ -1783,33 +2229,196 @@ fn select_best_playback(pool: &CandidatePool, quality: Quality) -> Option<Resolv
             primary_url: vid.url.clone(),
             audio_url: Some(aud.url.clone()),
             user_agent: ua,
+            referer,
             is_audio_only: false,
             duration_secs,
         });
     }
 
-    // Fallback to progressive muxed or HLS manifest (e.g. livestreams)
+    // Fallback to progressive muxed
     if let Some(muxed) = pick_best_video(&pool.muxed, target_h) {
         return Some(ResolvedPlayback {
             primary_url: muxed.url.clone(),
             audio_url: None,
             user_agent: ua,
-            is_audio_only: false,
-            duration_secs,
-        });
-    }
-
-    if let Some(ref hls) = pool.hls_url {
-        return Some(ResolvedPlayback {
-            primary_url: hls.clone(),
-            audio_url: None,
-            user_agent: ua,
+            referer,
             is_audio_only: false,
             duration_secs,
         });
     }
 
     None
+}
+
+#[derive(Clone, Debug)]
+struct HlsAudioTrack {
+    group_id: String,
+    uri: String,
+    is_default: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HlsVariant {
+    uri: String,
+    height: u32,
+    bandwidth: u64,
+    codec: SimpleVideoCodec,
+    audio_group: Option<String>,
+}
+
+fn extract_m3u8_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = attrs;
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([',', ' ', '\t']);
+        if rest.is_empty() {
+            break;
+        }
+        let Some((k, after_eq)) = rest.split_once('=') else {
+            break;
+        };
+        let k = k.trim();
+        let (val, tail) = if let Some(quoted) = after_eq.strip_prefix('"') {
+            match quoted.split_once('"') {
+                Some((v, rem)) => (v, rem),
+                None => (quoted, ""),
+            }
+        } else {
+            match after_eq.split_once(',') {
+                Some((v, rem)) => (v.trim(), rem),
+                None => (after_eq.trim(), ""),
+            }
+        };
+        if k.eq_ignore_ascii_case(key) {
+            return Some(val);
+        }
+        rest = tail;
+    }
+    None
+}
+
+fn parse_hls_master_playlist(
+    manifest: &str,
+    quality: Quality,
+) -> Option<(String, Option<String>)> {
+    let mut audio_tracks: Vec<HlsAudioTrack> = Vec::new();
+    let mut variants: Vec<HlsVariant> = Vec::new();
+    let mut pending_stream_inf: Option<&str> = None;
+
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(attrs) = line.strip_prefix("#EXT-X-MEDIA:") {
+            if extract_m3u8_attr(attrs, "TYPE")
+                .map(|t| t.eq_ignore_ascii_case("AUDIO"))
+                .unwrap_or(false)
+            {
+                if let (Some(group_id), Some(uri)) = (
+                    extract_m3u8_attr(attrs, "GROUP-ID"),
+                    extract_m3u8_attr(attrs, "URI"),
+                ) {
+                    if !uri.is_empty() {
+                        let is_default = extract_m3u8_attr(attrs, "DEFAULT")
+                            .map(|d| d.eq_ignore_ascii_case("YES"))
+                            .unwrap_or(false);
+                        audio_tracks.push(HlsAudioTrack {
+                            group_id: group_id.to_string(),
+                            uri: uri.to_string(),
+                            is_default,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(attrs) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+            pending_stream_inf = Some(attrs);
+            continue;
+        }
+        if !line.starts_with('#') {
+            if let Some(attrs) = pending_stream_inf.take() {
+                let height = extract_m3u8_attr(attrs, "RESOLUTION")
+                    .and_then(|res| res.split_once('x'))
+                    .and_then(|(_, h)| h.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let bandwidth = extract_m3u8_attr(attrs, "AVERAGE-BANDWIDTH")
+                    .or_else(|| extract_m3u8_attr(attrs, "BANDWIDTH"))
+                    .and_then(|b| b.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let codecs = extract_m3u8_attr(attrs, "CODECS").unwrap_or("");
+                let codec = if codecs.contains("avc1") {
+                    SimpleVideoCodec::H264
+                } else if codecs.contains("vp09") || codecs.contains("vp9") {
+                    SimpleVideoCodec::Vp9
+                } else if codecs.contains("av01") {
+                    SimpleVideoCodec::Av1
+                } else {
+                    SimpleVideoCodec::Unknown
+                };
+                let audio_group = extract_m3u8_attr(attrs, "AUDIO").map(|s| s.to_string());
+                variants.push(HlsVariant {
+                    uri: line.to_string(),
+                    height,
+                    bandwidth,
+                    codec,
+                    audio_group,
+                });
+            }
+        }
+    }
+
+    if quality == Quality::AudioOnly {
+        if let Some(aud) = audio_tracks
+            .iter()
+            .find(|a| a.is_default)
+            .or_else(|| audio_tracks.first())
+        {
+            return Some((aud.uri.clone(), None));
+        }
+        if let Some(lowest) = variants.iter().min_by_key(|v| (v.height, v.bandwidth)) {
+            return Some((lowest.uri.clone(), None));
+        }
+        return None;
+    }
+
+    if variants.is_empty() {
+        return None;
+    }
+
+    let target_h = quality.target_height().unwrap_or(360);
+    let has_within_target = variants.iter().any(|v| v.height > 0 && v.height <= target_h);
+
+    let chosen = variants.iter().max_by(|a, b| {
+        if has_within_target {
+            let a_ok = a.height > 0 && a.height <= target_h;
+            let b_ok = b.height > 0 && b.height <= target_h;
+            if a_ok != b_ok {
+                return a_ok.cmp(&b_ok);
+            }
+            if a.height != b.height {
+                return a.height.cmp(&b.height);
+            }
+        } else if a.height != b.height {
+            return b.height.cmp(&a.height);
+        }
+
+        a.codec
+            .hardware_rank()
+            .cmp(&b.codec.hardware_rank())
+            .then_with(|| a.bandwidth.cmp(&b.bandwidth))
+    })?;
+
+    let paired_audio = chosen.audio_group.as_ref().and_then(|grp| {
+        audio_tracks
+            .iter()
+            .filter(|a| &a.group_id == grp)
+            .find(|a| a.is_default)
+            .or_else(|| audio_tracks.iter().find(|a| &a.group_id == grp))
+            .map(|a| a.uri.clone())
+    });
+
+    Some((chosen.uri.clone(), paired_audio))
 }
 
 struct ChannelFallback<'a> {
@@ -1987,6 +2596,7 @@ mod tests {
             }],
             hls_url: None,
             user_agent: "TestUA".to_string(),
+            referer: String::new(),
             duration_secs: Some(180),
             title: None,
             channel_id: String::new(),
@@ -1996,12 +2606,12 @@ mod tests {
         };
 
         // 360p prefers single-connection progressive muxed MP4
-        let p360 = select_best_playback(&pool, Quality::P360).unwrap();
+        let p360 = select_direct_playback(&pool, Quality::P360).unwrap();
         assert_eq!(p360.primary_url, "https://cdn.example/360_muxed.mp4");
         assert!(p360.audio_url.is_none());
 
         // 720p prefers H.264 over AV1 and pairs adaptive audio
-        let p720 = select_best_playback(&pool, Quality::P720).unwrap();
+        let p720 = select_direct_playback(&pool, Quality::P720).unwrap();
         assert_eq!(p720.primary_url, "https://cdn.example/720_h264.mp4");
         assert_eq!(
             p720.audio_url.as_deref(),
@@ -2009,9 +2619,47 @@ mod tests {
         );
 
         // AudioOnly picks direct audio stream
-        let paud = select_best_playback(&pool, Quality::AudioOnly).unwrap();
+        let paud = select_direct_playback(&pool, Quality::AudioOnly).unwrap();
         assert!(paud.is_audio_only);
         assert_eq!(paud.primary_url, "https://cdn.example/128k.m4a");
         assert!(paud.audio_url.is_none());
+    }
+
+    #[test]
+    fn test_cpn_and_hls_master_parsing() {
+        assert_eq!(
+            append_cpn_param("https://rr1.googlevideo.com/videoplayback?itag=18", "AbCdEf1234567890"),
+            "https://rr1.googlevideo.com/videoplayback?itag=18&cpn=AbCdEf1234567890"
+        );
+        assert_eq!(
+            append_cpn_param("https://rr1.googlevideo.com/videoplayback?itag=18&cpn=Existing", "New"),
+            "https://rr1.googlevideo.com/videoplayback?itag=18&cpn=Existing"
+        );
+
+        let sample_m3u8 = "\
+#EXTM3U
+#EXT-X-MEDIA:URI=\"https://manifest.example/audio_en.m3u8\",TYPE=AUDIO,GROUP-ID=\"234\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=620000,CODECS=\"mp4a.40.2,avc1.4d401e\",RESOLUTION=640x360
+https://manifest.example/v360_muxed.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2100000,CODECS=\"mp4a.40.2,avc1.4d401f\",RESOLUTION=1280x720,AUDIO=\"234\"
+https://manifest.example/v720_video.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=4200000,CODECS=\"mp4a.40.2,avc1.640028\",RESOLUTION=1920x1080,AUDIO=\"234\"
+https://manifest.example/v1080_video.m3u8
+";
+
+        let (u360, a360) = parse_hls_master_playlist(sample_m3u8, Quality::P360).unwrap();
+        assert_eq!(u360, "https://manifest.example/v360_muxed.m3u8");
+        assert!(a360.is_none());
+
+        let (u720, a720) = parse_hls_master_playlist(sample_m3u8, Quality::P720).unwrap();
+        assert_eq!(u720, "https://manifest.example/v720_video.m3u8");
+        assert_eq!(
+            a720.as_deref(),
+            Some("https://manifest.example/audio_en.m3u8")
+        );
+
+        let (uaud, aaud) = parse_hls_master_playlist(sample_m3u8, Quality::AudioOnly).unwrap();
+        assert_eq!(uaud, "https://manifest.example/audio_en.m3u8");
+        assert!(aaud.is_none());
     }
 }
