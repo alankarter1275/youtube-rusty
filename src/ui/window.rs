@@ -1,6 +1,9 @@
 use crate::backend::cache::Cache;
 use crate::backend::engine::Engine;
+use crate::backend::history::HistoryStore;
 use crate::backend::models::VideoSummary;
+use crate::backend::settings::SettingsStore;
+use crate::backend::subscriptions::SubscriptionStore;
 use crate::player::mpv::Quality;
 use crate::player::mpv_ipc::{MpvEvent, MpvSession};
 use crate::ui::channel_page::ChannelPage;
@@ -13,7 +16,7 @@ use gtk4::gdk::{Display, Texture};
 use gtk4::gio;
 use gtk4::{
     Align, Box as GtkBox, Button, CssProvider, FlowBox, Label, MenuButton, Orientation, Overlay,
-    ScrolledWindow, SearchEntry, SelectionMode,
+    Picture, ScrolledWindow, SearchEntry, SelectionMode,
 };
 use libadwaita as adw;
 use std::cell::RefCell;
@@ -34,13 +37,21 @@ pub struct MainWindow {
     pub search_entry: SearchEntry,
     pub rail: Rail,
     pub nav_view: adw::NavigationView,
+    pub home_page: adw::NavigationPage,
     pub flow_box: FlowBox,
     pub section_title: Label,
+    pub chips_box: GtkBox,
+    pub subs_strip_box: GtkBox,
+    pub subs_avatars_row: GtkBox,
+    pub history_header_box: GtkBox,
     pub toast_overlay: adw::ToastOverlay,
     pub player_card: Rc<PlayerCard>,
     pub mpv_session: RefCell<Option<Arc<MpvSession>>>,
     pub mpv_pos: RefCell<f64>,
     pub mpv_duration: RefCell<f64>,
+    pub history_store: Arc<HistoryStore>,
+    pub settings_store: Arc<SettingsStore>,
+    pub subscription_store: Arc<SubscriptionStore>,
     engine: Arc<Engine>,
     cache: Arc<Cache>,
     runtime: Arc<Runtime>,
@@ -98,6 +109,51 @@ impl MainWindow {
         chips_box.append(&chip_music);
         chips_box.append(&chip_news);
 
+        // Subscriptions Avatar Strip
+        let subs_strip_box = GtkBox::new(Orientation::Vertical, 8);
+        subs_strip_box.set_margin_start(28);
+        subs_strip_box.set_margin_end(28);
+        subs_strip_box.set_margin_top(16);
+        subs_strip_box.set_margin_bottom(12);
+        subs_strip_box.set_visible(false);
+
+        let subs_title = Label::new(Some("Subscriptions"));
+        subs_title.set_halign(Align::Start);
+        subs_title.set_xalign(0.0);
+        subs_title.add_css_class("yr-h1");
+        subs_strip_box.append(&subs_title);
+
+        let subs_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .build();
+        let subs_avatars_row = GtkBox::new(Orientation::Horizontal, 16);
+        subs_avatars_row.set_margin_top(4);
+        subs_avatars_row.set_margin_bottom(8);
+        subs_scroll.set_child(Some(&subs_avatars_row));
+        subs_strip_box.append(&subs_scroll);
+
+        // History Header Box (Title + Clear button)
+        let history_header_box = GtkBox::new(Orientation::Horizontal, 12);
+        history_header_box.set_margin_start(28);
+        history_header_box.set_margin_end(28);
+        history_header_box.set_margin_top(16);
+        history_header_box.set_margin_bottom(16);
+        history_header_box.set_visible(false);
+
+        let hist_title = Label::new(Some("Watch History"));
+        hist_title.set_halign(Align::Start);
+        hist_title.set_xalign(0.0);
+        hist_title.set_hexpand(true);
+        hist_title.add_css_class("yr-h1");
+
+        let clear_hist_btn = Button::with_label("Clear history");
+        clear_hist_btn.add_css_class("yr-chip");
+        clear_hist_btn.set_valign(Align::Center);
+
+        history_header_box.append(&hist_title);
+        history_header_box.append(&clear_hist_btn);
+
         // Section Title: "Trending" (Playfair 18 / yr-h2)
         let section_title = Label::new(Some("Trending"));
         section_title.set_halign(Align::Start);
@@ -122,6 +178,8 @@ impl MainWindow {
 
         let content_v_box = GtkBox::new(Orientation::Vertical, 0);
         content_v_box.append(&chips_box);
+        content_v_box.append(&subs_strip_box);
+        content_v_box.append(&history_header_box);
         content_v_box.append(&section_title);
         content_v_box.append(&flow_box);
 
@@ -174,6 +232,9 @@ impl MainWindow {
         let engine = Arc::new(Engine::new());
         let cache = Arc::new(Cache::new());
         let runtime = Arc::new(Runtime::new().expect("Failed to initialize Tokio runtime"));
+        let history_store = Arc::new(HistoryStore::new());
+        let settings_store = Arc::new(SettingsStore::new());
+        let subscription_store = Arc::new(SubscriptionStore::new());
 
         let this = Rc::new(Self {
             window,
@@ -182,16 +243,34 @@ impl MainWindow {
             search_entry,
             rail,
             nav_view,
+            home_page,
             flow_box,
             section_title,
+            chips_box,
+            subs_strip_box,
+            subs_avatars_row,
+            history_header_box,
             toast_overlay,
             player_card,
             mpv_session: RefCell::new(None),
             mpv_pos: RefCell::new(0.0),
             mpv_duration: RefCell::new(0.0),
+            history_store,
+            settings_store,
+            subscription_store,
             engine,
             cache,
             runtime,
+        });
+
+        // Wire Clear History Button
+        let this_clear = this.clone();
+        clear_hist_btn.connect_clicked(move |_| {
+            this_clear.history_store.clear();
+            this_clear
+                .toast_overlay
+                .add_toast(adw::Toast::new("Watch history cleared"));
+            this_clear.load_history();
         });
 
         this.setup_events(&chip_trending, &chip_gaming, &chip_music, &chip_news);
@@ -226,22 +305,19 @@ impl MainWindow {
         let this = self.clone();
         self.rail.subs_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::Subscriptions);
-            this.section_title.set_text("Subscriptions");
-            this.show_empty_state("No Subscriptions Yet", "Channels you subscribe to will appear here.");
+            this.load_subscriptions();
         });
 
         let this = self.clone();
         self.rail.hist_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::History);
-            this.section_title.set_text("History");
-            this.show_empty_state("No Watch History", "Videos you watch will appear here.");
+            this.load_history();
         });
 
         let this = self.clone();
         self.rail.settings_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::Settings);
-            let toast = adw::Toast::new("Settings opened");
-            this.toast_overlay.add_toast(toast);
+            this.open_settings();
         });
 
         // Chips category selection
@@ -371,6 +447,11 @@ impl MainWindow {
 
     pub fn play_video(self: &Rc<Self>, summary: VideoSummary, quality: Quality) {
         self.ensure_mpv_session();
+
+        let settings = self.settings_store.load();
+        if settings.save_history {
+            self.history_store.add(summary.clone());
+        }
 
         let id = summary.id.clone();
         let title = summary.title.clone();
@@ -514,9 +595,14 @@ impl MainWindow {
     }
 
     pub fn search(self: &Rc<Self>, query: &str) {
+        self.nav_view.pop_to_page(&self.home_page);
+        self.chips_box.set_visible(false);
+        self.subs_strip_box.set_visible(false);
+        self.history_header_box.set_visible(false);
+        self.section_title.set_visible(true);
         self.section_title
             .set_text(&format!("Results for \"{query}\""));
-        self.show_skeletons(6);
+        self.show_skeletons_search(6);
 
         let (sender, receiver) = async_channel::unbounded::<Result<Vec<VideoSummary>, String>>();
         let engine = self.engine.clone();
@@ -533,7 +619,10 @@ impl MainWindow {
                 match res {
                     Ok(videos) => {
                         if videos.is_empty() {
-                            this.show_empty_state("No results found", "Try different keywords or check spelling.");
+                            this.show_empty_state(
+                                "No results found",
+                                "Try different keywords or check spelling.",
+                            );
                         } else {
                             this.populate_videos(videos, ViewMode::SearchList);
                         }
@@ -547,6 +636,11 @@ impl MainWindow {
     }
 
     pub fn search_category(self: &Rc<Self>, category: &str) {
+        self.nav_view.pop_to_page(&self.home_page);
+        self.chips_box.set_visible(true);
+        self.subs_strip_box.set_visible(false);
+        self.history_header_box.set_visible(false);
+        self.section_title.set_visible(true);
         self.section_title.set_text(category);
         self.show_skeletons(8);
 
@@ -570,6 +664,11 @@ impl MainWindow {
     }
 
     pub fn load_trending(self: &Rc<Self>) {
+        self.nav_view.pop_to_page(&self.home_page);
+        self.chips_box.set_visible(true);
+        self.subs_strip_box.set_visible(false);
+        self.history_header_box.set_visible(false);
+        self.section_title.set_visible(true);
         self.section_title.set_text("Trending");
         self.show_skeletons(8);
 
@@ -600,12 +699,314 @@ impl MainWindow {
         });
     }
 
+    pub fn load_subscriptions(self: &Rc<Self>) {
+        self.nav_view.pop_to_page(&self.home_page);
+        self.chips_box.set_visible(false);
+        self.history_header_box.set_visible(false);
+        self.subs_strip_box.set_visible(true);
+        self.section_title.set_visible(true);
+        self.section_title.set_text("Latest from Subscriptions");
+
+        while let Some(child) = self.subs_avatars_row.first_child() {
+            self.subs_avatars_row.remove(&child);
+        }
+
+        let subs = self.subscription_store.load_all();
+        if subs.is_empty() {
+            self.subs_strip_box.set_visible(false);
+            self.section_title.set_text("Subscriptions");
+            self.show_empty_state(
+                "No Subscriptions Yet",
+                "Channels you subscribe to will appear here.",
+            );
+            return;
+        }
+
+        for sub in subs.iter() {
+            let item_box = GtkBox::new(Orientation::Vertical, 6);
+            item_box.add_css_class("yr-avatar-btn");
+            item_box.set_valign(Align::Center);
+
+            let av = adw::Avatar::new(56, Some(&sub.name), true);
+            av.set_valign(Align::Center);
+
+            let lbl = Label::new(Some(&sub.name));
+            lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            lbl.set_max_width_chars(11);
+            lbl.add_css_class("yr-meta");
+
+            item_box.append(&av);
+            item_box.append(&lbl);
+
+            let click = gtk4::GestureClick::new();
+            let cid = sub.id.clone();
+            let cname = sub.name.clone();
+            let this_chan = self.clone();
+            click.connect_released(move |_, _, _, _| {
+                this_chan.open_channel(&cid, &cname);
+            });
+            item_box.add_controller(click);
+
+            self.subs_avatars_row.append(&item_box);
+        }
+
+        if let Some(first_sub) = subs.first() {
+            self.show_skeletons(8);
+            let (sender, receiver) =
+                async_channel::unbounded::<Result<Vec<VideoSummary>, String>>();
+            let engine = self.engine.clone();
+            let cid = first_sub.id.clone();
+            self.runtime.spawn(async move {
+                let res = engine.channel_videos(&cid).await;
+                let _ = sender.send(res.map(|(_, vids)| vids)).await;
+            });
+
+            let this = self.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(res) = receiver.recv().await {
+                    match res {
+                        Ok(videos) => this.populate_videos(videos, ViewMode::Grid),
+                        Err(_) => this.show_empty_state(
+                            "No Videos Found",
+                            "No recent videos from your subscriptions.",
+                        ),
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn load_history(self: &Rc<Self>) {
+        self.nav_view.pop_to_page(&self.home_page);
+        self.chips_box.set_visible(false);
+        self.subs_strip_box.set_visible(false);
+        self.section_title.set_visible(false);
+        self.history_header_box.set_visible(true);
+
+        while let Some(child) = self.flow_box.first_child() {
+            self.flow_box.remove(&child);
+        }
+
+        let entries = self.history_store.load_all();
+        if entries.is_empty() {
+            self.show_empty_state(
+                "No Watch History",
+                "Videos you watch will appear here.",
+            );
+            return;
+        }
+
+        self.flow_box.set_max_children_per_line(1);
+        self.flow_box.set_min_children_per_line(1);
+        self.flow_box.set_column_spacing(0);
+        self.flow_box.set_row_spacing(12);
+
+        for entry in entries {
+            let this_rm = self.clone();
+            let vid = entry.video.id.clone();
+            let (child, picture) = VideoCard::new_history(&entry, move || {
+                this_rm.history_store.remove(&vid);
+                this_rm.load_history();
+            });
+
+            unsafe {
+                child.set_data("video_summary", entry.video.clone());
+            }
+
+            self.load_thumbnail_async_pic(
+                &picture,
+                Some(&child),
+                &entry.video.thumbnail_url,
+                &entry.video.id,
+            );
+
+            let toast_overlay = self.toast_overlay.clone();
+            let on_toast = move |msg: String| {
+                toast_overlay.add_toast(adw::Toast::new(&msg));
+            };
+
+            let this_play = self.clone();
+            let sum_play = entry.video.clone();
+            let on_play = move |_id: String, _title: String, quality: Quality| {
+                this_play.play_video(sum_play.clone(), quality);
+            };
+
+            let this_queue = self.clone();
+            let on_add_queue = move |sum: VideoSummary| {
+                this_queue.queue_video(sum);
+            };
+
+            let this_chan = self.clone();
+            let on_open_channel = move |cid: String, cname: String| {
+                this_chan.open_channel(&cid, &cname);
+            };
+
+            ContextMenu::attach(
+                &child,
+                &entry.video,
+                on_play,
+                on_add_queue,
+                on_toast,
+                on_open_channel,
+            );
+
+            self.flow_box.append(&child);
+        }
+    }
+
+    pub fn open_settings(self: &Rc<Self>) {
+        let prefs = adw::PreferencesDialog::builder()
+            .title("Settings")
+            .build();
+
+        let page = adw::PreferencesPage::builder()
+            .title("General")
+            .icon_name("emblem-system-symbolic")
+            .build();
+
+        let group_playback = adw::PreferencesGroup::builder()
+            .title("Playback")
+            .description("Configure video playback and external player")
+            .build();
+
+        let settings = self.settings_store.load();
+
+        let quality_model = gtk4::StringList::new(&["360p", "720p", "1080p"]);
+        let selected_idx = match settings.default_quality.as_str() {
+            "720p" => 1,
+            "1080p" => 2,
+            _ => 0,
+        };
+        let quality_row = adw::ComboRow::builder()
+            .title("Default Resolution")
+            .subtitle("Preferred starting stream resolution")
+            .model(&quality_model)
+            .selected(selected_idx)
+            .build();
+
+        let store_q = self.settings_store.clone();
+        quality_row.connect_selected_notify(move |row| {
+            let mut s = store_q.load();
+            s.default_quality = match row.selected() {
+                1 => "720p".to_string(),
+                2 => "1080p".to_string(),
+                _ => "360p".to_string(),
+            };
+            store_q.save(&s);
+        });
+
+        let hwdec_row = adw::SwitchRow::builder()
+            .title("Hardware Video Decoding")
+            .subtitle("Enable VA-API hardware acceleration in MPV")
+            .active(settings.hardware_decoding)
+            .build();
+
+        let store_hw = self.settings_store.clone();
+        hwdec_row.connect_active_notify(move |row| {
+            let mut s = store_hw.load();
+            s.hardware_decoding = row.is_active();
+            store_hw.save(&s);
+        });
+
+        let player_row = adw::EntryRow::builder()
+            .title("External Player Executable")
+            .text(&settings.external_player)
+            .build();
+
+        let store_pl = self.settings_store.clone();
+        player_row.connect_changed(move |row| {
+            let mut s = store_pl.load();
+            s.external_player = row.text().to_string();
+            store_pl.save(&s);
+        });
+
+        group_playback.add(&quality_row);
+        group_playback.add(&hwdec_row);
+        group_playback.add(&player_row);
+
+        let group_data = adw::PreferencesGroup::builder()
+            .title("Data &amp; Storage")
+            .description("Manage local cache and watching history")
+            .build();
+
+        let hist_row = adw::SwitchRow::builder()
+            .title("Save Watch History")
+            .subtitle("Locally record played videos in history")
+            .active(settings.save_history)
+            .build();
+
+        let store_h = self.settings_store.clone();
+        hist_row.connect_active_notify(move |row| {
+            let mut s = store_h.load();
+            s.save_history = row.is_active();
+            store_h.save(&s);
+        });
+
+        let clear_cache_row = adw::ActionRow::builder()
+            .title("Clear Thumbnail Cache")
+            .subtitle("Removes cached video thumbnails from disk")
+            .build();
+        let clear_cache_btn = Button::with_label("Clear Cache");
+        clear_cache_btn.add_css_class("yr-btn");
+        clear_cache_btn.set_valign(Align::Center);
+        let toast_overlay = self.toast_overlay.clone();
+        let cache_ref = self.cache.clone();
+        clear_cache_btn.connect_clicked(move |_| {
+            cache_ref.clear_all();
+            toast_overlay.add_toast(adw::Toast::new("Thumbnail cache cleared"));
+        });
+        clear_cache_row.add_suffix(&clear_cache_btn);
+
+        let clear_hist_row = adw::ActionRow::builder()
+            .title("Clear Watch History")
+            .subtitle("Deletes all recorded watch history")
+            .build();
+        let clear_hist_btn = Button::with_label("Clear History");
+        clear_hist_btn.add_css_class("yr-btn");
+        clear_hist_btn.set_valign(Align::Center);
+        let toast_overlay2 = self.toast_overlay.clone();
+        let hist_store_ref = self.history_store.clone();
+        let this_hist = self.clone();
+        clear_hist_btn.connect_clicked(move |_| {
+            hist_store_ref.clear();
+            toast_overlay2.add_toast(adw::Toast::new("Watch history cleared"));
+            this_hist.load_history();
+        });
+        clear_hist_row.add_suffix(&clear_hist_btn);
+
+        group_data.add(&hist_row);
+        group_data.add(&clear_cache_row);
+        group_data.add(&clear_hist_row);
+
+        page.add(&group_playback);
+        page.add(&group_data);
+        prefs.add(&page);
+        prefs.present(Some(&self.window));
+    }
+
     fn show_skeletons(self: &Rc<Self>, count: usize) {
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
+        self.flow_box.set_max_children_per_line(4);
+        self.flow_box.set_min_children_per_line(1);
+        self.flow_box.set_column_spacing(20);
+        self.flow_box.set_row_spacing(24);
         for _ in 0..count {
             self.flow_box.append(&VideoCard::new_skeleton());
+        }
+    }
+
+    fn show_skeletons_search(self: &Rc<Self>, count: usize) {
+        while let Some(child) = self.flow_box.first_child() {
+            self.flow_box.remove(&child);
+        }
+        self.flow_box.set_max_children_per_line(1);
+        self.flow_box.set_min_children_per_line(1);
+        self.flow_box.set_column_spacing(0);
+        self.flow_box.set_row_spacing(14);
+        for _ in 0..count {
+            self.flow_box.append(&VideoCard::new_search_skeleton());
         }
     }
 
@@ -625,7 +1026,7 @@ impl MainWindow {
         self.flow_box.append(&container);
     }
 
-    fn populate_videos(self: &Rc<Self>, videos: Vec<VideoSummary>, mode: ViewMode) {
+    pub fn populate_videos(self: &Rc<Self>, videos: Vec<VideoSummary>, mode: ViewMode) {
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
@@ -695,7 +1096,13 @@ impl MainWindow {
         }
     }
 
-    fn load_thumbnail_async(self: &Rc<Self>, card: &VideoCard, url: &str, id: &str) {
+    fn load_thumbnail_async_pic(
+        self: &Rc<Self>,
+        picture: &Picture,
+        container: Option<&gtk4::FlowBoxChild>,
+        url: &str,
+        id: &str,
+    ) {
         if url.is_empty() {
             return;
         }
@@ -725,19 +1132,25 @@ impl MainWindow {
             let _ = sender.send(None).await;
         });
 
-        let picture = card.picture.clone();
-        let container = card.container.clone();
+        let pic_clone = picture.clone();
+        let cont_clone = container.cloned();
         glib::spawn_future_local(async move {
             if let Ok(Some(bytes)) = receiver.recv().await {
                 let glib_bytes = glib::Bytes::from(&bytes);
                 if let Ok(texture) = Texture::from_bytes(&glib_bytes) {
-                    picture.set_paintable(Some(&texture));
-                    unsafe {
-                        container.set_data("thumb_texture", texture);
+                    pic_clone.set_paintable(Some(&texture));
+                    if let Some(c) = cont_clone {
+                        unsafe {
+                            c.set_data("thumb_texture", texture);
+                        }
                     }
                 }
             }
         });
+    }
+
+    fn load_thumbnail_async(self: &Rc<Self>, card: &VideoCard, url: &str, id: &str) {
+        self.load_thumbnail_async_pic(&card.picture, Some(&card.container), url, id);
     }
 
     fn load_avatar_async(self: &Rc<Self>, card: &VideoCard, url: &str, channel_id: &str) {

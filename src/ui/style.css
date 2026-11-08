@@ -102,3 +102,40 @@ preferencesgroup > box > box > list, .boxed-list { background-color: alpha(#E8DD
 /* ---------- status pages ---------- */
 .yr-status-icon { background-color: alpha(#E8DDD5, 0.08); border-radius: 999px;
   min-width: 96px; min-height: 96px; color: @yr_text2; }
+
+/* ---------- search result cards ---------- */
+.search-card {
+  background: none;
+  border-radius: 14px;
+  padding: 8px;
+  margin-bottom: 4px;
+}
+.search-card:hover {
+  background-color: alpha(#E8DDD5, 0.04);
+}
+.video-description {
+  font-size: 13px;
+  color: #A3968E;
+  margin-top: 4px;
+}
+
+/* ---------- history row ---------- */
+.yr-history-row {
+  border-radius: 12px;
+  padding: 8px 12px;
+  margin-bottom: 4px;
+}
+.yr-history-row:hover {
+  background-color: alpha(#E8DDD5, 0.04);
+}
+
+/* ---------- subscriptions strip ---------- */
+.yr-avatar-btn {
+  background: none;
+  box-shadow: none;
+  border-radius: 14px;
+  padding: 8px 12px;
+}
+.yr-avatar-btn:hover {
+  background-color: alpha(#E8DDD5, 0.06);
+}

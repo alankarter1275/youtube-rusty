@@ -178,6 +178,92 @@ fn main() {
                 }
             });
         }
+
+        if std::env::var("TEST_SEARCH").is_ok() {
+            let win_clone = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let sample_results = vec![
+                    backend::models::VideoSummary {
+                        id: "pk1".to_string(),
+                        title: "Pokémon Journeys Episode 37 | Ash and Goh's Ancient Adventure".to_string(),
+                        channel_id: "UC_pokemon".to_string(),
+                        channel_name: "Pokémon Asia Official".to_string(),
+                        channel_avatar_url: "".to_string(),
+                        duration_seconds: Some(1279),
+                        duration_text: "21:19".to_string(),
+                        view_count_text: "19.8M views".to_string(),
+                        published_text: "2 years ago".to_string(),
+                        thumbnail_url: "".to_string(),
+                        description_snippet: "Ash and Goh visit the museum to investigate rumors of legendary fossil Pokémon resurrected from ancient strata.".to_string(),
+                    },
+                    backend::models::VideoSummary {
+                        id: "pk2".to_string(),
+                        title: "Pokémon: Diamond and Pearl: Battle Dimension | Episode 4".to_string(),
+                        channel_id: "UC_pokemon".to_string(),
+                        channel_name: "Pokémon Asia Official".to_string(),
+                        channel_avatar_url: "".to_string(),
+                        duration_seconds: Some(1208),
+                        duration_text: "20:08".to_string(),
+                        view_count_text: "8.3M views".to_string(),
+                        published_text: "1 year ago".to_string(),
+                        thumbnail_url: "".to_string(),
+                        description_snippet: "Dawn encounters a wild Pachirisu in the forest while Ash trains his Aipom for the next gym battle.".to_string(),
+                    },
+                ];
+                win_clone.section_title.set_text("Results for \"pokemon\"");
+                win_clone.chips_box.set_visible(false);
+                win_clone.populate_videos(sample_results, ui::window::ViewMode::SearchList);
+            });
+        }
+
+        if std::env::var("TEST_SUBSCRIPTIONS").is_ok() {
+            let win_clone = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let sub1 = backend::subscriptions::SubscribedChannel {
+                    id: "UC_ancient_history".to_string(),
+                    name: "Heritage Explorers".to_string(),
+                    handle: "@heritage_explorers".to_string(),
+                    avatar_url: "".to_string(),
+                };
+                let sub2 = backend::subscriptions::SubscribedChannel {
+                    id: "UC_nature".to_string(),
+                    name: "Wild Earth".to_string(),
+                    handle: "@wildearth".to_string(),
+                    avatar_url: "".to_string(),
+                };
+                win_clone.subscription_store.subscribe(sub1);
+                win_clone.subscription_store.subscribe(sub2);
+                win_clone.rail.subs_btn.emit_clicked();
+            });
+        }
+
+        if std::env::var("TEST_HISTORY").is_ok() {
+            let win_clone = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let sample_hist = backend::models::VideoSummary {
+                    id: "dQw4w9WgXcQ".to_string(),
+                    title: "Exploring the Ancient Terracotta Temples of Bishnupur".to_string(),
+                    channel_id: "UC_ancient_history".to_string(),
+                    channel_name: "Heritage Explorers".to_string(),
+                    channel_avatar_url: "".to_string(),
+                    duration_seconds: Some(742),
+                    duration_text: "12:22".to_string(),
+                    view_count_text: "1.4M views".to_string(),
+                    published_text: "3 days ago".to_string(),
+                    thumbnail_url: "".to_string(),
+                    description_snippet: "".to_string(),
+                };
+                win_clone.history_store.add(sample_hist);
+                win_clone.rail.hist_btn.emit_clicked();
+            });
+        }
+
+        if std::env::var("TEST_SETTINGS").is_ok() {
+            let win_clone = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                win_clone.rail.settings_btn.emit_clicked();
+            });
+        }
     });
 
     app.run();

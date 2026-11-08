@@ -26,6 +26,14 @@ impl Cache {
         fs::write(&path, data)?;
         Ok(path)
     }
+
+    pub fn clear_all(&self) {
+        if let Ok(entries) = fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 fn dirs_base() -> PathBuf {
