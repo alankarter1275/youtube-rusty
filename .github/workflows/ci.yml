@@ -23,53 +23,53 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: "true"
+          cache-on-failure: "true"
 
       - name: Cargo check, test, and build
         run: |
           python3 - << 'PY'
           import subprocess, sys
 
-          def emit(level, title, text):
-              esc = (
-                  text.replace("%", "%25")
-                      .replace("\r", "%0D")
-                      .replace("\n", "%0A")
-              )
-              # Split into <=60000-char chunks so nothing is ever truncated
-              chunk_size = 55000
-              parts = [esc[i:i+chunk_size] for i in range(0, max(1, len(esc)), chunk_size)]
-              for idx, part in enumerate(parts, 1):
-                  t = title if len(parts) == 1 else f"{title} ({idx}/{len(parts)})"
+          def emit_chunks(level, title, text):
+              lines = text.splitlines()
+              chunks = []
+              cur = []
+              cur_len = 0
+              for line in lines:
+                  esc = (
+                      line.replace("%", "%25")
+                          .replace("\r", "%0D")
+                  )
+                  add_len = len(esc) + 3
+                  if cur and cur_len + add_len > 3000:
+                      chunks.append("%0A".join(cur))
+                      cur = [esc]
+                      cur_len = add_len
+                  else:
+                      cur.append(esc)
+                      cur_len += add_len
+              if cur:
+                  chunks.append("%0A".join(cur))
+              for idx, part in enumerate(chunks[:45], 1):
+                  t = title if len(chunks) == 1 else f"{title} ({idx}/{len(chunks)})"
                   print(f"::{level} title={t}::{part}", flush=True)
 
           steps = [
-              ("cargo check --all-targets", ["cargo", "check", "--all-targets"]),
-              ("cargo test", ["cargo", "test"]),
-              ("cargo build", ["cargo", "build"]),
+              ("cargo check", ["cargo", "check", "-q", "--all-targets"]),
+              ("cargo test", ["cargo", "test", "-q"]),
+              ("cargo build", ["cargo", "build", "-q"]),
           ]
 
           for label, cmd in steps:
               print(f"=== Running: {label} ===", flush=True)
               proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              out = proc.stdout or ""
+              out = (proc.stdout or "").strip()
               print(out, flush=True)
               if proc.returncode != 0:
-                  # Filter out "Compiling ..." lines so only warnings/errors remain
-                  relevant = "\n".join(
-                      line for line in out.splitlines()
-                      if not line.strip().startswith(("Compiling ", "Downloading ", "Downloaded ", "Locking ", "Updating "))
-                  )
-                  emit("error", f"Failed: {label}", relevant[-180000:])
+                  emit_chunks("error", f"Failed {label}", out or f"Exit code {proc.returncode}")
                   sys.exit(proc.returncode)
-              else:
-                  # Surface any compiler warnings too
-                  relevant = "\n".join(
-                      line for line in out.splitlines()
-                      if not line.strip().startswith(("Compiling ", "Downloading ", "Downloaded ", "Locking ", "Updating "))
-                  )
-                  if "warning:" in relevant:
-                      emit("warning", f"Warnings: {label}", relevant[-50000:])
+              elif out and "warning:" in out:
+                  emit_chunks("warning", f"Warnings {label}", out)
 
-          emit("notice", "CI Passed", "cargo check, cargo test, and cargo build all succeeded cleanly.")
+          print("::notice title=CI Passed::cargo check, cargo test, and cargo build all succeeded cleanly.", flush=True)
           PY
