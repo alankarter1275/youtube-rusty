@@ -1,4 +1,5 @@
 use crate::backend::models::{format_duration, format_queue_total_duration, VideoSummary};
+use crate::ui::icons::set_pointer;
 use crate::ui::image_loader::ImageLoader;
 use adw::prelude::*;
 use gtk4::{
@@ -10,7 +11,7 @@ use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static SHUFFLE_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -43,6 +44,8 @@ pub struct PlayerCard {
     clear_btn: Button,
     is_expanded: Cell<bool>,
     is_playing: Cell<bool>,
+    is_loading: Cell<bool>,
+    pulse_running: Cell<bool>,
     is_narrow: Cell<bool>,
     is_shorts_mode: Cell<bool>,
     queue: RefCell<Vec<VideoSummary>>,
@@ -57,7 +60,7 @@ pub struct PlayerCard {
 impl PlayerCard {
     pub fn new(image_loader: Rc<ImageLoader>) -> Rc<Self> {
         let root = GtkBox::new(Orientation::Vertical, 0);
-        root.set_width_request(370);
+        root.set_width_request(356);
         root.set_halign(Align::End);
         root.set_valign(Align::End);
         root.set_focusable(true);
@@ -67,8 +70,8 @@ impl PlayerCard {
         let body = GtkBox::new(Orientation::Vertical, 10);
         body.set_hexpand(true);
         let inner_clamp = adw::Clamp::builder()
-            .maximum_size(342)
-            .tightening_threshold(342)
+            .maximum_size(328)
+            .tightening_threshold(328)
             .child(&body)
             .build();
         root.append(&inner_clamp);
@@ -289,6 +292,8 @@ impl PlayerCard {
             clear_btn,
             is_expanded: Cell::new(false),
             is_playing: Cell::new(true),
+            is_loading: Cell::new(false),
+            pulse_running: Cell::new(false),
             is_narrow: Cell::new(false),
             is_shorts_mode: Cell::new(false),
             queue: RefCell::new(Vec::new()),
@@ -299,6 +304,16 @@ impl PlayerCard {
             on_move_item: RefCell::new(None),
             on_empty_stop: RefCell::new(None),
         });
+
+        set_pointer(&card.channel_btn);
+        set_pointer(&card.prev_btn);
+        set_pointer(&card.play_pause_btn);
+        set_pointer(&card.narrow_play_pause_btn);
+        set_pointer(&card.next_btn);
+        set_pointer(&card.close_btn);
+        set_pointer(&card.expand_btn);
+        set_pointer(&card.shuffle_btn);
+        set_pointer(&card.clear_btn);
 
         // Expand/collapse toggle
         let card_weak = Rc::downgrade(&card);
@@ -409,7 +424,37 @@ impl PlayerCard {
         self.time_total_label.set_text(&dur_txt);
     }
 
+    pub fn set_loading(self: &Rc<Self>, loading: bool) {
+        self.is_loading.set(loading);
+        self.update_header_labels();
+        if loading {
+            self.progress_bar.set_pulse_step(0.18);
+            if !self.pulse_running.get() {
+                self.pulse_running.set(true);
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_local(Duration::from_millis(120), move || {
+                    let Some(c) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if c.is_loading.get() && c.root.is_visible() {
+                        c.progress_bar.pulse();
+                        glib::ControlFlow::Continue
+                    } else {
+                        c.pulse_running.set(false);
+                        glib::ControlFlow::Break
+                    }
+                });
+            }
+        } else {
+            self.progress_bar.set_fraction(0.0);
+        }
+    }
+
     pub fn set_progress(&self, elapsed: f64, duration: f64) {
+        if self.is_loading.get() && elapsed > 0.0 {
+            self.is_loading.set(false);
+            self.update_header_labels();
+        }
         let safe_elapsed = elapsed.max(0.0);
         self.time_elapsed_label
             .set_text(&format_duration(safe_elapsed as u64));
@@ -455,11 +500,11 @@ impl PlayerCard {
             self.controls_row.set_visible(false);
             self.queue_box.set_visible(false);
         } else {
-            self.root.set_width_request(370);
+            self.root.set_width_request(356);
             self.root.set_halign(Align::End);
             self.root.remove_css_class("yr-player-narrow");
-            self.inner_clamp.set_maximum_size(342);
-            self.inner_clamp.set_tightening_threshold(342);
+            self.inner_clamp.set_maximum_size(328);
+            self.inner_clamp.set_tightening_threshold(328);
             self.thumb_overlay.set_size_request(96, 54);
             self.thumb_h_clamp.set_maximum_size(96);
             self.thumb_h_clamp.set_tightening_threshold(96);
@@ -635,17 +680,21 @@ impl PlayerCard {
             self.channel_btn.set_visible(!cur.channel_name.is_empty());
             self.channel_btn.set_sensitive(!cur.channel_id.is_empty());
 
-            let prefix = if self.is_shorts_mode.get() {
-                "Short"
+            if self.is_loading.get() {
+                self.queue_pos_label.set_text("Loading in MPV…");
             } else {
-                "Queue"
-            };
-            if self.is_narrow.get() {
-                self.queue_pos_label
-                    .set_text(&format!("{} of {}", cur_idx + 1, count));
-            } else {
-                self.queue_pos_label
-                    .set_text(&format!("{prefix} · {} of {}", cur_idx + 1, count));
+                let prefix = if self.is_shorts_mode.get() {
+                    "Short"
+                } else {
+                    "Queue"
+                };
+                if self.is_narrow.get() {
+                    self.queue_pos_label
+                        .set_text(&format!("{} of {}", cur_idx + 1, count));
+                } else {
+                    self.queue_pos_label
+                        .set_text(&format!("{prefix} · {} of {}", cur_idx + 1, count));
+                }
             }
         }
     }
@@ -709,6 +758,7 @@ impl PlayerCard {
 
             let click_area = GtkBox::new(Orientation::Horizontal, 8);
             click_area.set_hexpand(true);
+            set_pointer(&click_area);
 
             let handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
             handle.add_css_class("yr-meta");

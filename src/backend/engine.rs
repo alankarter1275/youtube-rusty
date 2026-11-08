@@ -5,6 +5,7 @@ use super::models::{
 use super::subscriptions::SubscribedChannel;
 use crate::player::mpv::Quality;
 use rustypipe::client::RustyPipe;
+use rustypipe::model::paginator::{ContinuationEndpoint, Paginator};
 use rustypipe::model::{Thumbnail, VideoItem};
 use rustypipe::param::search_filter::{ItemType, Length, Order, SearchFilter, UploadDate};
 use rustypipe::param::{ChannelOrder, ChannelVideoTab};
@@ -14,6 +15,27 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+
+#[derive(Clone, Debug)]
+pub struct PageCursor {
+    pub ctoken: String,
+    pub endpoint: ContinuationEndpoint,
+    pub visitor_data: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PagedVideos {
+    pub items: Vec<VideoSummary>,
+    pub next: Option<PageCursor>,
+}
+
+fn cursor_from_paginator<T>(p: &Paginator<T>) -> Option<PageCursor> {
+    p.ctoken.as_ref().map(|ctoken| PageCursor {
+        ctoken: ctoken.clone(),
+        endpoint: p.endpoint,
+        visitor_data: p.visitor_data.clone(),
+    })
+}
 
 pub struct Engine {
     rp: RustyPipe,
@@ -35,18 +57,17 @@ impl Engine {
         date: UploadDateFilter,
         duration: DurationFilter,
         sort: SearchSortOrder,
-    ) -> Result<Vec<VideoSummary>, String> {
+    ) -> Result<PagedVideos, String> {
         let is_default = date == UploadDateFilter::AnyTime
             && duration == DurationFilter::AnyLength
             && sort == SearchSortOrder::Relevance;
 
-        let items = if is_default {
+        let paginator = if is_default {
             self.rp
                 .query()
                 .search::<VideoItem, _>(query)
                 .await
                 .map_err(|e| format!("Search error: {e}"))?
-                .items
                 .items
         } else {
             let rp_date = match date {
@@ -80,27 +101,30 @@ impl Engine {
                 .await
                 .map_err(|e| format!("Search error: {e}"))?
                 .items
-                .items
         };
 
-        Ok(items
+        let next = cursor_from_paginator(&paginator);
+        let items = paginator
+            .items
             .into_iter()
             .map(|it| map_video_item(it, None, false))
-            .collect())
+            .collect();
+
+        Ok(PagedVideos { items, next })
     }
 
-    pub async fn category_feed(&self, category: &str) -> Result<Vec<VideoSummary>, String> {
+    pub async fn category_feed(&self, category: &str) -> Result<PagedVideos, String> {
         let filter = SearchFilter::new()
             .item_type(ItemType::Video)
             .date(UploadDate::Week);
 
-        let items = match self
+        let paginator = match self
             .rp
             .query()
             .search_filter::<VideoItem, _>(category, &filter)
             .await
         {
-            Ok(res) if !res.items.items.is_empty() => res.items.items,
+            Ok(res) if !res.items.items.is_empty() => res.items,
             _ => {
                 self.rp
                     .query()
@@ -108,15 +132,53 @@ impl Engine {
                     .await
                     .map_err(|e| format!("Category error: {e}"))?
                     .items
-                    .items
             }
         };
 
-        Ok(items
+        let next = cursor_from_paginator(&paginator);
+        let items = paginator
+            .items
             .into_iter()
             .filter(|it| !it.is_short)
             .map(|it| map_video_item(it, None, false))
-            .collect())
+            .collect();
+
+        Ok(PagedVideos { items, next })
+    }
+
+    pub async fn load_more(
+        &self,
+        cursor: &PageCursor,
+        fallback_details: Option<&ChannelDetails>,
+        force_short: bool,
+        filter_out_shorts: bool,
+    ) -> Result<PagedVideos, String> {
+        let paginator = self
+            .rp
+            .query()
+            .continuation::<VideoItem, _>(
+                &cursor.ctoken,
+                cursor.endpoint,
+                cursor.visitor_data.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Load more error: {e}"))?;
+
+        let next = cursor_from_paginator(&paginator);
+        let fallback = fallback_details.map(|d| ChannelFallback {
+            id: &d.id,
+            name: &d.name,
+            avatar_url: &d.avatar_url,
+        });
+
+        let items = paginator
+            .items
+            .into_iter()
+            .filter(|it| !filter_out_shorts || !it.is_short)
+            .map(|it| map_video_item(it, fallback.as_ref(), force_short))
+            .collect();
+
+        Ok(PagedVideos { items, next })
     }
 
     pub async fn trending(&self) -> Result<Vec<VideoSummary>, String> {
@@ -205,7 +267,7 @@ impl Engine {
     pub async fn channel_videos(
         &self,
         channel_id: &str,
-    ) -> Result<(ChannelDetails, Vec<VideoSummary>), String> {
+    ) -> Result<(ChannelDetails, PagedVideos), String> {
         let ch = self
             .rp
             .query()
@@ -238,20 +300,21 @@ impl Engine {
             avatar_url: &details.avatar_url,
         };
 
-        let videos = ch
+        let next = cursor_from_paginator(&ch.content);
+        let items = ch
             .content
             .items
             .into_iter()
             .map(|it| map_video_item(it, Some(&fallback), false))
             .collect();
-        Ok((details, videos))
+        Ok((details, PagedVideos { items, next }))
     }
 
     pub async fn channel_shorts(
         &self,
         channel_id: &str,
         fallback_details: Option<&ChannelDetails>,
-    ) -> Result<Vec<VideoSummary>, String> {
+    ) -> Result<PagedVideos, String> {
         let ch = self
             .rp
             .query()
@@ -284,13 +347,14 @@ impl Engine {
             avatar_url: av_str,
         };
 
-        let videos = ch
+        let next = cursor_from_paginator(&ch.content);
+        let items = ch
             .content
             .items
             .into_iter()
             .map(|it| map_video_item(it, Some(&fallback), true))
             .collect();
-        Ok(videos)
+        Ok(PagedVideos { items, next })
     }
 
     pub async fn channel_tab_ordered(
@@ -299,7 +363,7 @@ impl Engine {
         is_shorts: bool,
         order: ChannelSortOrder,
         fallback_details: Option<&ChannelDetails>,
-    ) -> Result<Vec<VideoSummary>, String> {
+    ) -> Result<PagedVideos, String> {
         let tab = if is_shorts {
             ChannelVideoTab::Shorts
         } else {
@@ -315,8 +379,8 @@ impl Engine {
             if is_shorts {
                 return self.channel_shorts(channel_id, fallback_details).await;
             } else {
-                let (_, vids) = self.channel_videos(channel_id).await?;
-                return Ok(vids);
+                let (_, paged) = self.channel_videos(channel_id).await?;
+                return Ok(paged);
             }
         }
 
@@ -333,12 +397,13 @@ impl Engine {
             avatar_url: &d.avatar_url,
         });
 
-        let videos = paginator
+        let next = cursor_from_paginator(&paginator);
+        let items = paginator
             .items
             .into_iter()
             .map(|it| map_video_item(it, fallback.as_ref(), is_shorts))
             .collect();
-        Ok(videos)
+        Ok(PagedVideos { items, next })
     }
 
     pub async fn channel_search(
@@ -405,7 +470,8 @@ impl Engine {
             set.spawn(async move {
                 let _permit = sem_cl.acquire_owned().await.ok()?;
                 match engine.channel_videos(&sub.id).await {
-                    Ok((details, mut vids)) => {
+                    Ok((details, paged)) => {
+                        let mut vids = paged.items;
                         for v in &mut vids {
                             if v.channel_id.is_empty() {
                                 v.channel_id = sub.id.clone();

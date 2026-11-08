@@ -1,8 +1,8 @@
 use crate::backend::cache::Cache;
-use crate::backend::engine::{download_with_ytdlp, Engine};
+use crate::backend::engine::{download_with_ytdlp, Engine, PageCursor, PagedVideos};
 use crate::backend::history::HistoryStore;
 use crate::backend::models::{
-    DurationFilter, SearchSortOrder, UploadDateFilter, VideoSummary,
+    ChannelDetails, DurationFilter, SearchSortOrder, UploadDateFilter, VideoSummary,
 };
 use crate::backend::settings::{AppSettings, SettingsStore};
 use crate::backend::subscriptions::SubscriptionStore;
@@ -11,16 +11,17 @@ use crate::player::mpv::Quality;
 use crate::player::mpv_ipc::{MpvEvent, MpvSession};
 use crate::ui::channel_page::ChannelPage;
 use crate::ui::details_sheet::{CardActions, ContextMenu, DetailsSheet};
+use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::image_loader::ImageLoader;
 use crate::ui::player_card::PlayerCard;
 use crate::ui::rail::{Rail, RailTab};
-use crate::ui::video_card::VideoCard;
+use crate::ui::video_card::{ListCardLayout, VideoCard};
 use adw::prelude::*;
 use gtk4::gdk::{self, Display};
 use gtk4::{
-    gio, glib, Align, Box as GtkBox, Button, CssProvider, Editable, EventControllerKey, FlowBox,
-    GestureClick, Image, Label, MenuButton, Orientation, Overlay, Popover, ScrolledWindow,
-    SearchEntry, SelectionMode, Separator,
+    gio, glib, Align, Box as GtkBox, Button, CssProvider, Editable, Entry, EventControllerKey,
+    FlowBox, GestureClick, Image, Label, MenuButton, Orientation, Overlay, Popover, ScrolledWindow,
+    SearchEntry, SelectionMode, Separator, Switch,
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
@@ -42,12 +43,14 @@ enum ActiveView {
     Search(String),
     Subscriptions,
     History,
+    Preferences,
 }
 
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     back_btn: Button,
     pub search_entry: SearchEntry,
+    suppress_search_clear: Cell<bool>,
     pub rail: Rail,
     bottom_home: Button,
     bottom_subs: Button,
@@ -55,7 +58,17 @@ pub struct MainWindow {
     bottom_settings: Button,
     pub nav_view: adw::NavigationView,
     pub home_page: adw::NavigationPage,
+    content_scrolled: ScrolledWindow,
+    feed_box: GtkBox,
+    prefs_clamp: adw::Clamp,
+    pref_scheme_btn: Button,
+    pref_accent_btn: Button,
+    pref_quality_btn: Button,
+    pref_hwdec_switch: Switch,
+    pref_player_entry: Entry,
+    pref_hist_switch: Switch,
     pub flow_box: FlowBox,
+    load_more_btn: Button,
     status_box: GtkBox,
     status_icon: Image,
     status_title: Label,
@@ -67,6 +80,7 @@ pub struct MainWindow {
     search_filters_btn: Button,
     clear_watch_later_btn: Button,
     chips_scroll: ScrolledWindow,
+    chips_box: GtkBox,
     chip_trending: Button,
     chip_gaming: Button,
     chip_music: Button,
@@ -83,10 +97,15 @@ pub struct MainWindow {
     pub mpv_pos: Cell<f64>,
     pub mpv_duration: Cell<f64>,
     is_narrow: Cell<bool>,
+    is_compact: Cell<bool>,
     grid_cols: Cell<u32>,
     shorts_cols: Cell<u32>,
     view_mode: Cell<ViewMode>,
     active_view: RefCell<ActiveView>,
+    prev_non_search_view: RefCell<ActiveView>,
+    current_videos: RefCell<Vec<VideoSummary>>,
+    feed_cursor: RefCell<Option<PageCursor>>,
+    is_loading_more: Cell<bool>,
     request_seq: Cell<u64>,
     search_date_filter: Cell<UploadDateFilter>,
     search_dur_filter: Cell<DurationFilter>,
@@ -117,28 +136,31 @@ impl MainWindow {
             .visible(false)
             .build();
         back_btn.add_css_class("flat");
+        back_btn.add_css_class("circular");
+        set_pointer(&back_btn);
         header_bar.pack_start(&back_btn);
 
-        // Centered Search Bar: max 420px
+        // Centered Search Bar: max 420px, shrinks smoothly on narrow windows
         let search_clamp = adw::Clamp::builder()
             .maximum_size(420)
-            .tightening_threshold(300)
+            .tightening_threshold(240)
             .hexpand(true)
             .build();
         let search_entry = SearchEntry::builder()
-            .placeholder_text("Search YouTube...")
-            .width_request(280)
+            .placeholder_text("Search YouTube")
+            .width_request(120)
             .hexpand(true)
             .build();
         search_entry.add_css_class("yr-search");
         search_clamp.set_child(Some(&search_entry));
         header_bar.set_title_widget(Some(&search_clamp));
 
-        // Primary Menu Button at the top right
+        // Primary Menu Button at the top right (exact 3-bar Kalam icon)
         let menu_btn = MenuButton::new();
-        menu_btn.set_icon_name("open-menu-symbolic");
+        menu_btn.set_child(Some(&make_icon(KalamIcon::Menu, 22)));
         menu_btn.set_tooltip_text(Some("Main menu"));
-        menu_btn.add_css_class("flat");
+        menu_btn.add_css_class("yr-rail-btn");
+        set_pointer(&menu_btn);
 
         let menu = gio::Menu::new();
         menu.append(Some("Preferences"), Some("app.settings"));
@@ -148,14 +170,14 @@ impl MainWindow {
         menu_btn.set_menu_model(Some(&menu));
         header_bar.pack_end(&menu_btn);
 
-        // Left Navigation Rail (68px)
+        // Full-height Left Navigation Rail (68px, spans entire window height)
         let rail = Rail::new();
 
         // Scrollable Chips Row
         let chips_box = GtkBox::new(Orientation::Horizontal, 8);
         chips_box.set_margin_start(28);
         chips_box.set_margin_end(28);
-        chips_box.set_margin_top(16);
+        chips_box.set_margin_top(10);
         chips_box.set_margin_bottom(12);
 
         let chip_trending = create_chip("Trending", true);
@@ -180,7 +202,7 @@ impl MainWindow {
         let subs_strip_box = GtkBox::new(Orientation::Vertical, 8);
         subs_strip_box.set_margin_start(28);
         subs_strip_box.set_margin_end(28);
-        subs_strip_box.set_margin_top(16);
+        subs_strip_box.set_margin_top(12);
         subs_strip_box.set_margin_bottom(12);
         subs_strip_box.set_visible(false);
 
@@ -198,7 +220,7 @@ impl MainWindow {
         let history_header_box = GtkBox::new(Orientation::Horizontal, 12);
         history_header_box.set_margin_start(28);
         history_header_box.set_margin_end(28);
-        history_header_box.set_margin_top(16);
+        history_header_box.set_margin_top(12);
         history_header_box.set_margin_bottom(16);
         history_header_box.set_visible(false);
 
@@ -211,6 +233,7 @@ impl MainWindow {
         let clear_hist_btn = Button::with_label("Clear history");
         clear_hist_btn.add_css_class("yr-chip");
         clear_hist_btn.set_valign(Align::Center);
+        set_pointer(&clear_hist_btn);
 
         history_header_box.append(&hist_title);
         history_header_box.append(&clear_hist_btn);
@@ -219,7 +242,8 @@ impl MainWindow {
         let section_header_row = GtkBox::new(Orientation::Horizontal, 12);
         section_header_row.set_margin_start(28);
         section_header_row.set_margin_end(28);
-        section_header_row.set_margin_bottom(16);
+        section_header_row.set_margin_top(4);
+        section_header_row.set_margin_bottom(14);
         section_header_row.set_valign(Align::Center);
 
         let section_title = Label::new(Some("Trending"));
@@ -233,10 +257,12 @@ impl MainWindow {
         search_filters_btn.add_css_class("yr-chip");
         search_filters_btn.set_tooltip_text(Some("Filter search results"));
         search_filters_btn.set_visible(false);
+        set_pointer(&search_filters_btn);
 
         let clear_watch_later_btn = Button::with_label("Clear saved");
         clear_watch_later_btn.add_css_class("yr-chip");
         clear_watch_later_btn.set_visible(false);
+        set_pointer(&clear_watch_later_btn);
 
         section_header_row.append(&section_title);
         section_header_row.append(&search_filters_btn);
@@ -274,13 +300,14 @@ impl MainWindow {
         status_desc.set_halign(Align::Center);
         status_desc.set_justify(gtk4::Justification::Center);
         status_desc.set_wrap(true);
-        status_desc.set_max_width_chars(48);
+        status_desc.set_max_width_chars(46);
 
         let status_action_btn = Button::with_label("Retry");
         status_action_btn.add_css_class("yr-btn");
         status_action_btn.add_css_class("primary");
         status_action_btn.set_halign(Align::Center);
         status_action_btn.set_margin_top(6);
+        set_pointer(&status_action_btn);
 
         status_box.append(&icon_circle);
         status_box.append(&status_title);
@@ -298,16 +325,44 @@ impl MainWindow {
         flow_box.set_homogeneous(true);
         flow_box.set_margin_start(28);
         flow_box.set_margin_end(28);
-        flow_box.set_margin_bottom(32);
+        flow_box.set_margin_bottom(16);
+
+        let load_more_btn = Button::with_label("Load more");
+        load_more_btn.add_css_class("yr-btn");
+        load_more_btn.set_halign(Align::Center);
+        load_more_btn.set_margin_top(4);
+        load_more_btn.set_margin_bottom(36);
+        load_more_btn.set_visible(false);
+        set_pointer(&load_more_btn);
+
+        let feed_box = GtkBox::new(Orientation::Vertical, 0);
+        feed_box.set_vexpand(true);
+        feed_box.append(&chips_scroll);
+        feed_box.append(&subs_strip_box);
+        feed_box.append(&history_header_box);
+        feed_box.append(&section_header_row);
+        feed_box.append(&status_box);
+        feed_box.append(&flow_box);
+        feed_box.append(&load_more_btn);
+
+        // Inline Kalam Preferences View (matches Settings.png 100%)
+        let (
+            prefs_clamp,
+            pref_scheme_btn,
+            pref_accent_btn,
+            pref_quality_btn,
+            pref_hwdec_switch,
+            pref_player_entry,
+            pref_hist_switch,
+            pref_clear_cache_btn,
+            pref_clear_hist_btn,
+        ) = build_inline_preferences_view();
 
         let content_v_box = GtkBox::new(Orientation::Vertical, 0);
         content_v_box.set_vexpand(true);
-        content_v_box.append(&chips_scroll);
-        content_v_box.append(&subs_strip_box);
-        content_v_box.append(&history_header_box);
-        content_v_box.append(&section_header_row);
-        content_v_box.append(&status_box);
-        content_v_box.append(&flow_box);
+        content_v_box.set_hexpand(true);
+        content_v_box.append(&feed_box);
+        content_v_box.append(&prefs_clamp);
 
         let content_scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -318,6 +373,8 @@ impl MainWindow {
             .build();
 
         let nav_view = adw::NavigationView::new();
+        nav_view.set_hexpand(true);
+        nav_view.set_vexpand(true);
         let home_page = adw::NavigationPage::builder()
             .title("Home")
             .tag("home")
@@ -325,49 +382,59 @@ impl MainWindow {
             .build();
         nav_view.push(&home_page);
 
-        let main_h_box = GtkBox::new(Orientation::Horizontal, 0);
-        main_h_box.append(&rail.container);
-        main_h_box.append(&nav_view);
-
         let cache = Arc::new(Cache::new());
         let runtime = Arc::new(Runtime::new().expect("Failed to initialize Tokio runtime"));
         let engine = Arc::new(Engine::new(cache.root_dir()));
         let image_loader = ImageLoader::new(cache, runtime.clone());
 
         let content_overlay = Overlay::new();
-        content_overlay.set_child(Some(&main_h_box));
+        content_overlay.set_hexpand(true);
+        content_overlay.set_vexpand(true);
+        content_overlay.set_child(Some(&nav_view));
 
         let player_card = PlayerCard::new(image_loader.clone());
         content_overlay.add_overlay(&player_card.root);
 
-        // Bottom Navigation Bar for Narrow Breakpoint (< 600px)
+        // Bottom Navigation Bar for Narrow Breakpoint (<= 600px)
         let bottom_bar = GtkBox::new(Orientation::Horizontal, 0);
         bottom_bar.add_css_class("yr-bottom-bar");
         bottom_bar.set_visible(false);
 
-        let bottom_home = create_bottom_nav_btn("user-home-symbolic", "Home", true);
-        let bottom_subs = create_bottom_nav_btn("emblem-favorite-symbolic", "Subscriptions", false);
-        let bottom_hist = create_bottom_nav_btn("document-open-recent-symbolic", "History", false);
-        let bottom_settings = create_bottom_nav_btn("emblem-system-symbolic", "Settings", false);
+        let bottom_home = create_bottom_nav_btn(KalamIcon::Home, "Home", true);
+        let bottom_subs = create_bottom_nav_btn(KalamIcon::Subscriptions, "Subscriptions", false);
+        let bottom_hist = create_bottom_nav_btn(KalamIcon::History, "History", false);
+        let bottom_settings = create_bottom_nav_btn(KalamIcon::Settings, "Preferences", false);
 
         bottom_bar.append(&bottom_home);
         bottom_bar.append(&bottom_subs);
         bottom_bar.append(&bottom_hist);
         bottom_bar.append(&bottom_settings);
 
+        // Right column: HeaderBar + Content + Narrow Bottom Bar
         let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.set_hexpand(true);
+        toolbar_view.set_vexpand(true);
         toolbar_view.add_top_bar(&header_bar);
         toolbar_view.add_bottom_bar(&bottom_bar);
         toolbar_view.set_content(Some(&content_overlay));
 
+        // Outer shell: Full-height Siderail on the left, ToolbarView on the right!
+        let shell_h_box = GtkBox::new(Orientation::Horizontal, 0);
+        shell_h_box.set_hexpand(true);
+        shell_h_box.set_vexpand(true);
+        shell_h_box.append(&rail.container);
+        shell_h_box.append(&toolbar_view);
+
         let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&toolbar_view));
+        toast_overlay.set_child(Some(&shell_h_box));
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("youtube-rusty")
-            .default_width(1280)
+            .default_width(1240)
             .default_height(780)
+            .width_request(340)
+            .height_request(420)
             .content(&toast_overlay)
             .build();
 
@@ -382,6 +449,7 @@ impl MainWindow {
             window,
             back_btn,
             search_entry,
+            suppress_search_clear: Cell::new(false),
             rail,
             bottom_home,
             bottom_subs,
@@ -389,7 +457,17 @@ impl MainWindow {
             bottom_settings,
             nav_view,
             home_page,
+            content_scrolled,
+            feed_box,
+            prefs_clamp,
+            pref_scheme_btn,
+            pref_accent_btn,
+            pref_quality_btn,
+            pref_hwdec_switch,
+            pref_player_entry,
+            pref_hist_switch,
             flow_box,
+            load_more_btn,
             status_box,
             status_icon,
             status_title,
@@ -401,6 +479,7 @@ impl MainWindow {
             search_filters_btn,
             clear_watch_later_btn,
             chips_scroll,
+            chips_box,
             chip_trending,
             chip_gaming,
             chip_music,
@@ -417,10 +496,15 @@ impl MainWindow {
             mpv_pos: Cell::new(0.0),
             mpv_duration: Cell::new(0.0),
             is_narrow: Cell::new(false),
+            is_compact: Cell::new(false),
             grid_cols: Cell::new(4),
             shorts_cols: Cell::new(6),
             view_mode: Cell::new(ViewMode::Grid),
             active_view: RefCell::new(ActiveView::HomeTrending),
+            prev_non_search_view: RefCell::new(ActiveView::HomeTrending),
+            current_videos: RefCell::new(Vec::new()),
+            feed_cursor: RefCell::new(None),
+            is_loading_more: Cell::new(false),
             request_seq: Cell::new(0),
             search_date_filter: Cell::new(UploadDateFilter::AnyTime),
             search_dur_filter: Cell::new(DurationFilter::AnyLength),
@@ -437,6 +521,8 @@ impl MainWindow {
         });
 
         this.apply_appearance(&initial_settings);
+        this.sync_preferences_ui(&initial_settings);
+        this.wire_preferences_signals(&pref_clear_cache_btn, &pref_clear_hist_btn);
         this.register_app_actions(app);
         this.setup_breakpoint(&bottom_bar);
         this.setup_search_filters_popover();
@@ -480,7 +566,16 @@ impl MainWindow {
                  @define-color yr_accent_hi {accent};
                  @define-color yr_on_accent #FAF6F2;
                  .yr-thumb {{ background-color: #E3D7CC; }}
-                 .yr-card:hover .yr-thumb {{ background-color: #D8C9BC; }}"
+                 .yr-card:hover .yr-thumb, .search-card:hover .yr-thumb, .yr-history-row:hover .yr-thumb {{ background-color: #D8C9BC; }}
+                 .yr-rail-sep {{ background-color: alpha(#1C1512, 0.12); }}
+                 .yr-chip {{ background-color: alpha(#1C1512, 0.08); }}
+                 .yr-chip:checked, .yr-chip.active {{ background-color: #1C1512; color: #FAF6F2; }}
+                 .yr-segmented {{ background-color: alpha(#1C1512, 0.08); }}
+                 .yr-segmented .yr-chip:checked {{ background-color: #1C1512; color: #FAF6F2; }}
+                 .yr-search, entry.yr-search, searchentry.yr-search {{ background-color: alpha(#1C1512, 0.07); }}
+                 .yr-btn {{ background-color: alpha(#1C1512, 0.09); }}
+                 .yr-pref-card {{ background-color: alpha(#1C1512, 0.05); }}
+                 .yr-pref-sep {{ background-color: alpha(#1C1512, 0.08); }}"
             )
         } else {
             format!(
@@ -511,7 +606,8 @@ impl MainWindow {
         let act_wl = gio::SimpleAction::new("watch_later", None);
         act_wl.connect_activate(move |_, _| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::Home);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::Home));
                 w.highlight_chip(Some(&w.chip_watch_later));
                 w.load_watch_later();
             }
@@ -537,29 +633,47 @@ impl MainWindow {
         app.add_action(&act_about);
     }
 
+    fn list_card_layout(&self) -> ListCardLayout {
+        if self.is_narrow.get() {
+            ListCardLayout::Stacked
+        } else if self.is_compact.get() {
+            ListCardLayout::Compact
+        } else {
+            ListCardLayout::Wide
+        }
+    }
+
     fn setup_breakpoint(self: &Rc<Self>, bottom_bar: &GtkBox) {
-        let tiers: [(&str, bool, u32, u32); 4] = [
-            ("max-width: 600px", true, 1, 2),
-            ("min-width: 601px and max-width: 900px", false, 2, 3),
-            ("min-width: 901px and max-width: 1180px", false, 3, 4),
-            ("min-width: 1181px", false, 4, 6),
+        let tiers: [(&str, bool, bool, u32, u32); 4] = [
+            ("max-width: 600px", true, true, 1, 2),
+            ("min-width: 601px and max-width: 820px", false, true, 2, 3),
+            ("min-width: 821px and max-width: 1120px", false, false, 3, 4),
+            ("min-width: 1121px", false, false, 4, 6),
         ];
 
-        for (cond_str, narrow, g_cols, s_cols) in tiers {
+        for (cond_str, narrow, compact, g_cols, s_cols) in tiers {
             if let Ok(cond) = adw::BreakpointCondition::parse(cond_str) {
                 let bp = adw::Breakpoint::new(cond);
                 let weak = Rc::downgrade(self);
                 let b_bar = bottom_bar.clone();
                 bp.connect_apply(move |_| {
                     if let Some(w) = weak.upgrade() {
+                        let prev_layout = w.list_card_layout();
                         w.is_narrow.set(narrow);
+                        w.is_compact.set(compact);
                         w.grid_cols.set(g_cols);
                         w.shorts_cols.set(s_cols);
                         w.rail.container.set_visible(!narrow);
                         b_bar.set_visible(narrow);
                         w.player_card.set_narrow_mode(narrow);
+                        w.apply_side_margins();
                         w.update_flow_columns();
-                        w.notify_channels_layout(narrow, g_cols, s_cols);
+                        w.notify_channels_layout(narrow, compact, g_cols, s_cols);
+
+                        let next_layout = w.list_card_layout();
+                        if prev_layout != next_layout {
+                            w.refresh_responsive_list_cards();
+                        }
                     }
                 });
                 self.window.add_breakpoint(bp);
@@ -567,24 +681,67 @@ impl MainWindow {
         }
     }
 
-    fn notify_channels_layout(&self, narrow: bool, grid_cols: u32, shorts_cols: u32) {
-        for cp in self.open_channels.borrow().iter() {
-            cp.set_layout(narrow, grid_cols, shorts_cols);
+    fn apply_side_margins(&self) {
+        let side = if self.is_narrow.get() {
+            16
+        } else if self.is_compact.get() {
+            20
+        } else {
+            28
+        };
+        for bx in [
+            &self.chips_box,
+            &self.subs_strip_box,
+            &self.history_header_box,
+            &self.section_header_row,
+        ] {
+            bx.set_margin_start(side);
+            bx.set_margin_end(side);
+        }
+        self.flow_box.set_margin_start(side);
+        self.flow_box.set_margin_end(side);
+        self.prefs_clamp.set_margin_start(side);
+        self.prefs_clamp.set_margin_end(side);
+    }
+
+    fn refresh_responsive_list_cards(self: &Rc<Self>) {
+        let av = self.active_view.borrow().clone();
+        match av {
+            ActiveView::Search(_) => {
+                if self.flow_box.is_visible() && !self.current_videos.borrow().is_empty() {
+                    let vids = self.current_videos.borrow().clone();
+                    let keep_more = self.load_more_btn.is_visible();
+                    self.populate_videos(vids, ViewMode::SearchList);
+                    self.load_more_btn.set_visible(keep_more);
+                }
+            }
+            ActiveView::History => {
+                self.load_history();
+            }
+            _ => {}
         }
     }
 
-    fn set_active_nav(&self, tab: RailTab) {
+    fn notify_channels_layout(&self, narrow: bool, compact: bool, grid_cols: u32, shorts_cols: u32) {
+        for cp in self.open_channels.borrow().iter() {
+            cp.set_layout(narrow, compact, grid_cols, shorts_cols);
+        }
+    }
+
+    fn set_active_nav(&self, tab: Option<RailTab>) {
         self.rail.set_active(tab);
         self.bottom_home.remove_css_class("active");
         self.bottom_subs.remove_css_class("active");
         self.bottom_hist.remove_css_class("active");
         self.bottom_settings.remove_css_class("active");
 
-        match tab {
-            RailTab::Home => self.bottom_home.add_css_class("active"),
-            RailTab::Subscriptions => self.bottom_subs.add_css_class("active"),
-            RailTab::History => self.bottom_hist.add_css_class("active"),
-            RailTab::Settings => self.bottom_settings.add_css_class("active"),
+        if let Some(t) = tab {
+            match t {
+                RailTab::Home => self.bottom_home.add_css_class("active"),
+                RailTab::Subscriptions => self.bottom_subs.add_css_class("active"),
+                RailTab::History => self.bottom_hist.add_css_class("active"),
+                RailTab::Settings => self.bottom_settings.add_css_class("active"),
+            }
         }
     }
 
@@ -603,12 +760,81 @@ impl MainWindow {
         }
     }
 
-    fn update_flow_columns(&self) {
-        let narrow = self.is_narrow.get();
-        let cols = self.grid_cols.get();
-        self.flow_box.set_margin_start(if narrow { 16 } else { 28 });
-        self.flow_box.set_margin_end(if narrow { 16 } else { 28 });
+    fn clear_search_bar_quietly(&self) {
+        if !self.search_entry.text().is_empty() {
+            self.suppress_search_clear.set(true);
+            self.search_entry.set_text("");
+            self.suppress_search_clear.set(false);
+        }
+    }
 
+    fn update_back_button_visibility(&self) {
+        let on_subpage = self
+            .nav_view
+            .visible_page()
+            .and_then(|p| p.tag())
+            .map(|t| t.as_str() != "home")
+            .unwrap_or(false);
+        let on_search = matches!(*self.active_view.borrow(), ActiveView::Search(_));
+        self.back_btn.set_visible(on_subpage || on_search);
+    }
+
+    fn go_back(self: &Rc<Self>) {
+        let on_subpage = self
+            .nav_view
+            .visible_page()
+            .and_then(|p| p.tag())
+            .map(|t| t.as_str() != "home")
+            .unwrap_or(false);
+        if on_subpage {
+            self.nav_view.pop();
+            return;
+        }
+        if matches!(*self.active_view.borrow(), ActiveView::Search(_)) {
+            self.clear_search_bar_quietly();
+            self.restore_previous_non_search_view();
+        }
+    }
+
+    fn restore_previous_non_search_view(self: &Rc<Self>) {
+        let prev = self.prev_non_search_view.borrow().clone();
+        match prev {
+            ActiveView::HomeCategory(cat) => {
+                self.set_active_nav(Some(RailTab::Home));
+                match cat.as_str() {
+                    "Gaming" => self.highlight_chip(Some(&self.chip_gaming)),
+                    "Music" => self.highlight_chip(Some(&self.chip_music)),
+                    "News" => self.highlight_chip(Some(&self.chip_news)),
+                    _ => self.highlight_chip(Some(&self.chip_trending)),
+                }
+                self.search_category(&cat);
+            }
+            ActiveView::WatchLater => {
+                self.set_active_nav(Some(RailTab::Home));
+                self.highlight_chip(Some(&self.chip_watch_later));
+                self.load_watch_later();
+            }
+            ActiveView::Subscriptions => {
+                self.set_active_nav(Some(RailTab::Subscriptions));
+                self.load_subscriptions();
+            }
+            ActiveView::History => {
+                self.set_active_nav(Some(RailTab::History));
+                self.load_history();
+            }
+            ActiveView::Preferences => {
+                self.open_settings();
+            }
+            _ => {
+                self.set_active_nav(Some(RailTab::Home));
+                self.highlight_chip(Some(&self.chip_trending));
+                self.load_trending();
+            }
+        }
+    }
+
+    fn update_flow_columns(&self) {
+        let cols = self.grid_cols.get();
         match self.view_mode.get() {
             ViewMode::Grid => {
                 self.flow_box.set_homogeneous(true);
@@ -639,7 +865,7 @@ impl MainWindow {
             glib::Propagation::Proceed
         });
 
-        // Window keyboard shortcuts: '/', 'Ctrl+F', 'Alt+Left'
+        // Window keyboard shortcuts: '/', 'Ctrl+F', 'Alt+Left', 'Esc'
         let key_ctrl = EventControllerKey::new();
         let weak = Rc::downgrade(self);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
@@ -656,7 +882,7 @@ impl MainWindow {
 
             if mods.contains(gdk::ModifierType::ALT_MASK) && key == gdk::Key::Left {
                 if w.back_btn.is_visible() {
-                    w.nav_view.pop();
+                    w.go_back();
                     return glib::Propagation::Stop;
                 }
             }
@@ -695,9 +921,11 @@ impl MainWindow {
         self.window.add_controller(key_ctrl);
 
         // Header Back Button + NavigationView page tracking
-        let nav_for_back = self.nav_view.clone();
+        let weak = Rc::downgrade(self);
         self.back_btn.connect_clicked(move |_| {
-            nav_for_back.pop();
+            if let Some(w) = weak.upgrade() {
+                w.go_back();
+            }
         });
 
         let weak = Rc::downgrade(self);
@@ -710,7 +938,7 @@ impl MainWindow {
                 .and_then(|p| p.tag())
                 .map(|t| t.as_str() == "home")
                 .unwrap_or(true);
-            w.back_btn.set_visible(!is_home);
+            w.update_back_button_visibility();
 
             if is_home {
                 w.open_channels.borrow_mut().clear();
@@ -739,14 +967,36 @@ impl MainWindow {
             }
         });
 
-        // Search activation
+        // Load more button
+        let weak = Rc::downgrade(self);
+        self.load_more_btn.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.load_more_current_feed();
+            }
+        });
+
+        // Search activation + clearing search returns to previous view
         let weak = Rc::downgrade(self);
         self.search_entry.connect_activate(move |entry| {
             let query = entry.text().trim().to_string();
-            if !query.is_empty() {
-                if let Some(w) = weak.upgrade() {
+            if let Some(w) = weak.upgrade() {
+                if !query.is_empty() {
+                    gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     w.search(&query);
                 }
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.search_entry.connect_search_changed(move |entry| {
+            let Some(w) = weak.upgrade() else {
+                return;
+            };
+            if w.suppress_search_clear.get() {
+                return;
+            }
+            if entry.text().is_empty() && matches!(*w.active_view.borrow(), ActiveView::Search(_)) {
+                w.restore_previous_non_search_view();
             }
         });
 
@@ -776,7 +1026,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.rail.logo_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::Home);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::Home));
                 w.highlight_chip(Some(&w.chip_trending));
                 w.load_trending();
             }
@@ -785,7 +1036,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.rail.home_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::Home);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::Home));
                 w.highlight_chip(Some(&w.chip_trending));
                 w.load_trending();
             }
@@ -794,7 +1046,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.rail.subs_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::Subscriptions);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::Subscriptions));
                 w.load_subscriptions();
             }
         });
@@ -802,7 +1055,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.rail.hist_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::History);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::History));
                 w.load_history();
             }
         });
@@ -818,7 +1072,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.bottom_home.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::Home);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::Home));
                 w.highlight_chip(Some(&w.chip_trending));
                 w.load_trending();
             }
@@ -827,7 +1082,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.bottom_subs.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::Subscriptions);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::Subscriptions));
                 w.load_subscriptions();
             }
         });
@@ -835,7 +1091,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.bottom_hist.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.set_active_nav(RailTab::History);
+                w.clear_search_bar_quietly();
+                w.set_active_nav(Some(RailTab::History));
                 w.load_history();
             }
         });
@@ -920,6 +1177,7 @@ impl MainWindow {
         self.player_card.connect_jump_to(move |idx| {
             if let Some(w) = weak.upgrade() {
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
+                    w.player_card.set_loading(true);
                     session.jump_to(idx);
                     if let Some(cur) = w.player_card.current_video() {
                         session.set_media_title(&cur.title);
@@ -949,6 +1207,7 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.player_card.connect_empty_stop(move || {
             if let Some(w) = weak.upgrade() {
+                w.player_card.set_loading(false);
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
                     session.stop();
                     session.clear();
@@ -966,6 +1225,7 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.player_card.connect_clear(move || {
             if let Some(w) = weak.upgrade() {
+                w.player_card.set_loading(false);
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
                     session.stop();
                     session.clear();
@@ -977,12 +1237,159 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.player_card.connect_close(move || {
             if let Some(w) = weak.upgrade() {
+                w.player_card.set_loading(false);
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
                     session.stop();
                     session.clear();
                 }
                 w.player_card.set_queue(vec![], 0, false);
                 w.player_card.root.set_visible(false);
+            }
+        });
+    }
+
+    fn sync_preferences_ui(&self, settings: &AppSettings) {
+        self.pref_scheme_btn.set_label(match settings.color_scheme.as_str() {
+            "system" => "System",
+            "light" => "Light",
+            _ => "Dark",
+        });
+        self.pref_accent_btn.set_label(match settings.accent_color.as_str() {
+            "forest" => "Forest",
+            "plum" => "Plum",
+            "teal" => "Teal",
+            _ => "Terracotta",
+        });
+        self.pref_quality_btn
+            .set_label(Quality::from_setting(&settings.default_quality).label());
+        self.pref_hwdec_switch.set_active(settings.hardware_decoding);
+        if self.pref_player_entry.text().as_str() != settings.external_player {
+            self.pref_player_entry.set_text(&settings.external_player);
+        }
+        self.pref_hist_switch.set_active(settings.save_history);
+    }
+
+    fn wire_preferences_signals(
+        self: &Rc<Self>,
+        clear_cache_btn: &Button,
+        clear_hist_btn: &Button,
+    ) {
+        // Color scheme popover
+        attach_choice_popover(
+            &self.pref_scheme_btn,
+            &[("dark", "Dark"), ("system", "Follow system"), ("light", "Light")],
+            {
+                let weak = Rc::downgrade(self);
+                move |key| {
+                    if let Some(w) = weak.upgrade() {
+                        let mut s = w.settings_store.load();
+                        s.color_scheme = key.to_string();
+                        w.settings_store.save(&s);
+                        w.apply_appearance(&s);
+                        w.sync_preferences_ui(&s);
+                    }
+                }
+            },
+        );
+
+        // Accent color popover
+        attach_choice_popover(
+            &self.pref_accent_btn,
+            &[
+                ("terracotta", "Terracotta"),
+                ("forest", "Forest"),
+                ("plum", "Plum"),
+                ("teal", "Teal"),
+            ],
+            {
+                let weak = Rc::downgrade(self);
+                move |key| {
+                    if let Some(w) = weak.upgrade() {
+                        let mut s = w.settings_store.load();
+                        s.accent_color = key.to_string();
+                        w.settings_store.save(&s);
+                        w.apply_appearance(&s);
+                        w.sync_preferences_ui(&s);
+                    }
+                }
+            },
+        );
+
+        // Default quality popover
+        attach_choice_popover(
+            &self.pref_quality_btn,
+            &[
+                ("360p", "360p"),
+                ("720p", "720p"),
+                ("1080p", "1080p"),
+                ("audio", "Audio only"),
+            ],
+            {
+                let weak = Rc::downgrade(self);
+                move |key| {
+                    if let Some(w) = weak.upgrade() {
+                        let mut s = w.settings_store.load();
+                        s.default_quality = key.to_string();
+                        w.settings_store.save(&s);
+                        w.sync_preferences_ui(&s);
+                    }
+                }
+            },
+        );
+
+        // Hardware decoding switch
+        let weak = Rc::downgrade(self);
+        self.pref_hwdec_switch.connect_state_set(move |_, active| {
+            if let Some(w) = weak.upgrade() {
+                let mut s = w.settings_store.load();
+                s.hardware_decoding = active;
+                w.settings_store.save(&s);
+                if let Some(sess) = w.mpv_session.borrow().as_ref() {
+                    sess.set_hardware_decoding(active);
+                }
+            }
+            glib::Propagation::Proceed
+        });
+
+        // External player command
+        let store_pl = self.settings_store.clone();
+        self.pref_player_entry.connect_changed(move |entry| {
+            let mut s = store_pl.load();
+            let txt = entry.text().trim().to_string();
+            s.external_player = if txt.is_empty() {
+                "mpv".to_string()
+            } else {
+                txt
+            };
+            store_pl.save(&s);
+        });
+
+        // Save watch history switch
+        let store_h = self.settings_store.clone();
+        self.pref_hist_switch.connect_state_set(move |_, active| {
+            let mut s = store_h.load();
+            s.save_history = active;
+            store_h.save(&s);
+            glib::Propagation::Proceed
+        });
+
+        // Clear thumbnail cache
+        let weak = Rc::downgrade(self);
+        clear_cache_btn.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.image_loader.clear_all();
+                w.toast_overlay
+                    .add_toast(adw::Toast::new("Thumbnail cache cleared"));
+            }
+        });
+
+        // Clear watch history
+        let weak = Rc::downgrade(self);
+        clear_hist_btn.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.history_store.clear();
+                w.toast_overlay
+                    .add_toast(adw::Toast::new("Watch history cleared"));
             }
         });
     }
@@ -1118,9 +1525,11 @@ impl MainWindow {
 
         let reset_btn = Button::with_label("Reset");
         reset_btn.add_css_class("yr-chip");
+        set_pointer(&reset_btn);
         let apply_btn = Button::with_label("Apply");
         apply_btn.add_css_class("yr-chip");
         apply_btn.add_css_class("active");
+        set_pointer(&apply_btn);
 
         footer.append(&reset_btn);
         footer.append(&apply_btn);
@@ -1300,14 +1709,9 @@ impl MainWindow {
         let title = summary.title.clone();
         session.play(&summary.id, &title, quality);
 
-        self.player_card
-            .set_queue(vec![summary], 0, false);
+        self.player_card.set_queue(vec![summary], 0, false);
         self.player_card.set_playing(true);
-
-        let q_name = quality.label();
-        self.toast_overlay.add_toast(adw::Toast::new(&format!(
-            "Playing \"{title}\" ({q_name}) in MPV..."
-        )));
+        self.player_card.set_loading(true);
     }
 
     pub fn play_shorts_queue(self: &Rc<Self>, shorts: Vec<VideoSummary>, start_index: usize) {
@@ -1318,11 +1722,8 @@ impl MainWindow {
         let session = self.ensure_mpv_session();
         self.mpv_became_active.set(false);
         self.mpv_pos.set(0.0);
-        self.mpv_duration.set(
-            shorts[clamped_start]
-                .duration_seconds
-                .unwrap_or(0) as f64,
-        );
+        self.mpv_duration
+            .set(shorts[clamped_start].duration_seconds.unwrap_or(0) as f64);
 
         let settings = self.settings_store.load();
         let mut quality = Quality::from_setting(&settings.default_quality);
@@ -1343,14 +1744,9 @@ impl MainWindow {
             session.set_media_title(&shorts[clamped_start].title);
         }
 
-        let total = shorts.len();
         self.player_card.set_queue(shorts, clamped_start, true);
         self.player_card.set_playing(true);
-
-        self.toast_overlay.add_toast(adw::Toast::new(&format!(
-            "Playing Short {} of {total} in MPV...",
-            clamped_start + 1
-        )));
+        self.player_card.set_loading(true);
     }
 
     pub fn queue_video(self: &Rc<Self>, summary: VideoSummary) {
@@ -1373,7 +1769,7 @@ impl MainWindow {
 
         let short_title = summary.title.clone();
         self.toast_overlay.add_toast(adw::Toast::new(&format!(
-            "Downloading \"{short_title}\" to Downloads..."
+            "Downloading \"{short_title}\" to Downloads…"
         )));
 
         let vid_id = summary.id.clone();
@@ -1408,7 +1804,6 @@ impl MainWindow {
     fn ensure_mpv_session(self: &Rc<Self>) -> Arc<MpvSession> {
         let settings = self.settings_store.load();
 
-        // Reuse existing alive session unless user changed external player command
         {
             let mut slot = self.mpv_session.borrow_mut();
             if let Some(existing) = slot.as_ref() {
@@ -1433,7 +1828,6 @@ impl MainWindow {
                 let Some(w) = weak.upgrade() else {
                     break;
                 };
-                // Ignore events from superseded sessions
                 let is_current = w
                     .mpv_session
                     .borrow()
@@ -1445,6 +1839,12 @@ impl MainWindow {
                 }
 
                 match event {
+                    MpvEvent::Loading => {
+                        w.player_card.set_loading(true);
+                    }
+                    MpvEvent::Loaded => {
+                        w.player_card.set_loading(false);
+                    }
                     MpvEvent::TimePos(pos) => {
                         w.mpv_became_active.set(true);
                         w.mpv_pos.set(pos);
@@ -1472,14 +1872,17 @@ impl MainWindow {
                         if !idle {
                             w.mpv_became_active.set(true);
                         } else if w.mpv_became_active.get() {
+                            w.player_card.set_loading(false);
                             w.player_card.set_playing(false);
                         }
                     }
                     MpvEvent::Error(msg) => {
+                        w.player_card.set_loading(false);
                         w.toast_overlay.add_toast(adw::Toast::new(&msg));
                     }
                     MpvEvent::ProcessExited => {
                         *w.mpv_session.borrow_mut() = None;
+                        w.player_card.set_loading(false);
                         w.player_card.set_queue(vec![], 0, false);
                         w.player_card.root.set_visible(false);
                         break;
@@ -1519,20 +1922,17 @@ impl MainWindow {
             self.subscription_store.clone(),
             on_play_shorts,
             self.is_narrow.get(),
+            self.is_compact.get(),
             self.grid_cols.get(),
             self.shorts_cols.get(),
         );
 
-        self.open_channels
-            .borrow_mut()
-            .push(channel_page.clone());
-
+        self.open_channels.borrow_mut().push(channel_page.clone());
         self.nav_view.push(&channel_page.page);
 
-        let (ch_tx, ch_rx) = async_channel::bounded::<
-            Result<(crate::backend::models::ChannelDetails, Vec<VideoSummary>), String>,
-        >(1);
-        let (sh_tx, sh_rx) = async_channel::bounded::<Result<Vec<VideoSummary>, String>>(1);
+        let (ch_tx, ch_rx) =
+            async_channel::bounded::<Result<(ChannelDetails, PagedVideos), String>>(1);
+        let (sh_tx, sh_rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
 
         let engine = self.engine.clone();
         let cid = channel_id.to_string();
@@ -1553,9 +1953,9 @@ impl MainWindow {
             if let Ok(res) = ch_rx.recv().await {
                 if let Some(cp) = cp_weak.upgrade() {
                     match res {
-                        Ok((details, videos)) => {
+                        Ok((details, paged)) => {
                             cp.set_channel_details(details);
-                            cp.set_videos(videos);
+                            cp.set_videos(paged);
                         }
                         Err(err) => {
                             cp.set_load_error(&err);
@@ -1567,9 +1967,9 @@ impl MainWindow {
 
         let cp_weak = Rc::downgrade(&channel_page);
         glib::spawn_future_local(async move {
-            if let Ok(Ok(shorts)) = sh_rx.recv().await {
+            if let Ok(Ok(paged)) = sh_rx.recv().await {
                 if let Some(cp) = cp_weak.upgrade() {
-                    cp.set_shorts(shorts);
+                    cp.set_shorts(paged);
                 }
             }
         });
@@ -1593,8 +1993,28 @@ impl MainWindow {
         section_heading: Option<&str>,
     ) {
         self.nav_view.pop_to_page(&self.home_page);
+        if !matches!(view, ActiveView::Search(_)) {
+            *self.prev_non_search_view.borrow_mut() = view.clone();
+        }
         *self.active_view.borrow_mut() = view.clone();
+        *self.feed_cursor.borrow_mut() = None;
+        self.is_loading_more.set(false);
+        self.load_more_btn.set_visible(false);
+        self.load_more_btn.set_sensitive(true);
+        self.load_more_btn.set_label("Load more");
         self.view_mode.set(mode);
+
+        let is_prefs = view == ActiveView::Preferences;
+        self.feed_box.set_visible(!is_prefs);
+        self.prefs_clamp.set_visible(is_prefs);
+
+        // Scroll back to top on view switches
+        self.content_scrolled.vadjustment().set_value(0.0);
+
+        if is_prefs {
+            self.update_back_button_visibility();
+            return;
+        }
 
         self.chips_scroll.set_visible(show_chips);
         self.subs_strip_box.set_visible(show_subs);
@@ -1604,6 +2024,14 @@ impl MainWindow {
         let is_wl = view == ActiveView::WatchLater;
         self.search_filters_btn.set_visible(is_search);
         self.clear_watch_later_btn.set_visible(is_wl);
+
+        if is_search {
+            self.section_title.remove_css_class("yr-h2");
+            self.section_title.add_css_class("yr-search-heading");
+        } else {
+            self.section_title.remove_css_class("yr-search-heading");
+            self.section_title.add_css_class("yr-h2");
+        }
 
         match section_heading {
             Some(txt) => {
@@ -1618,22 +2046,23 @@ impl MainWindow {
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
         self.update_flow_columns();
+        self.update_back_button_visibility();
     }
 
     pub fn search(self: &Rc<Self>, query: &str) {
         let req_id = self.next_request_id();
-        self.set_active_nav(RailTab::Home);
+        self.set_active_nav(None);
         self.prepare_view_shell(
             ActiveView::Search(query.to_string()),
             ViewMode::SearchList,
             false,
             false,
             false,
-            Some(&format!("Results for \"{query}\"")),
+            Some(&format!("Results for “{query}”")),
         );
         self.show_skeletons_search(6);
 
-        let (sender, receiver) = async_channel::bounded::<Result<Vec<VideoSummary>, String>>(1);
+        let (sender, receiver) = async_channel::bounded::<Result<PagedVideos, String>>(1);
         let engine = self.engine.clone();
         let q = query.to_string();
         let q_ui = query.to_string();
@@ -1658,25 +2087,27 @@ impl MainWindow {
                 return;
             }
             match res {
-                Ok(videos) => {
-                    if videos.is_empty() {
+                Ok(paged) => {
+                    if paged.items.is_empty() {
                         let weak_clear = Rc::downgrade(&w);
                         w.show_status_state(
                             "system-search-symbolic",
                             "No results",
                             &format!(
-                                "Nothing matched \"{q_ui}\". Check the spelling or try different words."
+                                "Nothing matched “{q_ui}”. Check the spelling or try different words."
                             ),
                             Some(("Clear search", Rc::new(move || {
                                 if let Some(win) = weak_clear.upgrade() {
-                                    win.search_entry.set_text("");
-                                    win.highlight_chip(Some(&win.chip_trending));
-                                    win.load_trending();
+                                    win.clear_search_bar_quietly();
+                                    win.restore_previous_non_search_view();
                                 }
                             }))),
                         );
                     } else {
-                        w.populate_videos(videos, ViewMode::SearchList);
+                        let has_more = paged.next.is_some();
+                        *w.feed_cursor.borrow_mut() = paged.next;
+                        w.populate_videos(paged.items, ViewMode::SearchList);
+                        w.load_more_btn.set_visible(has_more);
                     }
                 }
                 Err(e) => {
@@ -1709,7 +2140,7 @@ impl MainWindow {
         );
         self.show_skeletons(8);
 
-        let (sender, receiver) = async_channel::bounded::<Result<Vec<VideoSummary>, String>>(1);
+        let (sender, receiver) = async_channel::bounded::<Result<PagedVideos, String>>(1);
         let engine = self.engine.clone();
         let cat = category.to_string();
         let cat_ui = category.to_string();
@@ -1731,8 +2162,8 @@ impl MainWindow {
                 return;
             }
             match res {
-                Ok(videos) => {
-                    if videos.is_empty() {
+                Ok(paged) => {
+                    if paged.items.is_empty() {
                         w.show_status_state(
                             "system-search-symbolic",
                             "No videos found",
@@ -1740,7 +2171,10 @@ impl MainWindow {
                             None,
                         );
                     } else {
-                        w.populate_videos(videos, ViewMode::Grid);
+                        let has_more = paged.next.is_some();
+                        *w.feed_cursor.borrow_mut() = paged.next;
+                        w.populate_videos(paged.items, ViewMode::Grid);
+                        w.load_more_btn.set_visible(has_more);
                     }
                 }
                 Err(e) => {
@@ -1756,6 +2190,58 @@ impl MainWindow {
                             }
                         }))),
                     );
+                }
+            }
+        });
+    }
+
+    fn load_more_current_feed(self: &Rc<Self>) {
+        if self.is_loading_more.get() {
+            return;
+        }
+        let Some(cursor) = self.feed_cursor.borrow().clone() else {
+            self.load_more_btn.set_visible(false);
+            return;
+        };
+        let req_id = self.request_seq.get();
+        let mode = self.view_mode.get();
+        let filter_shorts = matches!(*self.active_view.borrow(), ActiveView::HomeCategory(_));
+
+        self.is_loading_more.set(true);
+        self.load_more_btn.set_sensitive(false);
+        self.load_more_btn.set_label("Loading more…");
+
+        let engine = self.engine.clone();
+        let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
+        self.runtime.spawn(async move {
+            let res = engine.load_more(&cursor, None, false, filter_shorts).await;
+            let _ = tx.send(res).await;
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(res) = rx.recv().await else {
+                return;
+            };
+            let Some(w) = weak.upgrade() else {
+                return;
+            };
+            if w.request_seq.get() != req_id {
+                return;
+            }
+            w.is_loading_more.set(false);
+            w.load_more_btn.set_sensitive(true);
+            w.load_more_btn.set_label("Load more");
+
+            match res {
+                Ok(paged) => {
+                    let has_more = paged.next.is_some();
+                    *w.feed_cursor.borrow_mut() = paged.next;
+                    w.append_videos(paged.items, mode);
+                    w.load_more_btn.set_visible(has_more);
+                }
+                Err(err) => {
+                    w.toast_overlay.add_toast(adw::Toast::new(&err));
                 }
             }
         });
@@ -1844,7 +2330,7 @@ impl MainWindow {
             self.show_status_state(
                 "bookmark-new-symbolic",
                 "Watch Later is empty",
-                "Click \"Watch later\" on any video to save it here for later.",
+                "Click “Watch later” on any video to save it here for later.",
                 None,
             );
             return;
@@ -1868,12 +2354,12 @@ impl MainWindow {
             );
             let weak_home = Rc::downgrade(self);
             self.show_status_state(
-                "emblem-favorite-symbolic",
-                "No Subscriptions Yet",
+                "video-display-symbolic",
+                "No subscriptions yet",
                 "Open any channel and click Subscribe to see their latest uploads here.",
                 Some(("Browse Trending", Rc::new(move || {
                     if let Some(win) = weak_home.upgrade() {
-                        win.set_active_nav(RailTab::Home);
+                        win.set_active_nav(Some(RailTab::Home));
                         win.highlight_chip(Some(&win.chip_trending));
                         win.load_trending();
                     }
@@ -1900,6 +2386,7 @@ impl MainWindow {
             item_box.add_css_class("yr-avatar-btn");
             item_box.set_valign(Align::Center);
             item_box.set_tooltip_text(Some(&sub.name));
+            set_pointer(&item_box);
 
             let av = adw::Avatar::new(56, Some(&sub.name), true);
             av.set_valign(Align::Center);
@@ -1956,8 +2443,8 @@ impl MainWindow {
                     if videos.is_empty() {
                         let weak_retry = Rc::downgrade(&w);
                         w.show_status_state(
-                            "emblem-favorite-symbolic",
-                            "No Recent Uploads",
+                            "video-display-symbolic",
+                            "No recent uploads",
                             "Could not find recent videos from your subscribed channels.",
                             Some(("Refresh", Rc::new(move || {
                                 if let Some(win) = weak_retry.upgrade() {
@@ -2005,7 +2492,7 @@ impl MainWindow {
         if entries.is_empty() {
             self.show_status_state(
                 "document-open-recent-symbolic",
-                "No Watch History",
+                "No watch history",
                 "Videos you play in MPV will appear here.",
                 None,
             );
@@ -2013,11 +2500,12 @@ impl MainWindow {
         }
 
         let actions = self.make_card_actions();
+        let layout = self.list_card_layout();
 
         for entry in entries {
             let weak_rm = Rc::downgrade(self);
             let vid = entry.video.id.clone();
-            let card = VideoCard::new_history(&entry, move || {
+            let card = VideoCard::new_history(&entry, layout, move || {
                 if let Some(w) = weak_rm.upgrade() {
                     w.history_store.remove(&vid);
                     w.load_history();
@@ -2039,238 +2527,32 @@ impl MainWindow {
                 }
             });
 
+            let sum_mid = entry.video.clone();
+            let on_play_mid = actions.on_play.clone();
+            let def_q_mid = actions.default_quality.clone();
+            card.connect_middle_click(move || {
+                on_play_mid(sum_mid.clone(), def_q_mid());
+            });
+
             ContextMenu::attach(&card.container, &entry.video, &actions);
             self.flow_box.append(&card.container);
         }
     }
 
     pub fn open_settings(self: &Rc<Self>) {
-        let prev_view = self.active_view.borrow().clone();
-        self.set_active_nav(RailTab::Settings);
-
-        let prefs = adw::PreferencesDialog::builder()
-            .title("Preferences")
-            .build();
-
-        let weak_closed = Rc::downgrade(self);
-        prefs.connect_closed(move |_| {
-            if let Some(w) = weak_closed.upgrade() {
-                let restore_tab = match prev_view {
-                    ActiveView::Subscriptions => RailTab::Subscriptions,
-                    ActiveView::History => RailTab::History,
-                    _ => RailTab::Home,
-                };
-                w.set_active_nav(restore_tab);
-            }
-        });
-
-        let page = adw::PreferencesPage::builder()
-            .title("Preferences")
-            .icon_name("emblem-system-symbolic")
-            .build();
-
-        let settings = self.settings_store.load();
-
-        // --- Group 1: Appearance (matches Settings.png) ---
-        let group_appearance = adw::PreferencesGroup::builder()
-            .title("Appearance")
-            .build();
-
-        let scheme_model = gtk4::StringList::new(&["Dark", "Follow system", "Light"]);
-        let scheme_idx = match settings.color_scheme.as_str() {
-            "system" => 1,
-            "light" => 2,
-            _ => 0,
-        };
-        let scheme_row = adw::ComboRow::builder()
-            .title("Color scheme")
-            .subtitle("Follow the system or force a mode")
-            .model(&scheme_model)
-            .selected(scheme_idx)
-            .build();
-
-        let weak_scheme = Rc::downgrade(self);
-        scheme_row.connect_selected_notify(move |row| {
-            if let Some(w) = weak_scheme.upgrade() {
-                let mut s = w.settings_store.load();
-                s.color_scheme = match row.selected() {
-                    1 => "system".to_string(),
-                    2 => "light".to_string(),
-                    _ => "dark".to_string(),
-                };
-                w.settings_store.save(&s);
-                w.apply_appearance(&s);
-            }
-        });
-
-        let accent_model = gtk4::StringList::new(&["Terracotta", "Forest", "Plum", "Teal"]);
-        let accent_idx = match settings.accent_color.as_str() {
-            "forest" => 1,
-            "plum" => 2,
-            "teal" => 3,
-            _ => 0,
-        };
-        let accent_row = adw::ComboRow::builder()
-            .title("Accent color")
-            .subtitle("Terracotta, Forest, Plum or Teal")
-            .model(&accent_model)
-            .selected(accent_idx)
-            .build();
-
-        let weak_accent = Rc::downgrade(self);
-        accent_row.connect_selected_notify(move |row| {
-            if let Some(w) = weak_accent.upgrade() {
-                let mut s = w.settings_store.load();
-                s.accent_color = match row.selected() {
-                    1 => "forest".to_string(),
-                    2 => "plum".to_string(),
-                    3 => "teal".to_string(),
-                    _ => "terracotta".to_string(),
-                };
-                w.settings_store.save(&s);
-                w.apply_appearance(&s);
-            }
-        });
-
-        group_appearance.add(&scheme_row);
-        group_appearance.add(&accent_row);
-
-        // --- Group 2: Playback ---
-        let group_playback = adw::PreferencesGroup::builder()
-            .title("Playback")
-            .build();
-
-        let quality_model = gtk4::StringList::new(&["360p", "720p", "1080p", "Audio only"]);
-        let selected_idx = match Quality::from_setting(&settings.default_quality) {
-            Quality::P360 => 0,
-            Quality::P720 => 1,
-            Quality::P1080 => 2,
-            Quality::AudioOnly => 3,
-        };
-        let quality_row = adw::ComboRow::builder()
-            .title("Default quality")
-            .subtitle("Quality the video starts with")
-            .model(&quality_model)
-            .selected(selected_idx)
-            .build();
-
-        let store_q = self.settings_store.clone();
-        quality_row.connect_selected_notify(move |row| {
-            let mut s = store_q.load();
-            let chosen = match row.selected() {
-                1 => Quality::P720,
-                2 => Quality::P1080,
-                3 => Quality::AudioOnly,
-                _ => Quality::P360,
-            };
-            s.default_quality = chosen.as_setting().to_string();
-            store_q.save(&s);
-        });
-
-        let hwdec_row = adw::SwitchRow::builder()
-            .title("Hardware decoding")
-            .subtitle("Use VA-API when available")
-            .active(settings.hardware_decoding)
-            .build();
-
-        let weak_hw = Rc::downgrade(self);
-        hwdec_row.connect_active_notify(move |row| {
-            if let Some(w) = weak_hw.upgrade() {
-                let active = row.is_active();
-                let mut s = w.settings_store.load();
-                s.hardware_decoding = active;
-                w.settings_store.save(&s);
-                if let Some(sess) = w.mpv_session.borrow().as_ref() {
-                    sess.set_hardware_decoding(active);
-                }
-            }
-        });
-
-        let player_row = adw::EntryRow::builder()
-            .title("Player command")
-            .text(&settings.external_player)
-            .build();
-
-        let store_pl = self.settings_store.clone();
-        player_row.connect_changed(move |row| {
-            let mut s = store_pl.load();
-            let txt = row.text().trim().to_string();
-            s.external_player = if txt.is_empty() {
-                "mpv".to_string()
-            } else {
-                txt
-            };
-            store_pl.save(&s);
-        });
-
-        group_playback.add(&quality_row);
-        group_playback.add(&hwdec_row);
-        group_playback.add(&player_row);
-
-        // --- Group 3: Data ---
-        let group_data = adw::PreferencesGroup::builder()
-            .title("Data")
-            .build();
-
-        let clear_cache_row = adw::ActionRow::builder()
-            .title("Clear thumbnail cache")
-            .subtitle("Free disk space used by images")
-            .build();
-        let clear_cache_btn = Button::with_label("Clear");
-        clear_cache_btn.add_css_class("yr-btn");
-        clear_cache_btn.set_valign(Align::Center);
-        let weak_cache = Rc::downgrade(self);
-        clear_cache_btn.connect_clicked(move |_| {
-            if let Some(w) = weak_cache.upgrade() {
-                w.image_loader.clear_all();
-                w.toast_overlay
-                    .add_toast(adw::Toast::new("Thumbnail cache cleared"));
-            }
-        });
-        clear_cache_row.add_suffix(&clear_cache_btn);
-
-        let hist_row = adw::SwitchRow::builder()
-            .title("Save watch history")
-            .subtitle("Stored locally on this device")
-            .active(settings.save_history)
-            .build();
-
-        let store_h = self.settings_store.clone();
-        hist_row.connect_active_notify(move |row| {
-            let mut s = store_h.load();
-            s.save_history = row.is_active();
-            store_h.save(&s);
-        });
-
-        let clear_hist_row = adw::ActionRow::builder()
-            .title("Clear watch history")
-            .subtitle("Deletes all recorded watch history")
-            .build();
-        let clear_hist_btn = Button::with_label("Clear");
-        clear_hist_btn.add_css_class("yr-btn");
-        clear_hist_btn.set_valign(Align::Center);
-        let weak_hist = Rc::downgrade(self);
-        clear_hist_btn.connect_clicked(move |_| {
-            if let Some(w) = weak_hist.upgrade() {
-                w.history_store.clear();
-                w.toast_overlay
-                    .add_toast(adw::Toast::new("Watch history cleared"));
-                if *w.active_view.borrow() == ActiveView::History {
-                    w.load_history();
-                }
-            }
-        });
-        clear_hist_row.add_suffix(&clear_hist_btn);
-
-        group_data.add(&clear_cache_row);
-        group_data.add(&hist_row);
-        group_data.add(&clear_hist_row);
-
-        page.add(&group_appearance);
-        page.add(&group_playback);
-        page.add(&group_data);
-        prefs.add(&page);
-        prefs.present(Some(&self.window));
+        let _req_id = self.next_request_id();
+        self.clear_search_bar_quietly();
+        self.set_active_nav(Some(RailTab::Settings));
+        let current = self.settings_store.load();
+        self.sync_preferences_ui(&current);
+        self.prepare_view_shell(
+            ActiveView::Preferences,
+            ViewMode::Grid,
+            false,
+            false,
+            false,
+            None,
+        );
     }
 
     fn show_shortcuts_dialog(&self) {
@@ -2293,10 +2575,10 @@ impl MainWindow {
 
         let items = [
             ("/ or Ctrl + F", "Focus the search bar"),
-            ("Enter", "Run search"),
-            ("Esc", "Close dialog / unfocus search"),
-            ("Alt + Left", "Go back from Channel page"),
-            ("Space", "Pause or resume when Player Card is focused"),
+            ("Enter", "Run search / Play in Details"),
+            ("Middle-click", "Play video directly in MPV"),
+            ("Alt + Left", "Go back"),
+            ("Space", "Pause or resume Player Card"),
         ];
 
         for (keys, desc) in items {
@@ -2305,6 +2587,7 @@ impl MainWindow {
             desc_lbl.add_css_class("yr-meta");
             desc_lbl.set_hexpand(true);
             desc_lbl.set_halign(Align::Start);
+            desc_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
             let key_lbl = Label::new(Some(keys));
             key_lbl.add_css_class("yr-chip");
@@ -2318,6 +2601,7 @@ impl MainWindow {
         close_btn.add_css_class("yr-btn");
         close_btn.set_halign(Align::End);
         close_btn.set_margin_top(8);
+        set_pointer(&close_btn);
         let dlg_weak = dialog.downgrade();
         close_btn.connect_clicked(move |_| {
             if let Some(d) = dlg_weak.upgrade() {
@@ -2344,10 +2628,10 @@ impl MainWindow {
         vbox.set_margin_end(24);
         vbox.set_halign(Align::Center);
 
-        let logo = Button::from_icon_name("media-playback-start-symbolic");
+        let logo = GtkBox::new(Orientation::Vertical, 0);
         logo.add_css_class("yr-logo");
         logo.set_halign(Align::Center);
-        logo.set_sensitive(false);
+        logo.append(&make_icon(KalamIcon::LogoPlay, 38));
         vbox.append(&logo);
 
         let name = Label::new(Some("youtube-rusty"));
@@ -2364,7 +2648,7 @@ impl MainWindow {
         desc.add_css_class("yr-meta");
         desc.set_wrap(true);
         desc.set_justify(gtk4::Justification::Center);
-        desc.set_max_width_chars(40);
+        desc.set_max_width_chars(38);
         vbox.append(&desc);
 
         let close_btn = Button::with_label("Close");
@@ -2372,6 +2656,7 @@ impl MainWindow {
         close_btn.add_css_class("primary");
         close_btn.set_halign(Align::Center);
         close_btn.set_margin_top(8);
+        set_pointer(&close_btn);
         let dlg_weak = dialog.downgrade();
         close_btn.connect_clicked(move |_| {
             if let Some(d) = dlg_weak.upgrade() {
@@ -2386,7 +2671,9 @@ impl MainWindow {
 
     fn show_skeletons(self: &Rc<Self>, count: usize) {
         self.status_box.set_visible(false);
+        self.load_more_btn.set_visible(false);
         self.flow_box.set_visible(true);
+        self.current_videos.borrow_mut().clear();
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
@@ -2399,14 +2686,17 @@ impl MainWindow {
 
     fn show_skeletons_search(self: &Rc<Self>, count: usize) {
         self.status_box.set_visible(false);
+        self.load_more_btn.set_visible(false);
         self.flow_box.set_visible(true);
+        self.current_videos.borrow_mut().clear();
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
         self.view_mode.set(ViewMode::SearchList);
         self.update_flow_columns();
+        let layout = self.list_card_layout();
         for _ in 0..count {
-            self.flow_box.append(&VideoCard::new_search_skeleton());
+            self.flow_box.append(&VideoCard::new_search_skeleton(layout));
         }
     }
 
@@ -2420,7 +2710,9 @@ impl MainWindow {
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
+        self.current_videos.borrow_mut().clear();
         self.flow_box.set_visible(false);
+        self.load_more_btn.set_visible(false);
 
         self.status_icon.set_icon_name(Some(icon_name));
         self.status_title.set_text(title);
@@ -2451,13 +2743,18 @@ impl MainWindow {
 
         self.view_mode.set(mode);
         self.update_flow_columns();
+        *self.current_videos.borrow_mut() = Vec::new();
+        self.append_videos(videos, mode);
+    }
 
+    fn append_videos(self: &Rc<Self>, videos: Vec<VideoSummary>, mode: ViewMode) {
         let actions = self.make_card_actions();
+        let layout = self.list_card_layout();
 
         for summary in videos {
             let card = match mode {
                 ViewMode::Grid => VideoCard::new_grid(&summary),
-                ViewMode::SearchList => VideoCard::new_search(&summary),
+                ViewMode::SearchList => VideoCard::new_search(&summary, layout),
             };
 
             let weak_click = Rc::downgrade(self);
@@ -2468,6 +2765,24 @@ impl MainWindow {
                     DetailsSheet::show(&w.window, &sum_cl, &act_cl);
                 }
             });
+
+            let sum_mid = summary.clone();
+            let on_play_mid = actions.on_play.clone();
+            let def_q_mid = actions.default_quality.clone();
+            card.connect_middle_click(move || {
+                on_play_mid(sum_mid.clone(), def_q_mid());
+            });
+
+            if !summary.channel_id.is_empty() {
+                let weak_chan = Rc::downgrade(self);
+                let cid = summary.channel_id.clone();
+                let cname = summary.channel_name.clone();
+                card.connect_channel_click(move || {
+                    if let Some(w) = weak_chan.upgrade() {
+                        w.open_channel(&cid, &cname);
+                    }
+                });
+            }
 
             ContextMenu::attach(&card.container, &summary, &actions);
 
@@ -2482,6 +2797,7 @@ impl MainWindow {
             }
 
             self.flow_box.append(&card.container);
+            self.current_videos.borrow_mut().push(summary);
         }
     }
 
@@ -2490,9 +2806,256 @@ impl MainWindow {
     }
 }
 
+#[allow(clippy::type_complexity)]
+fn build_inline_preferences_view() -> (
+    adw::Clamp,
+    Button,
+    Button,
+    Button,
+    Switch,
+    Entry,
+    Switch,
+    Button,
+    Button,
+) {
+    let col = GtkBox::new(Orientation::Vertical, 22);
+    col.set_margin_top(12);
+    col.set_margin_bottom(40);
+    col.set_hexpand(true);
+
+    let title = Label::new(Some("Preferences"));
+    title.add_css_class("yr-h1");
+    title.set_halign(Align::Start);
+    col.append(&title);
+
+    // --- Group 1: Appearance ---
+    let g_app = GtkBox::new(Orientation::Vertical, 8);
+    let g_app_lbl = Label::new(Some("Appearance"));
+    g_app_lbl.add_css_class("yr-pref-section");
+    g_app_lbl.set_halign(Align::Start);
+    g_app.append(&g_app_lbl);
+
+    let card_app = GtkBox::new(Orientation::Vertical, 0);
+    card_app.add_css_class("yr-pref-card");
+
+    let scheme_btn = Button::with_label("Dark");
+    scheme_btn.add_css_class("yr-btn");
+    scheme_btn.set_valign(Align::Center);
+    set_pointer(&scheme_btn);
+    card_app.append(&make_pref_row(
+        "Color scheme",
+        "Follow the system or force a mode",
+        &scheme_btn,
+    ));
+    card_app.append(&make_pref_sep());
+
+    let accent_btn = Button::with_label("Terracotta");
+    accent_btn.add_css_class("yr-btn");
+    accent_btn.set_valign(Align::Center);
+    set_pointer(&accent_btn);
+    card_app.append(&make_pref_row(
+        "Accent color",
+        "Terracotta, Forest, Plum or Teal",
+        &accent_btn,
+    ));
+
+    g_app.append(&card_app);
+    col.append(&g_app);
+
+    // --- Group 2: Playback ---
+    let g_play = GtkBox::new(Orientation::Vertical, 8);
+    let g_play_lbl = Label::new(Some("Playback"));
+    g_play_lbl.add_css_class("yr-pref-section");
+    g_play_lbl.set_halign(Align::Start);
+    g_play.append(&g_play_lbl);
+
+    let card_play = GtkBox::new(Orientation::Vertical, 0);
+    card_play.add_css_class("yr-pref-card");
+
+    let quality_btn = Button::with_label("360p");
+    quality_btn.add_css_class("yr-btn");
+    quality_btn.set_valign(Align::Center);
+    set_pointer(&quality_btn);
+    card_play.append(&make_pref_row(
+        "Default quality",
+        "Quality the video starts with",
+        &quality_btn,
+    ));
+    card_play.append(&make_pref_sep());
+
+    let hwdec_switch = Switch::new();
+    hwdec_switch.set_valign(Align::Center);
+    set_pointer(&hwdec_switch);
+    card_play.append(&make_pref_row(
+        "Hardware decoding",
+        "Use VA-API when available",
+        &hwdec_switch,
+    ));
+    card_play.append(&make_pref_sep());
+
+    let player_entry = Entry::builder()
+        .text("mpv")
+        .width_chars(10)
+        .max_width_chars(16)
+        .valign(Align::Center)
+        .build();
+    player_entry.add_css_class("yr-search");
+    card_play.append(&make_pref_row(
+        "Player command",
+        "Program that plays videos",
+        &player_entry,
+    ));
+
+    g_play.append(&card_play);
+    col.append(&g_play);
+
+    // --- Group 3: Data ---
+    let g_data = GtkBox::new(Orientation::Vertical, 8);
+    let g_data_lbl = Label::new(Some("Data"));
+    g_data_lbl.add_css_class("yr-pref-section");
+    g_data_lbl.set_halign(Align::Start);
+    g_data.append(&g_data_lbl);
+
+    let card_data = GtkBox::new(Orientation::Vertical, 0);
+    card_data.add_css_class("yr-pref-card");
+
+    let clear_cache_btn = Button::with_label("Clear");
+    clear_cache_btn.add_css_class("yr-btn");
+    clear_cache_btn.set_valign(Align::Center);
+    set_pointer(&clear_cache_btn);
+    card_data.append(&make_pref_row(
+        "Clear thumbnail cache",
+        "Free disk space used by images",
+        &clear_cache_btn,
+    ));
+    card_data.append(&make_pref_sep());
+
+    let hist_switch = Switch::new();
+    hist_switch.set_valign(Align::Center);
+    set_pointer(&hist_switch);
+    card_data.append(&make_pref_row(
+        "Save watch history",
+        "Stored locally on this device",
+        &hist_switch,
+    ));
+    card_data.append(&make_pref_sep());
+
+    let clear_hist_btn = Button::with_label("Clear");
+    clear_hist_btn.add_css_class("yr-btn");
+    clear_hist_btn.set_valign(Align::Center);
+    set_pointer(&clear_hist_btn);
+    card_data.append(&make_pref_row(
+        "Clear watch history",
+        "Remove all saved history entries",
+        &clear_hist_btn,
+    ));
+
+    g_data.append(&card_data);
+    col.append(&g_data);
+
+    let clamp = adw::Clamp::builder()
+        .maximum_size(560)
+        .tightening_threshold(400)
+        .hexpand(true)
+        .margin_start(28)
+        .margin_end(28)
+        .visible(false)
+        .child(&col)
+        .build();
+
+    (
+        clamp,
+        scheme_btn,
+        accent_btn,
+        quality_btn,
+        hwdec_switch,
+        player_entry,
+        hist_switch,
+        clear_cache_btn,
+        clear_hist_btn,
+    )
+}
+
+fn make_pref_row(title: &str, subtitle: &str, suffix: &impl IsA<gtk4::Widget>) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 16);
+    row.add_css_class("yr-pref-row");
+    row.set_valign(Align::Center);
+
+    let text_col = GtkBox::new(Orientation::Vertical, 2);
+    text_col.set_hexpand(true);
+    text_col.set_valign(Align::Center);
+
+    let t = Label::new(Some(title));
+    t.add_css_class("yr-title");
+    t.set_halign(Align::Start);
+    t.set_xalign(0.0);
+    t.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+    let sub = Label::new(Some(subtitle));
+    sub.add_css_class("yr-meta");
+    sub.set_halign(Align::Start);
+    sub.set_xalign(0.0);
+    sub.set_wrap(true);
+
+    text_col.append(&t);
+    text_col.append(&sub);
+
+    row.append(&text_col);
+    row.append(suffix);
+    row
+}
+
+fn make_pref_sep() -> GtkBox {
+    let sep = GtkBox::new(Orientation::Horizontal, 0);
+    sep.add_css_class("yr-pref-sep");
+    sep.set_hexpand(true);
+    sep
+}
+
+fn attach_choice_popover(
+    button: &Button,
+    options: &[(&'static str, &'static str)],
+    on_select: impl Fn(&'static str) + 'static,
+) {
+    let popover = Popover::new();
+    popover.set_parent(button);
+    popover.set_has_arrow(false);
+
+    let pop_cleanup = popover.clone();
+    button.connect_destroy(move |_| {
+        pop_cleanup.unparent();
+    });
+
+    let vbox = GtkBox::new(Orientation::Vertical, 2);
+    vbox.set_width_request(180);
+
+    let cb = Rc::new(on_select);
+    for &(key, label) in options {
+        let item = make_filter_item(label, false);
+        let pop_weak = popover.downgrade();
+        let cb_cl = cb.clone();
+        item.connect_clicked(move |_| {
+            if let Some(pop) = pop_weak.upgrade() {
+                pop.popdown();
+            }
+            cb_cl(key);
+        });
+        vbox.append(&item);
+    }
+
+    popover.set_child(Some(&vbox));
+    let pop_weak = popover.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(pop) = pop_weak.upgrade() {
+            pop.popup();
+        }
+    });
+}
+
 fn create_chip(label: &str, is_active: bool) -> Button {
     let btn = Button::builder().label(label).build();
     btn.add_css_class("yr-chip");
+    set_pointer(&btn);
     if is_active {
         btn.add_css_class("active");
     }
@@ -2522,14 +3085,16 @@ fn load_custom_css() -> CssProvider {
     theme_provider
 }
 
-fn create_bottom_nav_btn(icon_name: &str, tooltip: &str, is_active: bool) -> Button {
-    let btn = Button::from_icon_name(icon_name);
+fn create_bottom_nav_btn(icon: KalamIcon, tooltip: &str, is_active: bool) -> Button {
+    let btn = Button::new();
+    btn.set_child(Some(&make_icon(icon, 22)));
     btn.add_css_class("yr-rail-btn");
     btn.set_tooltip_text(Some(tooltip));
     btn.set_hexpand(true);
     btn.set_halign(Align::Center);
     btn.set_width_request(44);
     btn.set_height_request(44);
+    set_pointer(&btn);
     if is_active {
         btn.add_css_class("active");
     }
@@ -2540,6 +3105,7 @@ fn make_filter_item(label: &str, selected: bool) -> Button {
     let btn = Button::builder().label(label).halign(Align::Fill).build();
     btn.add_css_class("flat");
     btn.add_css_class("yr-menu-item");
+    set_pointer(&btn);
     if selected {
         btn.add_css_class("selected");
     }

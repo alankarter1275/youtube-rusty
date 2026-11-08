@@ -1,10 +1,11 @@
-use crate::backend::engine::Engine;
+use crate::backend::engine::{Engine, PageCursor, PagedVideos};
 use crate::backend::models::{
     matches_local_filters, ChannelDetails, ChannelSortOrder, DurationFilter, UploadDateFilter,
     VideoSummary,
 };
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
 use crate::ui::details_sheet::{CardActions, ContextMenu, DetailsSheet};
+use crate::ui::icons::set_pointer;
 use crate::ui::video_card::VideoCard;
 use gtk4::glib;
 use adw::prelude::*;
@@ -38,21 +39,27 @@ pub struct ChannelPage {
     name_label: Label,
     stats_label: Label,
     sub_btn: Button,
+    header_box: GtkBox,
     toolbar_box: GtkBox,
+    compact_search_box: GtkBox,
     tab_videos: ToggleButton,
     tab_shorts: ToggleButton,
     play_all_btn: Button,
     search_entry: SearchEntry,
+    compact_search_entry: SearchEntry,
     filter_btn: Button,
     sort_btn: Button,
     flow_box: FlowBox,
+    load_more_btn: Button,
     status_box: GtkBox,
     status_page: adw::StatusPage,
     active_tab: Cell<ChannelTab>,
     is_narrow: Cell<bool>,
+    is_compact: Cell<bool>,
     grid_cols: Cell<u32>,
     shorts_cols: Cell<u32>,
     is_loading: Cell<bool>,
+    is_loading_more: Cell<bool>,
     request_seq: Cell<u64>,
     date_filter: Cell<UploadDateFilter>,
     duration_filter: Cell<DurationFilter>,
@@ -60,6 +67,8 @@ pub struct ChannelPage {
     channel_details: RefCell<Option<ChannelDetails>>,
     videos_list: RefCell<Vec<VideoSummary>>,
     shorts_list: RefCell<Vec<VideoSummary>>,
+    videos_cursor: RefCell<Option<PageCursor>>,
+    shorts_cursor: RefCell<Option<PageCursor>>,
     search_results: RefCell<Option<Vec<VideoSummary>>>,
 }
 
@@ -75,6 +84,7 @@ impl ChannelPage {
         store: Arc<SubscriptionStore>,
         on_play_shorts_queue: Rc<dyn Fn(Vec<VideoSummary>, usize)>,
         narrow: bool,
+        compact: bool,
         grid_cols: u32,
         shorts_cols: u32,
     ) -> Rc<Self> {
@@ -160,7 +170,7 @@ impl ChannelPage {
 
         let search_entry = SearchEntry::builder()
             .placeholder_text("Search in channel")
-            .width_request(210)
+            .width_request(190)
             .build();
         search_entry.add_css_class("yr-search");
         toolbar_box.append(&search_entry);
@@ -168,14 +178,36 @@ impl ChannelPage {
         let filter_btn = Button::with_label("Filter");
         filter_btn.add_css_class("yr-chip");
         filter_btn.set_tooltip_text(Some("Filter channel videos"));
+        set_pointer(&filter_btn);
         toolbar_box.append(&filter_btn);
 
         let sort_btn = Button::with_label("Sort: Newest");
         sort_btn.add_css_class("yr-chip");
         sort_btn.set_tooltip_text(Some("Sort channel videos"));
+        set_pointer(&sort_btn);
         toolbar_box.append(&sort_btn);
 
+        set_pointer(&sub_btn);
+        set_pointer(&tab_videos);
+        set_pointer(&tab_shorts);
+        set_pointer(&play_all_btn);
+
         root_box.append(&toolbar_box);
+
+        // Compact second-row search bar for half-screen / narrow windows (prevents horizontal overflow)
+        let compact_search_box = GtkBox::new(Orientation::Horizontal, 0);
+        compact_search_box.set_margin_start(28);
+        compact_search_box.set_margin_end(28);
+        compact_search_box.set_margin_bottom(12);
+        compact_search_box.set_visible(false);
+
+        let compact_search_entry = SearchEntry::builder()
+            .placeholder_text("Search in channel")
+            .hexpand(true)
+            .build();
+        compact_search_entry.add_css_class("yr-search");
+        compact_search_box.append(&compact_search_entry);
+        root_box.append(&compact_search_box);
 
         // --- Video / Shorts Grid + Status Container ---
         let body_box = GtkBox::new(Orientation::Vertical, 0);
@@ -204,10 +236,19 @@ impl ChannelPage {
         flow_box.set_homogeneous(true);
         flow_box.set_margin_start(28);
         flow_box.set_margin_end(28);
-        flow_box.set_margin_bottom(32);
+        flow_box.set_margin_bottom(16);
+
+        let load_more_btn = Button::with_label("Load more");
+        load_more_btn.add_css_class("yr-btn");
+        load_more_btn.set_halign(Align::Center);
+        load_more_btn.set_margin_top(4);
+        load_more_btn.set_margin_bottom(32);
+        load_more_btn.set_visible(false);
+        set_pointer(&load_more_btn);
 
         body_box.append(&status_box);
         body_box.append(&flow_box);
+        body_box.append(&load_more_btn);
 
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -246,21 +287,27 @@ impl ChannelPage {
             name_label,
             stats_label,
             sub_btn,
+            header_box,
             toolbar_box,
+            compact_search_box,
             tab_videos,
             tab_shorts,
             play_all_btn,
             search_entry,
+            compact_search_entry,
             filter_btn,
             sort_btn,
             flow_box,
+            load_more_btn,
             status_box,
             status_page,
             active_tab: Cell::new(ChannelTab::Videos),
             is_narrow: Cell::new(narrow),
+            is_compact: Cell::new(compact),
             grid_cols: Cell::new(grid_cols),
             shorts_cols: Cell::new(shorts_cols),
             is_loading: Cell::new(true),
+            is_loading_more: Cell::new(false),
             request_seq: Cell::new(0),
             date_filter: Cell::new(UploadDateFilter::AnyTime),
             duration_filter: Cell::new(DurationFilter::AnyLength),
@@ -268,11 +315,13 @@ impl ChannelPage {
             channel_details: RefCell::new(None),
             videos_list: RefCell::new(Vec::new()),
             shorts_list: RefCell::new(Vec::new()),
+            videos_cursor: RefCell::new(None),
+            shorts_cursor: RefCell::new(None),
             search_results: RefCell::new(None),
         });
 
         this.wire_signals();
-        this.set_layout(narrow, grid_cols, shorts_cols);
+        this.set_layout(narrow, compact, grid_cols, shorts_cols);
         this.show_skeletons();
 
         this
@@ -376,29 +425,54 @@ impl ChannelPage {
             }
         });
 
-        // Search in channel (Enter to search; clearing restores tab list)
-        let weak = Rc::downgrade(self);
-        self.search_entry.connect_activate(move |entry| {
-            if let Some(cp) = weak.upgrade() {
-                let q = entry.text().trim().to_string();
-                if q.is_empty() {
-                    *cp.search_results.borrow_mut() = None;
-                    cp.render_active_tab();
-                } else {
-                    cp.run_channel_search(&q);
-                }
-            }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.search_entry.connect_search_changed(move |entry| {
-            if entry.text().trim().is_empty() {
+        // Search in channel (both wide & compact entries stay synced)
+        for entry in [&self.search_entry, &self.compact_search_entry] {
+            let weak = Rc::downgrade(self);
+            let other = if entry == &self.search_entry {
+                self.compact_search_entry.clone()
+            } else {
+                self.search_entry.clone()
+            };
+            entry.connect_activate(move |ent| {
                 if let Some(cp) = weak.upgrade() {
-                    if cp.search_results.borrow().is_some() {
+                    let q = ent.text().trim().to_string();
+                    if other.text().as_str() != q {
+                        other.set_text(&q);
+                    }
+                    if q.is_empty() {
                         *cp.search_results.borrow_mut() = None;
                         cp.render_active_tab();
+                    } else {
+                        cp.run_channel_search(&q);
                     }
                 }
+            });
+
+            let weak = Rc::downgrade(self);
+            let other_clear = if entry == &self.search_entry {
+                self.compact_search_entry.clone()
+            } else {
+                self.search_entry.clone()
+            };
+            entry.connect_search_changed(move |ent| {
+                if ent.text().trim().is_empty() {
+                    if !other_clear.text().is_empty() {
+                        other_clear.set_text("");
+                    }
+                    if let Some(cp) = weak.upgrade() {
+                        if cp.search_results.borrow().is_some() {
+                            *cp.search_results.borrow_mut() = None;
+                            cp.render_active_tab();
+                        }
+                    }
+                }
+            });
+        }
+
+        let weak = Rc::downgrade(self);
+        self.load_more_btn.connect_clicked(move |_| {
+            if let Some(cp) = weak.upgrade() {
+                cp.load_more_active_tab();
             }
         });
 
@@ -690,7 +764,7 @@ impl ChannelPage {
         let cid = self.channel_id.clone();
         let fallback = self.channel_details.borrow().clone();
         let engine = self.engine.clone();
-        let (tx, rx) = async_channel::bounded::<Result<Vec<VideoSummary>, String>>(1);
+        let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
 
         self.runtime.spawn(async move {
             let res = engine
@@ -712,16 +786,77 @@ impl ChannelPage {
             }
             cp.is_loading.set(false);
             match res {
-                Ok(items) => {
+                Ok(paged) => {
                     if is_shorts {
-                        *cp.shorts_list.borrow_mut() = items;
+                        *cp.shorts_list.borrow_mut() = paged.items;
+                        *cp.shorts_cursor.borrow_mut() = paged.next;
                     } else {
-                        *cp.videos_list.borrow_mut() = items;
+                        *cp.videos_list.borrow_mut() = paged.items;
+                        *cp.videos_cursor.borrow_mut() = paged.next;
                     }
                     cp.render_active_tab();
                 }
                 Err(err) => {
                     cp.show_status("Could not sort channel videos", &err);
+                }
+            }
+        });
+    }
+
+    fn load_more_active_tab(self: &Rc<Self>) {
+        if self.is_loading.get() || self.is_loading_more.get() || self.search_results.borrow().is_some() {
+            return;
+        }
+        let is_shorts = self.active_tab.get() == ChannelTab::Shorts;
+        let cursor_opt = if is_shorts {
+            self.shorts_cursor.borrow().clone()
+        } else {
+            self.videos_cursor.borrow().clone()
+        };
+        let Some(cursor) = cursor_opt else {
+            self.load_more_btn.set_visible(false);
+            return;
+        };
+
+        self.is_loading_more.set(true);
+        self.load_more_btn.set_sensitive(false);
+        self.load_more_btn.set_label("Loading more…");
+
+        let fallback = self.channel_details.borrow().clone();
+        let engine = self.engine.clone();
+        let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
+        self.runtime.spawn(async move {
+            let res = engine
+                .load_more(&cursor, fallback.as_ref(), is_shorts, false)
+                .await;
+            let _ = tx.send(res).await;
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(res) = rx.recv().await else {
+                return;
+            };
+            let Some(cp) = weak.upgrade() else {
+                return;
+            };
+            cp.is_loading_more.set(false);
+            cp.load_more_btn.set_sensitive(true);
+            cp.load_more_btn.set_label("Load more");
+
+            match res {
+                Ok(paged) => {
+                    if is_shorts {
+                        cp.shorts_list.borrow_mut().extend(paged.items);
+                        *cp.shorts_cursor.borrow_mut() = paged.next;
+                    } else {
+                        cp.videos_list.borrow_mut().extend(paged.items);
+                        *cp.videos_cursor.borrow_mut() = paged.next;
+                    }
+                    cp.render_active_tab();
+                }
+                Err(err) => {
+                    (cp.actions.on_toast)(err);
                 }
             }
         });
@@ -767,15 +902,25 @@ impl ChannelPage {
         });
     }
 
-    pub fn set_layout(&self, narrow: bool, grid_cols: u32, shorts_cols: u32) {
+    pub fn set_layout(&self, narrow: bool, compact: bool, grid_cols: u32, shorts_cols: u32) {
         self.is_narrow.set(narrow);
+        self.is_compact.set(compact);
         self.grid_cols.set(grid_cols);
         self.shorts_cols.set(shorts_cols);
-        self.search_entry.set_visible(!narrow);
-        self.toolbar_box.set_margin_start(if narrow { 16 } else { 28 });
-        self.toolbar_box.set_margin_end(if narrow { 16 } else { 28 });
-        self.flow_box.set_margin_start(if narrow { 16 } else { 28 });
-        self.flow_box.set_margin_end(if narrow { 16 } else { 28 });
+
+        let show_compact_search = narrow || compact;
+        self.search_entry.set_visible(!show_compact_search);
+        self.compact_search_box.set_visible(show_compact_search);
+
+        let side = if narrow { 16 } else if compact { 20 } else { 28 };
+        self.header_box.set_margin_start(side);
+        self.header_box.set_margin_end(side);
+        self.toolbar_box.set_margin_start(side);
+        self.toolbar_box.set_margin_end(side);
+        self.compact_search_box.set_margin_start(side);
+        self.compact_search_box.set_margin_end(side);
+        self.flow_box.set_margin_start(side);
+        self.flow_box.set_margin_end(side);
         self.update_grid_columns();
     }
 
@@ -831,16 +976,18 @@ impl ChannelPage {
         *self.channel_details.borrow_mut() = Some(details);
     }
 
-    pub fn set_videos(&self, videos: Vec<VideoSummary>) {
+    pub fn set_videos(&self, paged: PagedVideos) {
         self.is_loading.set(false);
-        *self.videos_list.borrow_mut() = videos;
+        *self.videos_list.borrow_mut() = paged.items;
+        *self.videos_cursor.borrow_mut() = paged.next;
         if self.active_tab.get() == ChannelTab::Videos && self.search_results.borrow().is_none() {
             self.render_active_tab();
         }
     }
 
-    pub fn set_shorts(&self, shorts: Vec<VideoSummary>) {
-        *self.shorts_list.borrow_mut() = shorts;
+    pub fn set_shorts(&self, paged: PagedVideos) {
+        *self.shorts_list.borrow_mut() = paged.items;
+        *self.shorts_cursor.borrow_mut() = paged.next;
         if self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none() {
             self.is_loading.set(false);
             self.render_active_tab();
@@ -855,6 +1002,7 @@ impl ChannelPage {
 
     fn show_skeletons(&self) {
         self.status_box.set_visible(false);
+        self.load_more_btn.set_visible(false);
         self.flow_box.set_visible(true);
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
@@ -873,6 +1021,7 @@ impl ChannelPage {
             self.flow_box.remove(&child);
         }
         self.flow_box.set_visible(false);
+        self.load_more_btn.set_visible(false);
         self.status_page.set_title(title);
         self.status_page.set_description(Some(description));
         self.status_box.set_visible(true);
@@ -993,10 +1142,24 @@ impl ChannelPage {
                     }
                 });
 
+                let sum_mid = video.clone();
+                let on_play_mid = self.actions.on_play.clone();
+                let def_q_mid = self.actions.default_quality.clone();
+                card.connect_middle_click(move || {
+                    on_play_mid(sum_mid.clone(), def_q_mid());
+                });
+
                 ContextMenu::attach(&card.container, video, &self.actions);
                 self.flow_box.append(&card.container);
             }
         }
+
+        let has_more = self.search_results.borrow().is_none()
+            && match self.active_tab.get() {
+                ChannelTab::Videos => self.videos_cursor.borrow().is_some(),
+                ChannelTab::Shorts => self.shorts_cursor.borrow().is_some(),
+            };
+        self.load_more_btn.set_visible(has_more);
     }
 }
 
@@ -1004,6 +1167,7 @@ fn create_pop_item(label: &str) -> Button {
     let btn = Button::builder().label(label).halign(Align::Fill).build();
     btn.add_css_class("flat");
     btn.add_css_class("yr-menu-item");
+    set_pointer(&btn);
     if let Some(child) = btn.child() {
         if let Some(lbl) = child.downcast_ref::<Label>() {
             lbl.set_halign(Align::Start);

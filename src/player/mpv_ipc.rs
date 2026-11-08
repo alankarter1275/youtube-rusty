@@ -12,6 +12,8 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum MpvEvent {
+    Loading,
+    Loaded,
     TimePos(f64),
     Duration(f64),
     Pause(bool),
@@ -74,7 +76,8 @@ impl MpvSession {
                 cmd.arg(arg);
             }
             cmd.arg("--idle=yes")
-                .arg("--force-window=yes")
+                .arg("--force-window=no")
+                .arg("--keep-open=no")
                 .arg(format!("--input-ipc-server={}", sock_for_task.display()))
                 .arg(&hwdec_arg)
                 .stdin(Stdio::null())
@@ -197,42 +200,65 @@ impl MpvSession {
                         break;
                     }
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if v.get("event").and_then(|e| e.as_str()) == Some("property-change") {
-                            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            let data = v.get("data");
+                        match v.get("event").and_then(|e| e.as_str()) {
+                            Some("start-file") => {
+                                let _ = ev_tx.send(MpvEvent::Loading).await;
+                            }
+                            Some("file-loaded") => {
+                                let _ = ev_tx.send(MpvEvent::Loaded).await;
+                            }
+                            Some("end-file") => {
+                                let _ = ev_tx.send(MpvEvent::Loaded).await;
+                                if v.get("reason").and_then(|r| r.as_str()) == Some("error") {
+                                    let detail = v
+                                        .get("file_error")
+                                        .and_then(|e| e.as_str())
+                                        .unwrap_or("stream unavailable");
+                                    let _ = ev_tx
+                                        .send(MpvEvent::Error(format!(
+                                            "MPV could not play this video ({detail})"
+                                        )))
+                                        .await;
+                                }
+                            }
+                            Some("property-change") => {
+                                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                let data = v.get("data");
 
-                            match name {
-                                "time-pos" => {
-                                    if let Some(num) = data.and_then(|d| d.as_f64()) {
-                                        let _ = ev_tx.send(MpvEvent::TimePos(num)).await;
-                                    }
-                                }
-                                "duration" => {
-                                    if let Some(num) = data.and_then(|d| d.as_f64()) {
-                                        let _ = ev_tx.send(MpvEvent::Duration(num)).await;
-                                    }
-                                }
-                                "pause" => {
-                                    if let Some(p) = data.and_then(|d| d.as_bool()) {
-                                        let _ = ev_tx.send(MpvEvent::Pause(p)).await;
-                                    }
-                                }
-                                "playlist-pos" => {
-                                    if let Some(idx) = data.and_then(|d| d.as_i64()) {
-                                        if idx >= 0 {
-                                            let _ = ev_tx
-                                                .send(MpvEvent::PlaylistPos(idx as usize))
-                                                .await;
+                                match name {
+                                    "time-pos" => {
+                                        if let Some(num) = data.and_then(|d| d.as_f64()) {
+                                            let _ = ev_tx.send(MpvEvent::TimePos(num)).await;
                                         }
                                     }
-                                }
-                                "idle-active" => {
-                                    if let Some(idle) = data.and_then(|d| d.as_bool()) {
-                                        let _ = ev_tx.send(MpvEvent::Idle(idle)).await;
+                                    "duration" => {
+                                        if let Some(num) = data.and_then(|d| d.as_f64()) {
+                                            let _ = ev_tx.send(MpvEvent::Duration(num)).await;
+                                        }
                                     }
+                                    "pause" => {
+                                        if let Some(p) = data.and_then(|d| d.as_bool()) {
+                                            let _ = ev_tx.send(MpvEvent::Pause(p)).await;
+                                        }
+                                    }
+                                    "playlist-pos" => {
+                                        if let Some(idx) = data.and_then(|d| d.as_i64()) {
+                                            if idx >= 0 {
+                                                let _ = ev_tx
+                                                    .send(MpvEvent::PlaylistPos(idx as usize))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    "idle-active" => {
+                                        if let Some(idle) = data.and_then(|d| d.as_bool()) {
+                                            let _ = ev_tx.send(MpvEvent::Idle(idle)).await;
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -286,9 +312,14 @@ impl MpvSession {
             Some(fmt) => {
                 self.send_json(json!({ "command": ["set_property", "ytdl-format", fmt] }));
                 self.send_json(json!({ "command": ["set_property", "vid", "auto"] }));
+                self.send_json(json!({ "command": ["set_property", "force-window", "immediate"] }));
             }
             None => {
+                self.send_json(json!({
+                    "command": ["set_property", "ytdl-format", "bestaudio/best"]
+                }));
                 self.send_json(json!({ "command": ["set_property", "vid", "no"] }));
+                self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
             }
         }
     }
@@ -338,6 +369,7 @@ impl MpvSession {
 
     pub fn stop(&self) {
         self.send_json(json!({ "command": ["stop"] }));
+        self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
     }
 
     pub fn shutdown(&self) {
