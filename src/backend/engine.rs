@@ -76,6 +76,16 @@ pub struct PageCursor {
     pub ctoken: String,
     pub endpoint: ContinuationEndpoint,
     pub visitor_data: Option<String>,
+    pub is_direct_browse_ctoken: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChannelHeaderStats {
+    pub channel_name: Option<String>,
+    pub handle: Option<String>,
+    pub subscriber_count_text: Option<String>,
+    pub video_count_text: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +201,7 @@ fn cursor_from_paginator<T>(p: &Paginator<T>) -> Option<PageCursor> {
         ctoken: ctoken.clone(),
         endpoint: p.endpoint,
         visitor_data: p.visitor_data.clone(),
+        is_direct_browse_ctoken: false,
     })
 }
 
@@ -210,6 +221,8 @@ impl Engine {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -217,6 +230,10 @@ impl Engine {
             http,
             visitor_data: RwLock::new(None),
         }
+    }
+
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
     }
 
     async fn ensure_visitor_data(&self) -> Option<String> {
@@ -1409,6 +1426,12 @@ impl Engine {
         force_short: bool,
         filter_out_shorts: bool,
     ) -> Result<PagedVideos, String> {
+        if cursor.is_direct_browse_ctoken {
+            return self
+                .continue_channel_shorts_direct(&cursor.ctoken, fallback_details)
+                .await;
+        }
+
         let paginator = self
             .rp
             .query()
@@ -1623,51 +1646,124 @@ impl Engine {
         Ok((details, PagedVideos { items, next }))
     }
 
+    pub async fn channel_shorts_with_stats(
+        &self,
+        channel_id: &str,
+        fallback_details: Option<&ChannelDetails>,
+    ) -> Result<(Option<ChannelHeaderStats>, PagedVideos), String> {
+        let val = self
+            .fetch_channel_browse_json(channel_id, Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"), None)
+            .await?;
+
+        let stats = extract_browse_header_stats(&val);
+        let id_str = fallback_details
+            .map(|d| d.id.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(channel_id);
+        let name_str = stats
+            .channel_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| fallback_details.map(|d| d.name.as_str()))
+            .unwrap_or("");
+        let av_str = stats
+            .avatar_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| fallback_details.map(|d| d.avatar_url.as_str()))
+            .unwrap_or("");
+
+        let fb = ChannelFallback {
+            id: id_str,
+            name: name_str,
+            avatar_url: av_str,
+        };
+        let paged = parse_shorts_browse_response(&val, id_str, Some(&fb));
+        let stats_opt = if stats.subscriber_count_text.is_some()
+            || stats.video_count_text.is_some()
+            || stats.channel_name.is_some()
+        {
+            Some(stats)
+        } else {
+            None
+        };
+        Ok((stats_opt, paged))
+    }
+
     pub async fn channel_shorts(
         &self,
         channel_id: &str,
         fallback_details: Option<&ChannelDetails>,
     ) -> Result<PagedVideos, String> {
-        let ch = self
-            .rp
-            .query()
-            .channel_videos_tab(channel_id, ChannelVideoTab::Shorts)
+        let (_, paged) = self
+            .channel_shorts_with_stats(channel_id, fallback_details)
+            .await?;
+        Ok(paged)
+    }
+
+    async fn continue_channel_shorts_direct(
+        &self,
+        ctoken: &str,
+        fallback_details: Option<&ChannelDetails>,
+    ) -> Result<PagedVideos, String> {
+        let val = self
+            .fetch_channel_browse_json("", None, Some(ctoken))
+            .await?;
+        let cid = fallback_details.map(|d| d.id.as_str()).unwrap_or("");
+        let fb = fallback_details.map(|d| ChannelFallback {
+            id: &d.id,
+            name: &d.name,
+            avatar_url: &d.avatar_url,
+        });
+        Ok(parse_shorts_browse_response(&val, cid, fb.as_ref()))
+    }
+
+    async fn fetch_channel_browse_json(
+        &self,
+        channel_id: &str,
+        params: Option<&str>,
+        continuation: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "context".to_string(),
+            json!({
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20260728.01.00",
+                    "hl": "en",
+                    "gl": "US"
+                }
+            }),
+        );
+        if let Some(ctoken) = continuation {
+            body.insert("continuation".to_string(), Value::String(ctoken.to_string()));
+        } else {
+            body.insert("browseId".to_string(), Value::String(channel_id.to_string()));
+            if let Some(p) = params {
+                body.insert("params".to_string(), Value::String(p.to_string()));
+            }
+        }
+
+        let resp = self
+            .http
+            .post("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false")
+            .header("User-Agent", RP_DESKTOP_UA)
+            .header("Origin", "https://www.youtube.com")
+            .header("Referer", "https://www.youtube.com/")
+            .header("Content-Type", "application/json")
+            .json(&Value::Object(body))
+            .send()
             .await
-            .map_err(|e| format!("Channel shorts error: {e}"))?;
+            .map_err(|e| format!("Channel browse network error: {e}"))?;
 
-        let ch_avatar = pick_thumbnail_url(&ch.avatar, 128);
-        let id_str = if !ch.id.is_empty() {
-            ch.id.as_str()
-        } else {
-            fallback_details.map(|d| d.id.as_str()).unwrap_or(channel_id)
-        };
-        let name_str = if !ch.name.is_empty() {
-            ch.name.as_str()
-        } else {
-            fallback_details.map(|d| d.name.as_str()).unwrap_or("")
-        };
-        let av_str = if !ch_avatar.is_empty() {
-            ch_avatar.as_str()
-        } else {
-            fallback_details
-                .map(|d| d.avatar_url.as_str())
-                .unwrap_or("")
-        };
+        if !resp.status().is_success() {
+            return Err(format!("Channel browse HTTP {}", resp.status()));
+        }
 
-        let fallback = ChannelFallback {
-            id: id_str,
-            name: name_str,
-            avatar_url: av_str,
-        };
-
-        let next = cursor_from_paginator(&ch.content);
-        let items = ch
-            .content
-            .items
-            .into_iter()
-            .map(|it| map_video_item(it, Some(&fallback), true))
-            .collect();
-        Ok(PagedVideos { items, next })
+        resp.json::<Value>()
+            .await
+            .map_err(|e| format!("Channel browse JSON error: {e}"))
     }
 
     pub async fn channel_tab_ordered(
@@ -1677,6 +1773,30 @@ impl Engine {
         order: ChannelSortOrder,
         fallback_details: Option<&ChannelDetails>,
     ) -> Result<PagedVideos, String> {
+        if order == ChannelSortOrder::Newest {
+            if is_shorts {
+                return self.channel_shorts(channel_id, fallback_details).await;
+            } else {
+                let (_, paged) = self.channel_videos(channel_id).await?;
+                return Ok(paged);
+            }
+        }
+
+        if is_shorts {
+            let val = self
+                .fetch_channel_browse_json(
+                    channel_id,
+                    Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
+                    None,
+                )
+                .await?;
+            if let Some(chip_token) = extract_shorts_sort_chip_token(&val, order) {
+                return self
+                    .continue_channel_shorts_direct(&chip_token, fallback_details)
+                    .await;
+            }
+        }
+
         let tab = if is_shorts {
             ChannelVideoTab::Shorts
         } else {
@@ -1687,15 +1807,6 @@ impl Engine {
             ChannelSortOrder::Oldest => ChannelOrder::Oldest,
             ChannelSortOrder::Popular => ChannelOrder::Popular,
         };
-
-        if order == ChannelSortOrder::Newest {
-            if is_shorts {
-                return self.channel_shorts(channel_id, fallback_details).await;
-            } else {
-                let (_, paged) = self.channel_videos(channel_id).await?;
-                return Ok(paged);
-            }
-        }
 
         let paginator = self
             .rp
@@ -2427,24 +2538,517 @@ struct ChannelFallback<'a> {
     avatar_url: &'a str,
 }
 
+fn normalize_thumb_url(u: &str) -> String {
+    if let Some(stripped) = u.strip_prefix("//") {
+        format!("https://{stripped}")
+    } else {
+        u.to_string()
+    }
+}
+
 fn pick_thumbnail_url(thumbs: &[Thumbnail], min_width: u32) -> String {
     if thumbs.is_empty() {
         return String::new();
     }
-    let normalize = |u: &str| {
-        if let Some(stripped) = u.strip_prefix("//") {
-            format!("https://{stripped}")
-        } else {
-            u.to_string()
-        }
-    };
-    if let Some(found) = thumbs.iter().find(|t| t.width >= min_width) {
-        return normalize(&found.url);
+    if let Some(found) = thumbs
+        .iter()
+        .filter(|t| t.width >= min_width)
+        .min_by_key(|t| t.width)
+    {
+        return normalize_thumb_url(&found.url);
     }
     thumbs
-        .last()
-        .map(|t| normalize(&t.url))
+        .iter()
+        .max_by_key(|t| t.width)
+        .or_else(|| thumbs.last())
+        .map(|t| normalize_thumb_url(&t.url))
         .unwrap_or_default()
+}
+
+fn pick_json_sources_url(sources: Option<&Vec<Value>>, min_width: u64) -> Option<String> {
+    let arr = sources?;
+    if arr.is_empty() {
+        return None;
+    }
+    let best = arr
+        .iter()
+        .filter_map(|s| {
+            let url = s.get("url").and_then(|v| v.as_str())?;
+            let w = s.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+            Some((w, url))
+        })
+        .filter(|(w, _)| *w >= min_width)
+        .min_by_key(|(w, _)| *w)
+        .or_else(|| {
+            arr.iter()
+                .filter_map(|s| {
+                    let url = s.get("url").and_then(|v| v.as_str())?;
+                    let w = s.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
+                    Some((w, url))
+                })
+                .max_by_key(|(w, _)| *w)
+        })?;
+    Some(normalize_thumb_url(best.1))
+}
+
+fn parse_compact_count_str(text: &str) -> Option<u64> {
+    let token = text
+        .split_whitespace()
+        .next()?
+        .trim()
+        .replace(',', "");
+    if token.is_empty() {
+        return None;
+    }
+    let (num_part, mult) = match token.chars().last()? {
+        'K' | 'k' => (&token[..token.len() - 1], 1_000.0),
+        'M' | 'm' => (&token[..token.len() - 1], 1_000_000.0),
+        'B' | 'b' => (&token[..token.len() - 1], 1_000_000_000.0),
+        _ => (token.as_str(), 1.0),
+    };
+    let val: f64 = num_part.parse().ok()?;
+    if val < 0.0 {
+        return None;
+    }
+    Some((val * mult) as u64)
+}
+
+fn extract_browse_header_stats(val: &Value) -> ChannelHeaderStats {
+    let mut out = ChannelHeaderStats::default();
+
+    if let Some(ph) = val.pointer("/header/pageHeaderRenderer") {
+        out.channel_name = ph
+            .pointer("/content/pageHeaderViewModel/title/dynamicTextViewModel/text/content")
+            .or_else(|| ph.get("pageTitle"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        out.avatar_url = pick_json_sources_url(
+            ph.pointer(
+                "/content/pageHeaderViewModel/image/decoratedAvatarViewModel/avatar/avatarViewModel/image/sources",
+            )
+            .and_then(|v| v.as_array()),
+            88,
+        );
+
+        if let Some(rows) = ph
+            .pointer("/content/pageHeaderViewModel/metadata/contentMetadataViewModel/metadataRows")
+            .and_then(|v| v.as_array())
+        {
+            for row in rows {
+                if let Some(parts) = row.get("metadataParts").and_then(|v| v.as_array()) {
+                    for part in parts {
+                        let Some(txt) = part
+                            .pointer("/text/content")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            continue;
+                        };
+                        let lower = txt.to_ascii_lowercase();
+                        if txt.starts_with('@') && out.handle.is_none() {
+                            out.handle = Some(txt.to_string());
+                        } else if lower.contains("subscriber") && out.subscriber_count_text.is_none()
+                        {
+                            out.subscriber_count_text = Some(txt.to_string());
+                        } else if lower.contains("video") && out.video_count_text.is_none() {
+                            out.video_count_text = Some(txt.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(c4) = val.pointer("/header/c4TabbedHeaderRenderer") {
+        out.channel_name = c4
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        out.handle = c4
+            .pointer("/channelHandleText/simpleText")
+            .or_else(|| c4.pointer("/channelHandleText/runs/0/text"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.subscriber_count_text = c4
+            .pointer("/subscriberCountText/simpleText")
+            .or_else(|| c4.pointer("/subscriberCountText/runs/0/text"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.video_count_text = c4
+            .pointer("/videosCountText/simpleText")
+            .or_else(|| c4.pointer("/videosCountText/runs/0/text"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.avatar_url = pick_json_sources_url(
+            c4.pointer("/avatar/thumbnails").and_then(|v| v.as_array()),
+            88,
+        );
+    }
+
+    out
+}
+
+fn extract_continuation_token_from_renderer(cont_renderer: &Value) -> Option<String> {
+    if let Some(tok) = cont_renderer
+        .pointer("/continuationEndpoint/continuationCommand/token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(tok.to_string());
+    }
+    if let Some(cmds) = cont_renderer
+        .pointer("/continuationEndpoint/commandExecutorCommand/commands")
+        .and_then(|v| v.as_array())
+    {
+        for cmd in cmds {
+            if let Some(tok) = cmd
+                .pointer("/continuationCommand/token")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_short_lockup_item(
+    lockup: &Value,
+    channel_id: &str,
+    fallback: Option<&ChannelFallback<'_>>,
+) -> Option<VideoSummary> {
+    let vid = lockup
+        .pointer("/onTap/innertubeCommand/reelWatchEndpoint/videoId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            lockup
+                .pointer("/inlinePlayerData/onVisible/innertubeCommand/watchEndpoint/videoId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            lockup
+                .get("entityId")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.strip_prefix("shorts-shelf-item-"))
+                .filter(|s| !s.is_empty())
+        })?;
+
+    let title = lockup
+        .pointer("/overlayMetadata/primaryText/content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            lockup
+                .get("accessibilityText")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.split(" - play Short").next())
+                .or_else(|| lockup.get("accessibilityText").and_then(|v| v.as_str()))
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("Short")
+        .to_string();
+
+    let view_count_text = lockup
+        .pointer("/overlayMetadata/secondaryText/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let view_count = parse_compact_count_str(&view_count_text);
+
+    let thumbnail_url = pick_json_sources_url(
+        lockup
+            .pointer("/thumbnailViewModel/thumbnailViewModel/image/sources")
+            .and_then(|v| v.as_array()),
+        216,
+    )
+    .or_else(|| {
+        pick_json_sources_url(
+            lockup.pointer("/thumbnail/sources").and_then(|v| v.as_array()),
+            216,
+        )
+    })
+    .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
+
+    Some(VideoSummary {
+        id: vid.to_string(),
+        title,
+        channel_id: fallback
+            .map(|f| f.id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(channel_id)
+            .to_string(),
+        channel_name: fallback.map(|f| f.name).unwrap_or("").to_string(),
+        channel_avatar_url: fallback.map(|f| f.avatar_url).unwrap_or("").to_string(),
+        duration_seconds: Some(60),
+        duration_text: "SHORTS".to_string(),
+        view_count_text,
+        view_count,
+        published_text: String::new(),
+        published_unix: None,
+        is_short: true,
+        thumbnail_url,
+        description_snippet: String::new(),
+    })
+}
+
+fn parse_reel_item(
+    reel: &Value,
+    channel_id: &str,
+    fallback: Option<&ChannelFallback<'_>>,
+) -> Option<VideoSummary> {
+    let vid = reel
+        .get("videoId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let title = reel
+        .pointer("/headline/simpleText")
+        .or_else(|| reel.pointer("/headline/runs/0/text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Short")
+        .to_string();
+    let view_count_text = reel
+        .pointer("/viewCountText/simpleText")
+        .or_else(|| reel.pointer("/viewCountText/runs/0/text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let view_count = parse_compact_count_str(&view_count_text);
+    let thumbnail_url = pick_json_sources_url(
+        reel.pointer("/thumbnail/thumbnails")
+            .and_then(|v| v.as_array()),
+        216,
+    )
+    .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
+
+    Some(VideoSummary {
+        id: vid.to_string(),
+        title,
+        channel_id: fallback
+            .map(|f| f.id)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(channel_id)
+            .to_string(),
+        channel_name: fallback.map(|f| f.name).unwrap_or("").to_string(),
+        channel_avatar_url: fallback.map(|f| f.avatar_url).unwrap_or("").to_string(),
+        duration_seconds: Some(60),
+        duration_text: "SHORTS".to_string(),
+        view_count_text,
+        view_count,
+        published_text: String::new(),
+        published_unix: None,
+        is_short: true,
+        thumbnail_url,
+        description_snippet: String::new(),
+    })
+}
+
+fn collect_short_items_from_array(
+    arr: &[Value],
+    channel_id: &str,
+    fallback: Option<&ChannelFallback<'_>>,
+    out_items: &mut Vec<VideoSummary>,
+    seen_ids: &mut HashSet<String>,
+    out_ctoken: &mut Option<String>,
+) {
+    for entry in arr {
+        if let Some(content) = entry.pointer("/richItemRenderer/content") {
+            if let Some(lockup) = content.get("shortsLockupViewModel") {
+                if let Some(v) = parse_short_lockup_item(lockup, channel_id, fallback) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_items.push(v);
+                    }
+                }
+            } else if let Some(reel) = content.get("reelItemRenderer") {
+                if let Some(v) = parse_reel_item(reel, channel_id, fallback) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_items.push(v);
+                    }
+                }
+            }
+        } else if let Some(lockup) = entry.get("shortsLockupViewModel") {
+            if let Some(v) = parse_short_lockup_item(lockup, channel_id, fallback) {
+                if seen_ids.insert(v.id.clone()) {
+                    out_items.push(v);
+                }
+            }
+        } else if let Some(reel) = entry.get("reelItemRenderer") {
+            if let Some(v) = parse_reel_item(reel, channel_id, fallback) {
+                if seen_ids.insert(v.id.clone()) {
+                    out_items.push(v);
+                }
+            }
+        } else if let Some(cont) = entry.get("continuationItemRenderer") {
+            if let Some(tok) = extract_continuation_token_from_renderer(cont) {
+                *out_ctoken = Some(tok);
+            }
+        } else if let Some(sub) = entry
+            .pointer("/itemSectionRenderer/contents")
+            .and_then(|v| v.as_array())
+        {
+            collect_short_items_from_array(
+                sub,
+                channel_id,
+                fallback,
+                out_items,
+                seen_ids,
+                out_ctoken,
+            );
+        }
+    }
+}
+
+fn select_shorts_tab_renderer(val: &Value) -> Option<&Value> {
+    let tabs = val
+        .pointer("/contents/twoColumnBrowseResultsRenderer/tabs")
+        .and_then(|v| v.as_array())?;
+    tabs.iter()
+        .filter_map(|t| t.get("tabRenderer"))
+        .find(|tr| {
+            tr.pointer("/endpoint/commandMetadata/webCommandMetadata/url")
+                .and_then(|v| v.as_str())
+                .map(|u| u.ends_with("/shorts"))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            tabs.iter()
+                .filter_map(|t| t.get("tabRenderer"))
+                .find(|tr| tr.get("selected").and_then(|v| v.as_bool()) == Some(true))
+        })
+}
+
+fn extract_shorts_sort_chip_token(val: &Value, order: ChannelSortOrder) -> Option<String> {
+    let target_word = match order {
+        ChannelSortOrder::Newest => "latest",
+        ChannelSortOrder::Popular => "popular",
+        ChannelSortOrder::Oldest => "oldest",
+    };
+
+    let tab = select_shorts_tab_renderer(val)?;
+    let chips = tab
+        .pointer("/content/richGridRenderer/header/feedFilterChipBarRenderer/contents")
+        .and_then(|v| v.as_array())?;
+
+    for chip_entry in chips {
+        if let Some(chip) = chip_entry.get("chipCloudChipRenderer") {
+            let label = chip
+                .pointer("/text/simpleText")
+                .or_else(|| chip.pointer("/text/runs/0/text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if label.contains(target_word) {
+                if let Some(tok) = chip
+                    .pointer("/navigationEndpoint/continuationCommand/token")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(tok.to_string());
+                }
+                if let Some(cmds) = chip
+                    .pointer("/navigationEndpoint/commandExecutorCommand/commands")
+                    .and_then(|v| v.as_array())
+                {
+                    for cmd in cmds {
+                        if let Some(tok) = cmd
+                            .pointer("/continuationCommand/token")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            return Some(tok.to_string());
+                        }
+                    }
+                }
+            }
+        } else if let Some(cvm) = chip_entry.get("chipViewModel") {
+            let label = cvm
+                .pointer("/text/content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if label.contains(target_word) {
+                if let Some(tok) = cvm
+                    .pointer("/tapCommand/innertubeCommand/continuationCommand/token")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_shorts_browse_response(
+    val: &Value,
+    channel_id: &str,
+    fallback: Option<&ChannelFallback<'_>>,
+) -> PagedVideos {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ctoken = None;
+
+    if let Some(tab) = select_shorts_tab_renderer(val) {
+        if let Some(arr) = tab
+            .pointer("/content/richGridRenderer/contents")
+            .and_then(|v| v.as_array())
+        {
+            collect_short_items_from_array(arr, channel_id, fallback, &mut items, &mut seen, &mut ctoken);
+        } else if let Some(arr) = tab
+            .pointer("/content/sectionListRenderer/contents")
+            .and_then(|v| v.as_array())
+        {
+            collect_short_items_from_array(arr, channel_id, fallback, &mut items, &mut seen, &mut ctoken);
+        }
+    }
+
+    if let Some(actions) = val
+        .get("onResponseReceivedActions")
+        .and_then(|v| v.as_array())
+    {
+        for action in actions {
+            if let Some(arr) = action
+                .pointer("/appendContinuationItemsAction/continuationItems")
+                .and_then(|v| v.as_array())
+            {
+                collect_short_items_from_array(
+                    arr,
+                    channel_id,
+                    fallback,
+                    &mut items,
+                    &mut seen,
+                    &mut ctoken,
+                );
+            }
+            if let Some(arr) = action
+                .pointer("/reloadContinuationItemsCommand/continuationItems")
+                .and_then(|v| v.as_array())
+            {
+                collect_short_items_from_array(
+                    arr,
+                    channel_id,
+                    fallback,
+                    &mut items,
+                    &mut seen,
+                    &mut ctoken,
+                );
+            }
+        }
+    }
+
+    let next = ctoken.map(|tok| PageCursor {
+        ctoken: tok,
+        endpoint: ContinuationEndpoint::Browse,
+        visitor_data: None,
+        is_direct_browse_ctoken: true,
+    });
+
+    PagedVideos { items, next }
 }
 
 fn map_youtube_item(item: YouTubeItem) -> SearchItem {
@@ -2507,7 +3111,7 @@ fn map_video_item(
         .map(|s| format!("{s} views"))
         .unwrap_or_default();
 
-    let thumbnail_url = pick_thumbnail_url(&item.thumbnail, 480);
+    let thumbnail_url = pick_thumbnail_url(&item.thumbnail, 320);
 
     let (mut channel_id, mut channel_name, mut channel_avatar_url) =
         if let Some(c) = item.channel {
@@ -2661,5 +3265,142 @@ https://manifest.example/v1080_video.m3u8
         let (uaud, aaud) = parse_hls_master_playlist(sample_m3u8, Quality::AudioOnly).unwrap();
         assert_eq!(uaud, "https://manifest.example/audio_en.m3u8");
         assert!(aaud.is_none());
+    }
+
+    #[test]
+    fn test_channel_shorts_lockup_and_header_stats_parsing() {
+        let sample = serde_json::json!({
+            "header": {
+                "pageHeaderRenderer": {
+                    "pageTitle": "Linus Tech Tips",
+                    "content": {
+                        "pageHeaderViewModel": {
+                            "title": {
+                                "dynamicTextViewModel": {
+                                    "text": { "content": "Linus Tech Tips" }
+                                }
+                            },
+                            "metadata": {
+                                "contentMetadataViewModel": {
+                                    "metadataRows": [
+                                        {
+                                            "metadataParts": [
+                                                { "text": { "content": "@LinusTechTips" } }
+                                            ]
+                                        },
+                                        {
+                                            "metadataParts": [
+                                                { "text": { "content": "16.2M subscribers" } },
+                                                { "text": { "content": "7.9K videos" } }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [
+                        {
+                            "tabRenderer": {
+                                "selected": true,
+                                "endpoint": {
+                                    "commandMetadata": {
+                                        "webCommandMetadata": {
+                                            "url": "/@LinusTechTips/shorts"
+                                        }
+                                    }
+                                },
+                                "content": {
+                                    "richGridRenderer": {
+                                        "contents": [
+                                            {
+                                                "richItemRenderer": {
+                                                    "content": {
+                                                        "shortsLockupViewModel": {
+                                                            "entityId": "shorts-shelf-item-abc123XYZ89",
+                                                            "onTap": {
+                                                                "innertubeCommand": {
+                                                                    "reelWatchEndpoint": {
+                                                                        "videoId": "abc123XYZ89"
+                                                                    }
+                                                                }
+                                                            },
+                                                            "overlayMetadata": {
+                                                                "primaryText": { "content": "Building a Tiny PC!" },
+                                                                "secondaryText": { "content": "1.4M views" }
+                                                            },
+                                                            "thumbnailViewModel": {
+                                                                "thumbnailViewModel": {
+                                                                    "image": {
+                                                                        "sources": [
+                                                                            {
+                                                                                "url": "https://i.ytimg.com/vi/abc123XYZ89/oar2.jpg",
+                                                                                "width": 405,
+                                                                                "height": 720
+                                                                            }
+                                                                        ]
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "continuationItemRenderer": {
+                                                    "continuationEndpoint": {
+                                                        "continuationCommand": {
+                                                            "token": "NEXT_SHORTS_TOKEN"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let stats = extract_browse_header_stats(&sample);
+        assert_eq!(stats.channel_name.as_deref(), Some("Linus Tech Tips"));
+        assert_eq!(stats.handle.as_deref(), Some("@LinusTechTips"));
+        assert_eq!(
+            stats.subscriber_count_text.as_deref(),
+            Some("16.2M subscribers")
+        );
+        assert_eq!(stats.video_count_text.as_deref(), Some("7.9K videos"));
+
+        let fb = ChannelFallback {
+            id: "UCXuqSBlHAE6Xw-yeJA0Tunw",
+            name: "Linus Tech Tips",
+            avatar_url: "",
+        };
+        let paged = parse_shorts_browse_response(&sample, "UCXuqSBlHAE6Xw-yeJA0Tunw", Some(&fb));
+        assert_eq!(paged.items.len(), 1);
+        assert_eq!(paged.items[0].id, "abc123XYZ89");
+        assert_eq!(paged.items[0].title, "Building a Tiny PC!");
+        assert_eq!(paged.items[0].view_count_text, "1.4M views");
+        assert_eq!(paged.items[0].view_count, Some(1_400_000));
+        assert!(paged.items[0].is_short);
+        assert_eq!(
+            paged.items[0].thumbnail_url,
+            "https://i.ytimg.com/vi/abc123XYZ89/oar2.jpg"
+        );
+        assert_eq!(
+            paged.next.as_ref().map(|c| c.ctoken.as_str()),
+            Some("NEXT_SHORTS_TOKEN")
+        );
+        assert_eq!(
+            paged.next.as_ref().map(|c| c.is_direct_browse_ctoken),
+            Some(true)
+        );
     }
 }

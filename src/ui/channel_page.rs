@@ -1,11 +1,11 @@
-use crate::backend::engine::{Engine, PageCursor, PagedVideos};
+use crate::backend::engine::{ChannelHeaderStats, Engine, PageCursor, PagedVideos};
 use crate::backend::models::{
     matches_local_filters, ChannelDetails, ChannelSortOrder, DurationFilter, UploadDateFilter,
     VideoSummary,
 };
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
 use crate::ui::details_sheet::{CardActions, DetailsSheet};
-use crate::ui::icons::set_pointer;
+use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::video_card::VideoCard;
 use adw::prelude::*;
 use gtk4::gdk;
@@ -50,6 +50,7 @@ pub struct ChannelPage {
     compact_search_entry: SearchEntry,
     filter_btn: Button,
     sort_btn: Button,
+    refresh_btn: Button,
     scrolled: ScrolledWindow,
     flow_box: FlowBox,
     status_box: GtkBox,
@@ -62,10 +63,12 @@ pub struct ChannelPage {
     is_loading: Cell<bool>,
     is_loading_more: Cell<bool>,
     request_seq: Cell<u64>,
+    reload_seq: Cell<u64>,
     date_filter: Cell<UploadDateFilter>,
     duration_filter: Cell<DurationFilter>,
     sort_order: Cell<ChannelSortOrder>,
     channel_details: RefCell<Option<ChannelDetails>>,
+    header_stats: RefCell<Option<ChannelHeaderStats>>,
     videos_list: RefCell<Vec<VideoSummary>>,
     shorts_list: RefCell<Vec<VideoSummary>>,
     videos_cursor: RefCell<Option<PageCursor>>,
@@ -190,6 +193,13 @@ impl ChannelPage {
         set_pointer(&sort_btn);
         toolbar_box.append(&sort_btn);
 
+        let refresh_btn = Button::new();
+        refresh_btn.set_child(Some(&make_icon(KalamIcon::Refresh, 16)));
+        refresh_btn.add_css_class("yr-chip");
+        refresh_btn.set_tooltip_text(Some("Refresh channel (Ctrl+R / F5)"));
+        set_pointer(&refresh_btn);
+        toolbar_box.append(&refresh_btn);
+
         set_pointer(&sub_btn);
         set_pointer(&tab_videos);
         set_pointer(&tab_shorts);
@@ -291,6 +301,7 @@ impl ChannelPage {
             compact_search_entry,
             filter_btn,
             sort_btn,
+            refresh_btn,
             scrolled,
             flow_box,
             status_box,
@@ -303,10 +314,12 @@ impl ChannelPage {
             is_loading: Cell::new(true),
             is_loading_more: Cell::new(false),
             request_seq: Cell::new(0),
+            reload_seq: Cell::new(0),
             date_filter: Cell::new(UploadDateFilter::AnyTime),
             duration_filter: Cell::new(DurationFilter::AnyLength),
             sort_order: Cell::new(ChannelSortOrder::Newest),
             channel_details: RefCell::new(None),
+            header_stats: RefCell::new(None),
             videos_list: RefCell::new(Vec::new()),
             shorts_list: RefCell::new(Vec::new()),
             videos_cursor: RefCell::new(None),
@@ -324,6 +337,13 @@ impl ChannelPage {
     }
 
     fn wire_signals(self: &Rc<Self>, root_box: &GtkBox) {
+        let weak_refresh = Rc::downgrade(self);
+        self.refresh_btn.connect_clicked(move |_| {
+            if let Some(cp) = weak_refresh.upgrade() {
+                cp.reload();
+            }
+        });
+
         // Enter key plays currently selected card
         let key_ctrl = EventControllerKey::new();
         let weak_key = Rc::downgrade(self);
@@ -1023,11 +1043,82 @@ impl ChannelPage {
         }
     }
 
-    pub fn set_channel_details(&self, details: ChannelDetails) {
-        self.name_label.set_text(&details.name);
-        self.page.set_title(&details.name);
-        self.avatar.set_text(Some(&details.name));
+    pub fn channel_id(&self) -> &str {
+        &self.channel_id
+    }
 
+    pub fn reload(self: &Rc<Self>) {
+        let seq = self.reload_seq.get().wrapping_add(1);
+        self.reload_seq.set(seq);
+        let req_seq = self.request_seq.get().wrapping_add(1);
+        self.request_seq.set(req_seq);
+
+        self.is_loading.set(true);
+        self.is_loading_more.set(false);
+        *self.search_results.borrow_mut() = None;
+        self.search_entry.set_text("");
+        self.compact_search_entry.set_text("");
+        self.sort_order.set(ChannelSortOrder::Newest);
+        self.sort_btn.set_label("Sort: Newest");
+        self.show_skeletons();
+
+        let (ch_tx, ch_rx) =
+            async_channel::bounded::<Result<(ChannelDetails, PagedVideos), String>>(1);
+        let (sh_tx, sh_rx) = async_channel::bounded::<
+            Result<(Option<ChannelHeaderStats>, PagedVideos), String>,
+        >(1);
+
+        let engine = self.engine.clone();
+        let cid = self.channel_id.clone();
+        self.runtime.spawn(async move {
+            let res = engine.channel_videos(&cid).await;
+            let _ = ch_tx.send(res).await;
+        });
+
+        let engine = self.engine.clone();
+        let cid2 = self.channel_id.clone();
+        self.runtime.spawn(async move {
+            let res = engine.channel_shorts_with_stats(&cid2, None).await;
+            let _ = sh_tx.send(res).await;
+        });
+
+        let cp_weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            if let Ok(res) = ch_rx.recv().await {
+                if let Some(cp) = cp_weak.upgrade() {
+                    if cp.reload_seq.get() != seq {
+                        return;
+                    }
+                    match res {
+                        Ok((details, paged)) => {
+                            cp.set_channel_details(details);
+                            cp.set_videos(paged);
+                        }
+                        Err(err) => {
+                            cp.set_load_error(&err);
+                        }
+                    }
+                }
+            }
+        });
+
+        let cp_weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            if let Ok(Ok((stats_opt, paged))) = sh_rx.recv().await {
+                if let Some(cp) = cp_weak.upgrade() {
+                    if cp.reload_seq.get() != seq {
+                        return;
+                    }
+                    if let Some(stats) = stats_opt {
+                        cp.apply_header_stats(stats);
+                    }
+                    cp.set_shorts(paged);
+                }
+            }
+        });
+    }
+
+    fn update_stats_label(&self, details: &ChannelDetails) {
         let stats_parts: Vec<&str> = [
             details.handle.as_str(),
             details.subscriber_count_text.as_str(),
@@ -1037,6 +1128,53 @@ impl ChannelPage {
         .filter(|s| !s.is_empty())
         .collect();
         self.stats_label.set_text(&stats_parts.join(" · "));
+    }
+
+    pub fn apply_header_stats(&self, stats: ChannelHeaderStats) {
+        if let Some(ref mut details) = *self.channel_details.borrow_mut() {
+            if let Some(ref h) = stats.handle {
+                if !h.is_empty() {
+                    details.handle = h.clone();
+                }
+            }
+            if let Some(ref subs) = stats.subscriber_count_text {
+                if !subs.is_empty() {
+                    details.subscriber_count_text = subs.clone();
+                }
+            }
+            if let Some(ref vids) = stats.video_count_text {
+                if !vids.is_empty() {
+                    details.video_count_text = vids.clone();
+                }
+            }
+            self.update_stats_label(details);
+        }
+        *self.header_stats.borrow_mut() = Some(stats);
+    }
+
+    pub fn set_channel_details(&self, mut details: ChannelDetails) {
+        if let Some(ref stats) = *self.header_stats.borrow() {
+            if let Some(ref h) = stats.handle {
+                if !h.is_empty() {
+                    details.handle = h.clone();
+                }
+            }
+            if let Some(ref subs) = stats.subscriber_count_text {
+                if !subs.is_empty() {
+                    details.subscriber_count_text = subs.clone();
+                }
+            }
+            if let Some(ref vids) = stats.video_count_text {
+                if !vids.is_empty() {
+                    details.video_count_text = vids.clone();
+                }
+            }
+        }
+
+        self.name_label.set_text(&details.name);
+        self.page.set_title(&details.name);
+        self.avatar.set_text(Some(&details.name));
+        self.update_stats_label(&details);
 
         if !details.avatar_url.is_empty() {
             self.actions
@@ -1053,6 +1191,18 @@ impl ChannelPage {
             });
         }
 
+        for short in self.shorts_list.borrow_mut().iter_mut() {
+            if short.channel_id.is_empty() {
+                short.channel_id = details.id.clone();
+            }
+            if short.channel_name.is_empty() {
+                short.channel_name = details.name.clone();
+            }
+            if short.channel_avatar_url.is_empty() {
+                short.channel_avatar_url = details.avatar_url.clone();
+            }
+        }
+
         *self.channel_details.borrow_mut() = Some(details);
     }
 
@@ -1065,7 +1215,20 @@ impl ChannelPage {
         }
     }
 
-    pub fn set_shorts(self: &Rc<Self>, paged: PagedVideos) {
+    pub fn set_shorts(self: &Rc<Self>, mut paged: PagedVideos) {
+        if let Some(ref details) = *self.channel_details.borrow() {
+            for short in &mut paged.items {
+                if short.channel_id.is_empty() {
+                    short.channel_id = details.id.clone();
+                }
+                if short.channel_name.is_empty() {
+                    short.channel_name = details.name.clone();
+                }
+                if short.channel_avatar_url.is_empty() {
+                    short.channel_avatar_url = details.avatar_url.clone();
+                }
+            }
+        }
         *self.shorts_list.borrow_mut() = paged.items;
         *self.shorts_cursor.borrow_mut() = paged.next;
         if self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none() {
@@ -1194,7 +1357,7 @@ impl ChannelPage {
             for (i, short) in items.iter().enumerate() {
                 let idx = start_offset + i;
                 let card = VideoCard::new_short(short);
-                self.actions.image_loader.load_into_picture(
+                self.actions.image_loader.load_into_short_picture(
                     &short.id,
                     &short.thumbnail_url,
                     &card.picture,

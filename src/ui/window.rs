@@ -4,8 +4,8 @@ use crate::backend::engine::{
 };
 use crate::backend::history::HistoryStore;
 use crate::backend::models::{
-    format_queue_total_duration, looks_like_youtube_url, ChannelDetails, DurationFilter,
-    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoSummary,
+    format_queue_total_duration, looks_like_youtube_url, DurationFilter, PlaylistSearchSummary,
+    SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoSummary,
 };
 use crate::backend::playlists::PlaylistStore;
 use crate::backend::search_history::SearchHistoryStore;
@@ -65,6 +65,7 @@ enum ActiveView {
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
     back_btn: Button,
+    refresh_btn: Button,
     pub search_entry: Entry,
     search_dropdown_clamp: adw::Clamp,
     search_suggest_box: GtkBox,
@@ -207,14 +208,21 @@ impl MainWindow {
         search_clamp.set_child(Some(&search_entry));
         header_bar.set_title_widget(Some(&search_clamp));
 
-        // Primary Menu Button at the top right
+        // Primary Menu + Refresh Buttons at the top right
         let menu_btn = MenuButton::new();
         menu_btn.set_child(Some(&make_icon(KalamIcon::Menu, 22)));
         menu_btn.set_tooltip_text(Some("Main menu"));
         menu_btn.add_css_class("yr-rail-btn");
         set_pointer(&menu_btn);
 
+        let refresh_btn = Button::new();
+        refresh_btn.set_child(Some(&make_icon(KalamIcon::Refresh, 19)));
+        refresh_btn.set_tooltip_text(Some("Refresh (Ctrl+R / F5)"));
+        refresh_btn.add_css_class("yr-rail-btn");
+        set_pointer(&refresh_btn);
+
         let menu = gio::Menu::new();
+        menu.append(Some("Refresh"), Some("app.refresh"));
         menu.append(Some("Playlists"), Some("app.playlists"));
         menu.append(Some("Watch Later"), Some("app.watch_later"));
         menu.append(Some("Preferences"), Some("app.settings"));
@@ -222,6 +230,7 @@ impl MainWindow {
         menu.append(Some("About youtube-rusty"), Some("app.about"));
         menu_btn.set_menu_model(Some(&menu));
         header_bar.pack_end(&menu_btn);
+        header_bar.pack_end(&refresh_btn);
 
         // Full-height Left Navigation Rail (68px)
         let rail = Rail::new();
@@ -533,9 +542,17 @@ impl MainWindow {
         nav_view.push(&home_page);
 
         let cache = Arc::new(Cache::new());
-        let runtime = Arc::new(Runtime::new().expect("Failed to initialize Tokio runtime"));
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .max_blocking_threads(2)
+                .thread_name("yr-worker")
+                .enable_all()
+                .build()
+                .expect("Failed to initialize Tokio runtime"),
+        );
         let engine = Arc::new(Engine::new(cache.root_dir()));
-        let image_loader = ImageLoader::new(cache, runtime.clone());
+        let image_loader = ImageLoader::new(cache, runtime.clone(), engine.http_client());
 
         let content_overlay = Overlay::new();
         content_overlay.set_hexpand(true);
@@ -619,6 +636,7 @@ impl MainWindow {
         let this = Rc::new(Self {
             window,
             back_btn,
+            refresh_btn,
             search_entry,
             search_dropdown_clamp,
             search_suggest_box,
@@ -840,6 +858,15 @@ impl MainWindow {
             }
         });
         app.add_action(&act_shortcuts);
+
+        let weak = Rc::downgrade(self);
+        let act_refresh = gio::SimpleAction::new("refresh", None);
+        act_refresh.connect_activate(move |_, _| {
+            if let Some(w) = weak.upgrade() {
+                w.reload_current_context();
+            }
+        });
+        app.add_action(&act_refresh);
 
         let weak = Rc::downgrade(self);
         let act_about = gio::SimpleAction::new("about", None);
@@ -1770,13 +1797,28 @@ impl MainWindow {
                 }
             });
 
-        // Window keyboard shortcuts: '/', 'Ctrl+F', 'Alt+Left', 'Esc', 'Enter' on selected card
+        let weak_refresh = Rc::downgrade(self);
+        self.refresh_btn.connect_clicked(move |_| {
+            if let Some(w) = weak_refresh.upgrade() {
+                w.reload_current_context();
+            }
+        });
+
+        // Window keyboard shortcuts: '/', 'Ctrl+F', 'Ctrl+R'/'F5', 'Alt+Left', 'Esc', 'Enter' on selected card
         let key_ctrl = EventControllerKey::new();
         let weak = Rc::downgrade(self);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             let Some(w) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+
+            if (mods.contains(gdk::ModifierType::CONTROL_MASK)
+                && (key == gdk::Key::r || key == gdk::Key::R))
+                || key == gdk::Key::F5
+            {
+                w.reload_current_context();
+                return glib::Propagation::Stop;
+            }
 
             if mods.contains(gdk::ModifierType::CONTROL_MASK)
                 && (key == gdk::Key::f || key == gdk::Key::F)
@@ -3083,52 +3125,49 @@ impl MainWindow {
 
         self.open_channels.borrow_mut().push(channel_page.clone());
         self.nav_view.push(&channel_page.page);
-
-        let (ch_tx, ch_rx) =
-            async_channel::bounded::<Result<(ChannelDetails, PagedVideos), String>>(1);
-        let (sh_tx, sh_rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
-
-        let engine = self.engine.clone();
-        let cid = channel_id.to_string();
-        self.runtime.spawn(async move {
-            let res = engine.channel_videos(&cid).await;
-            let _ = ch_tx.send(res).await;
-        });
-
-        let engine = self.engine.clone();
-        let cid2 = channel_id.to_string();
-        self.runtime.spawn(async move {
-            let res = engine.channel_shorts(&cid2, None).await;
-            let _ = sh_tx.send(res).await;
-        });
-
-        let cp_weak = Rc::downgrade(&channel_page);
-        glib::spawn_future_local(async move {
-            if let Ok(res) = ch_rx.recv().await {
-                if let Some(cp) = cp_weak.upgrade() {
-                    match res {
-                        Ok((details, paged)) => {
-                            cp.set_channel_details(details);
-                            cp.set_videos(paged);
-                        }
-                        Err(err) => {
-                            cp.set_load_error(&err);
-                        }
-                    }
-                }
-            }
-        });
-
-        let cp_weak = Rc::downgrade(&channel_page);
-        glib::spawn_future_local(async move {
-            if let Ok(Ok(paged)) = sh_rx.recv().await {
-                if let Some(cp) = cp_weak.upgrade() {
-                    cp.set_shorts(paged);
-                }
-            }
-        });
+        channel_page.reload();
 
         Some(channel_page)
+    }
+
+    pub fn reload_current_context(self: &Rc<Self>) {
+        if let Some(vis_tag) = self
+            .nav_view
+            .visible_page()
+            .and_then(|p| p.tag())
+            .map(|g| g.to_string())
+        {
+            if vis_tag != "home" {
+                let cp_opt = self
+                    .open_channels
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|cp| cp.channel_id() == vis_tag)
+                    .cloned();
+                if let Some(cp) = cp_opt {
+                    cp.reload();
+                    return;
+                }
+            }
+        }
+
+        let av = self.active_view.borrow().clone();
+        match av {
+            ActiveView::HomeTrending => self.load_trending(),
+            ActiveView::HomeCategory(cat) => self.search_category(&cat),
+            ActiveView::WatchLater => self.load_watch_later(),
+            ActiveView::Search(query) => self.search(&query),
+            ActiveView::Subscriptions => self.load_subscriptions(),
+            ActiveView::Playlists => self.load_playlists_overview(),
+            ActiveView::SavedPlaylistDetail(pid) => self.open_saved_playlist(&pid),
+            ActiveView::RemotePlaylist(pid) => self.open_remote_playlist(&pid),
+            ActiveView::History => self.load_history(),
+            ActiveView::Preferences => {
+                let current = self.settings_store.load();
+                self.sync_preferences_ui(&current);
+            }
+        }
     }
 
     fn next_request_id(&self) -> u64 {
@@ -4421,6 +4460,7 @@ impl MainWindow {
             ("Double-click / Enter", "Play video in MPV"),
             ("Right-click card", "Open video details & options"),
             ("/ or Ctrl + F", "Focus search bar"),
+            ("Ctrl + R or F5", "Refresh active feed or channel"),
             ("Alt + Left", "Go back"),
             ("Space", "Pause or resume Player Card"),
         ];

@@ -13,6 +13,7 @@ pub enum KalamIcon {
     Settings,
     Menu,
     PlayFilled,
+    Refresh,
 }
 
 pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
@@ -140,6 +141,15 @@ pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
                     cr.line_to(20.0, y);
                     let _ = cr.stroke();
                 }
+            }
+            KalamIcon::Refresh => {
+                setup_stroke(cr, w, h);
+                cr.arc(12.0, 12.0, 8.2, 0.16 * PI, 1.85 * PI);
+                let _ = cr.stroke();
+                cr.move_to(19.6, 4.0);
+                cr.line_to(19.6, 8.6);
+                cr.line_to(15.0, 8.6);
+                let _ = cr.stroke();
             }
         }
     });
