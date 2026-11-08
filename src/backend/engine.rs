@@ -71,12 +71,27 @@ fn append_cpn_param(url: &str, cpn: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorKind {
+    RustyPipe,
+    DirectChannelShorts,
+    DirectPlaylistVideos,
+    DirectSearch,
+    DirectChannelPlaylists,
+}
+
 #[derive(Clone, Debug)]
 pub struct PageCursor {
     pub ctoken: String,
     pub endpoint: ContinuationEndpoint,
     pub visitor_data: Option<String>,
-    pub is_direct_browse_ctoken: bool,
+    pub kind: CursorKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct PagedPlaylists {
+    pub items: Vec<PlaylistSearchSummary>,
+    pub next: Option<PageCursor>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -201,7 +216,7 @@ fn cursor_from_paginator<T>(p: &Paginator<T>) -> Option<PageCursor> {
         ctoken: ctoken.clone(),
         endpoint: p.endpoint,
         visitor_data: p.visitor_data.clone(),
-        is_direct_browse_ctoken: false,
+        kind: CursorKind::RustyPipe,
     })
 }
 
@@ -234,6 +249,10 @@ impl Engine {
 
     pub fn http_client(&self) -> reqwest::Client {
         self.http.clone()
+    }
+
+    pub async fn warm_startup(&self) {
+        let _ = self.ensure_visitor_data().await;
     }
 
     async fn ensure_visitor_data(&self) -> Option<String> {
@@ -397,29 +416,46 @@ impl Engine {
         pool: &CandidatePool,
         quality: Quality,
     ) -> Option<ResolvedPlayback> {
-        // 1. Try direct HTTP candidate (adaptive or progressive MP4)
-        if let Some(direct) = select_direct_playback(pool, quality) {
-            if self.verify_resolved_urls(&direct).await {
-                return Some(direct);
-            }
-            // If adaptive pair failed (e.g. 403 on adaptive), try progressive muxed MP4 before HLS
-            if direct.audio_url.is_some() {
-                if let Some(muxed_only) = select_muxed_fallback(pool, quality) {
-                    if self.verify_resolved_urls(&muxed_only).await {
-                        return Some(muxed_only);
+        let direct_opt = select_direct_playback(pool, quality);
+        let hls_opt = pool.hls_url.as_deref();
+
+        match (direct_opt, hls_opt) {
+            (Some(direct), Some(hls_master)) => {
+                let (direct_ok, hls_res) = tokio::join!(
+                    self.verify_resolved_urls(&direct),
+                    self.resolve_hls_playback(hls_master, pool, quality)
+                );
+                if direct_ok {
+                    return Some(direct);
+                }
+                if let Some(hls_play) = hls_res {
+                    return Some(hls_play);
+                }
+                if direct.audio_url.is_some() {
+                    if let Some(muxed_only) = select_muxed_fallback(pool, quality) {
+                        if self.verify_resolved_urls(&muxed_only).await {
+                            return Some(muxed_only);
+                        }
                     }
                 }
+                None
             }
-        }
-
-        // 2. Try Apple/YouTube HLS master manifest (`hlsManifestUrl`), picking exact target quality
-        if let Some(ref hls_master) = pool.hls_url {
-            if let Some(hls_play) = self.resolve_hls_playback(hls_master, pool, quality).await {
-                return Some(hls_play);
+            (Some(direct), None) => {
+                if self.verify_resolved_urls(&direct).await {
+                    return Some(direct);
+                }
+                if direct.audio_url.is_some() {
+                    if let Some(muxed_only) = select_muxed_fallback(pool, quality) {
+                        if self.verify_resolved_urls(&muxed_only).await {
+                            return Some(muxed_only);
+                        }
+                    }
+                }
+                None
             }
+            (None, Some(hls_master)) => self.resolve_hls_playback(hls_master, pool, quality).await,
+            (None, None) => None,
         }
-
-        None
     }
 
     async fn verify_resolved_urls(&self, play: &ResolvedPlayback) -> bool {
@@ -468,7 +504,7 @@ impl Engine {
         let mut req = self
             .http
             .get(url)
-            .timeout(Duration::from_secs(6))
+            .timeout(Duration::from_millis(3500))
             .header("User-Agent", ua)
             .header("Range", "bytes=0-1");
         if !referer.is_empty() {
@@ -484,7 +520,7 @@ impl Engine {
         let mut req = self
             .http
             .get(url)
-            .timeout(Duration::from_secs(6))
+            .timeout(Duration::from_millis(3500))
             .header("User-Agent", ua);
         if !referer.is_empty() {
             req = req.header("Referer", referer);
@@ -1038,6 +1074,13 @@ impl Engine {
 
         match tab {
             SearchTab::All => {
+                if is_default_filters {
+                    if let Ok(direct_all) = self.search_direct(query, Some("8AEB"), false).await {
+                        if !direct_all.items.is_empty() {
+                            return Ok(direct_all);
+                        }
+                    }
+                }
                 let paginator = if is_default_filters {
                     self.rp
                         .query()
@@ -1092,23 +1135,12 @@ impl Engine {
                 Ok(PagedSearchItems { items, next })
             }
             SearchTab::Playlists => {
-                let filter = SearchFilter::new()
-                    .item_type(ItemType::Playlist)
-                    .sort_opt(rp_sort);
-                let paginator = self
-                    .rp
-                    .query()
-                    .search_filter::<PlaylistItem, _>(query, &filter)
-                    .await
-                    .map_err(|e| format!("Playlist search error: {e}"))?
-                    .items;
-                let next = cursor_from_paginator(&paginator);
-                let items = paginator
-                    .items
-                    .into_iter()
-                    .map(|p| SearchItem::Playlist(map_playlist_item(p)))
-                    .collect();
-                Ok(PagedSearchItems { items, next })
+                let pl_params = match sort {
+                    SearchSortOrder::Relevance => "EgIQA_ABAQ%3D%3D",
+                    SearchSortOrder::UploadDate => "CAISAhAD8AEB",
+                    SearchSortOrder::ViewCount => "CAMSAhAD8AEB",
+                };
+                self.search_direct(query, Some(pl_params), true).await
             }
         }
     }
@@ -1118,6 +1150,12 @@ impl Engine {
         cursor: &PageCursor,
         tab: SearchTab,
     ) -> Result<PagedSearchItems, String> {
+        if cursor.kind == CursorKind::DirectSearch {
+            return self
+                .continue_search_direct(&cursor.ctoken, tab == SearchTab::Playlists)
+                .await;
+        }
+
         match tab {
             SearchTab::All => {
                 let paginator = self
@@ -1187,10 +1225,30 @@ impl Engine {
     }
 
     pub async fn fetch_playlist(&self, playlist_id: &str) -> Result<RemotePlaylist, String> {
+        let clean_id = playlist_id
+            .trim()
+            .strip_prefix("VL")
+            .unwrap_or_else(|| playlist_id.trim());
+        if clean_id.is_empty() {
+            return Err("Invalid playlist ID".to_string());
+        }
+
+        let browse_id = format!("VL{clean_id}");
+        if let Ok(val) = self
+            .fetch_channel_browse_json(&browse_id, Some("wgYCCAA%3D"), None)
+            .await
+        {
+            if let Some(parsed) = parse_playlist_browse_response(&val, clean_id) {
+                if !parsed.videos.is_empty() || !parsed.name.is_empty() {
+                    return Ok(parsed);
+                }
+            }
+        }
+
         let pl = self
             .rp
             .query()
-            .playlist(playlist_id)
+            .playlist(clean_id)
             .await
             .map_err(|e| format!("Could not load playlist: {e}"))?;
 
@@ -1218,6 +1276,110 @@ impl Engine {
             videos,
             next,
         })
+    }
+
+    pub async fn channel_playlists(
+        &self,
+        channel_id: &str,
+        fallback_channel_name: &str,
+    ) -> Result<PagedPlaylists, String> {
+        let val = self
+            .fetch_channel_browse_json(channel_id, Some("EglwbGF5bGlzdHPyBgQKAkIA"), None)
+            .await?;
+        Ok(parse_channel_playlists_browse_response(
+            &val,
+            fallback_channel_name,
+        ))
+    }
+
+    pub async fn continue_channel_playlists(
+        &self,
+        cursor: &PageCursor,
+        fallback_channel_name: &str,
+    ) -> Result<PagedPlaylists, String> {
+        let val = self
+            .fetch_channel_browse_json("", None, Some(&cursor.ctoken))
+            .await?;
+        Ok(parse_channel_playlists_browse_response(
+            &val,
+            fallback_channel_name,
+        ))
+    }
+
+    async fn search_direct(
+        &self,
+        query: &str,
+        params: Option<&str>,
+        playlists_only: bool,
+    ) -> Result<PagedSearchItems, String> {
+        let val = self.fetch_search_json(Some(query), params, None).await?;
+        Ok(parse_direct_search_response(&val, playlists_only))
+    }
+
+    async fn continue_search_direct(
+        &self,
+        ctoken: &str,
+        playlists_only: bool,
+    ) -> Result<PagedSearchItems, String> {
+        let val = self.fetch_search_json(None, None, Some(ctoken)).await?;
+        Ok(parse_direct_search_response(&val, playlists_only))
+    }
+
+    async fn fetch_search_json(
+        &self,
+        query: Option<&str>,
+        params: Option<&str>,
+        continuation: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "context".to_string(),
+            json!({
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20260728.01.00",
+                    "hl": "en",
+                    "gl": "US"
+                }
+            }),
+        );
+        if let Some(ctoken) = continuation {
+            body.insert("continuation".to_string(), Value::String(ctoken.to_string()));
+        } else {
+            if let Some(q) = query {
+                body.insert("query".to_string(), Value::String(q.to_string()));
+            }
+            if let Some(p) = params {
+                body.insert("params".to_string(), Value::String(p.to_string()));
+            }
+        }
+
+        let resp = self
+            .http
+            .post("https://www.youtube.com/youtubei/v1/search?prettyPrint=false")
+            .header("User-Agent", RP_DESKTOP_UA)
+            .header("Origin", "https://www.youtube.com")
+            .header("Referer", "https://www.youtube.com/")
+            .header("Content-Type", "application/json")
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| format!("Search network error: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Search HTTP {}", resp.status()));
+        }
+
+        resp.json::<Value>()
+            .await
+            .map_err(|e| format!("Search JSON error: {e}"))
+    }
+
+    async fn continue_playlist_videos_direct(&self, ctoken: &str) -> Result<PagedVideos, String> {
+        let val = self
+            .fetch_channel_browse_json("", None, Some(ctoken))
+            .await?;
+        Ok(parse_playlist_continuation_response(&val))
     }
 
     pub async fn resolve_youtube_url(&self, raw_url: &str) -> Result<ResolvedUrl, String> {
@@ -1426,10 +1588,16 @@ impl Engine {
         force_short: bool,
         filter_out_shorts: bool,
     ) -> Result<PagedVideos, String> {
-        if cursor.is_direct_browse_ctoken {
-            return self
-                .continue_channel_shorts_direct(&cursor.ctoken, fallback_details)
-                .await;
+        match cursor.kind {
+            CursorKind::DirectChannelShorts => {
+                return self
+                    .continue_channel_shorts_direct(&cursor.ctoken, fallback_details)
+                    .await;
+            }
+            CursorKind::DirectPlaylistVideos => {
+                return self.continue_playlist_videos_direct(&cursor.ctoken).await;
+            }
+            _ => {}
         }
 
         let paginator = self
@@ -3045,10 +3213,881 @@ fn parse_shorts_browse_response(
         ctoken: tok,
         endpoint: ContinuationEndpoint::Browse,
         visitor_data: None,
-        is_direct_browse_ctoken: true,
+        kind: CursorKind::DirectChannelShorts,
     });
 
     PagedVideos { items, next }
+}
+
+fn extract_yt_text(node: Option<&Value>) -> Option<String> {
+    let v = node?;
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(s) = v.get("simpleText").and_then(|x| x.as_str()) {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(s) = v.get("content").and_then(|x| x.as_str()) {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(runs) = v.get("runs").and_then(|x| x.as_array()) {
+        let joined: String = runs
+            .iter()
+            .filter_map(|r| r.get("text").and_then(|x| x.as_str()))
+            .collect();
+        let t = joined.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+fn parse_mmss_to_seconds(txt: &str) -> Option<u64> {
+    let parts: Vec<&str> = txt.trim().split(':').collect();
+    match parts.len() {
+        2 => {
+            let m: u64 = parts[0].trim().parse().ok()?;
+            let s: u64 = parts[1].trim().parse().ok()?;
+            Some(m * 60 + s)
+        }
+        3 => {
+            let h: u64 = parts[0].trim().parse().ok()?;
+            let m: u64 = parts[1].trim().parse().ok()?;
+            let s: u64 = parts[2].trim().parse().ok()?;
+            Some(h * 3600 + m * 60 + s)
+        }
+        _ => None,
+    }
+}
+
+fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoSummary> {
+    if pvr.get("isPlayable").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+    let vid = pvr
+        .get("videoId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let title = extract_yt_text(pvr.get("title")).unwrap_or_else(|| "Untitled video".to_string());
+
+    let channel_name = extract_yt_text(pvr.get("shortBylineText")).unwrap_or_default();
+    let channel_id = pvr
+        .pointer("/shortBylineText/runs/0/navigationEndpoint/browseEndpoint/browseId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let duration_seconds = pvr
+        .get("lengthSeconds")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .or_else(|| {
+            extract_yt_text(pvr.get("lengthText")).and_then(|s| parse_mmss_to_seconds(&s))
+        });
+    let duration_text = extract_yt_text(pvr.get("lengthText"))
+        .or_else(|| duration_seconds.map(format_duration))
+        .unwrap_or_default();
+
+    let mut view_count_text = String::new();
+    let mut published_text = String::new();
+    if let Some(runs) = pvr.pointer("/videoInfo/runs").and_then(|v| v.as_array()) {
+        for r in runs {
+            if let Some(t) = r.get("text").and_then(|v| v.as_str()).map(str::trim) {
+                if t.is_empty() || t == "•" || t == "·" {
+                    continue;
+                }
+                let lower = t.to_ascii_lowercase();
+                if lower.contains("view") || lower.contains("watching") {
+                    view_count_text = t.to_string();
+                } else if lower.contains("ago") || lower.contains("streamed") {
+                    published_text = t.to_string();
+                }
+            }
+        }
+    }
+    let view_count = parse_compact_count_str(&view_count_text);
+
+    let thumbnail_url = pick_json_sources_url(
+        pvr.pointer("/thumbnail/thumbnails")
+            .and_then(|v| v.as_array()),
+        320,
+    )
+    .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+
+    let is_short = pvr
+        .pointer("/navigationEndpoint/reelWatchEndpoint")
+        .is_some()
+        || duration_text.eq_ignore_ascii_case("SHORTS");
+
+    Some(VideoSummary {
+        id: vid.to_string(),
+        title,
+        channel_id,
+        channel_name,
+        channel_avatar_url: String::new(),
+        duration_seconds,
+        duration_text,
+        view_count_text,
+        view_count,
+        published_text,
+        published_unix: None,
+        is_short,
+        thumbnail_url,
+        description_snippet: String::new(),
+    })
+}
+
+fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
+    let vid = vr
+        .get("videoId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let title = extract_yt_text(vr.get("title")).unwrap_or_else(|| "Untitled video".to_string());
+    let byline = vr
+        .get("ownerText")
+        .or_else(|| vr.get("longBylineText"))
+        .or_else(|| vr.get("shortBylineText"));
+    let channel_name = extract_yt_text(byline).unwrap_or_default();
+    let channel_id = byline
+        .and_then(|b| b.pointer("/runs/0/navigationEndpoint/browseEndpoint/browseId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let channel_avatar_url = pick_json_sources_url(
+        vr.pointer("/channelThumbnailSupportedRenderers/channelThumbnailWithLinkRenderer/thumbnail/thumbnails")
+            .and_then(|v| v.as_array()),
+        64,
+    )
+    .unwrap_or_default();
+
+    let mut duration_text = extract_yt_text(vr.get("lengthText")).unwrap_or_default();
+    let mut is_short = vr
+        .pointer("/navigationEndpoint/reelWatchEndpoint")
+        .is_some();
+    if let Some(overlays) = vr.get("thumbnailOverlays").and_then(|v| v.as_array()) {
+        for ov in overlays {
+            if let Some(tr) = ov.get("thumbnailOverlayTimeStatusRenderer") {
+                if duration_text.is_empty() {
+                    if let Some(t) = extract_yt_text(tr.get("text")) {
+                        duration_text = t;
+                    }
+                }
+                if tr
+                    .get("style")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("SHORTS"))
+                    .unwrap_or(false)
+                {
+                    is_short = true;
+                }
+            }
+        }
+    }
+    let duration_seconds = parse_mmss_to_seconds(&duration_text);
+    let view_count_text = extract_yt_text(vr.get("shortViewCountText"))
+        .or_else(|| extract_yt_text(vr.get("viewCountText")))
+        .unwrap_or_default();
+    let view_count = parse_compact_count_str(&view_count_text);
+    let published_text = extract_yt_text(vr.get("publishedTimeText")).unwrap_or_default();
+    let description_snippet = vr
+        .pointer("/detailedMetadataSnippets/0/snippetText")
+        .and_then(|v| extract_yt_text(Some(v)))
+        .or_else(|| extract_yt_text(vr.get("descriptionSnippet")))
+        .unwrap_or_default();
+
+    let thumbnail_url = pick_json_sources_url(
+        vr.pointer("/thumbnail/thumbnails")
+            .and_then(|v| v.as_array()),
+        320,
+    )
+    .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+
+    Some(VideoSummary {
+        id: vid.to_string(),
+        title,
+        channel_id,
+        channel_name,
+        channel_avatar_url,
+        duration_seconds,
+        duration_text,
+        view_count_text,
+        view_count,
+        published_text,
+        published_unix: None,
+        is_short,
+        thumbnail_url,
+        description_snippet,
+    })
+}
+
+fn parse_channel_renderer_json(cr: &Value) -> Option<ChannelSearchSummary> {
+    let cid = cr
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let name = extract_yt_text(cr.get("title")).unwrap_or_else(|| "Channel".to_string());
+    let sub_txt = extract_yt_text(cr.get("videoCountText")).unwrap_or_default();
+    let real_sub_txt = extract_yt_text(cr.get("subscriberCountText")).unwrap_or_default();
+
+    let (handle, subscriber_count_text) = if sub_txt.starts_with('@') {
+        (sub_txt, real_sub_txt)
+    } else if real_sub_txt.starts_with('@') {
+        (real_sub_txt, sub_txt)
+    } else {
+        let h = cr
+            .pointer("/navigationEndpoint/browseEndpoint/canonicalBaseUrl")
+            .and_then(|v| v.as_str())
+            .and_then(|u| u.strip_prefix('/'))
+            .filter(|s| s.starts_with('@'))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("@{}", name.to_lowercase().replace(' ', "")));
+        let subs = if !real_sub_txt.is_empty() {
+            real_sub_txt
+        } else {
+            sub_txt
+        };
+        (h, subs)
+    };
+
+    let description = extract_yt_text(cr.get("descriptionSnippet")).unwrap_or_default();
+    let avatar_url = pick_json_sources_url(
+        cr.pointer("/thumbnail/thumbnails")
+            .and_then(|v| v.as_array()),
+        64,
+    )
+    .unwrap_or_default();
+
+    Some(ChannelSearchSummary {
+        id: cid.to_string(),
+        name,
+        handle,
+        subscriber_count_text,
+        description,
+        avatar_url,
+    })
+}
+
+fn parse_playlist_renderer_json(
+    pr: &Value,
+    fallback_channel_name: &str,
+) -> Option<PlaylistSearchSummary> {
+    let pid = pr
+        .get("playlistId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let name = extract_yt_text(pr.get("title")).unwrap_or_else(|| "Playlist".to_string());
+    let channel_name = extract_yt_text(pr.get("shortBylineText"))
+        .or_else(|| extract_yt_text(pr.get("longBylineText")))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback_channel_name.to_string());
+
+    let video_count_text = extract_yt_text(pr.get("videoCountText"))
+        .or_else(|| extract_yt_text(pr.get("videoCountShortText")))
+        .map(|s| {
+            if s.to_ascii_lowercase().contains("video") {
+                s
+            } else {
+                format!("{s} videos")
+            }
+        })
+        .or_else(|| {
+            pr.get("videoCount")
+                .and_then(|v| v.as_str().or_else(|| None))
+                .map(|s| format!("{s} videos"))
+        })
+        .unwrap_or_else(|| "Playlist".to_string());
+
+    let thumbnail_url = pick_json_sources_url(
+        pr.pointer("/thumbnails/0/thumbnails")
+            .or_else(|| pr.pointer("/thumbnail/thumbnails"))
+            .and_then(|v| v.as_array()),
+        320,
+    )
+    .unwrap_or_default();
+
+    Some(PlaylistSearchSummary {
+        id: pid.to_string(),
+        name,
+        channel_name,
+        video_count_text,
+        thumbnail_url,
+    })
+}
+
+fn parse_playlist_lockup_json(
+    lockup: &Value,
+    fallback_channel_name: &str,
+) -> Option<PlaylistSearchSummary> {
+    let content_type = lockup
+        .get("contentType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cid = lockup
+        .get("contentId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+
+    let is_playlist_type = content_type == "LOCKUP_CONTENT_TYPE_PLAYLIST"
+        || content_type == "LOCKUP_CONTENT_TYPE_PODCAST"
+        || content_type == "LOCKUP_CONTENT_TYPE_ALBUM"
+        || (content_type.is_empty()
+            && (cid.starts_with("PL")
+                || cid.starts_with("OL")
+                || cid.starts_with("UU")
+                || cid.starts_with("FL")
+                || cid.starts_with("RD")));
+    if !is_playlist_type {
+        return None;
+    }
+    // Skip infinite auto-generated Radio Mixes ("RD...") that cannot be browsed as normal playlists
+    if cid.starts_with("RD") {
+        return None;
+    }
+
+    let name = lockup
+        .pointer("/metadata/lockupMetadataViewModel/title/content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Playlist")
+        .to_string();
+
+    let mut channel_name = String::new();
+    if let Some(rows) = lockup
+        .pointer("/metadata/lockupMetadataViewModel/metadata/contentMetadataViewModel/metadataRows")
+        .and_then(|v| v.as_array())
+    {
+        for row in rows {
+            if let Some(parts) = row.get("metadataParts").and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(txt) = part
+                        .pointer("/text/content")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let lower = txt.to_ascii_lowercase();
+                        if lower != "playlist"
+                            && lower != "podcast"
+                            && lower != "course"
+                            && !lower.starts_with("updated ")
+                            && !lower.contains("full playlist")
+                            && !lower.contains("view full")
+                        {
+                            channel_name = txt.strip_prefix("by ").unwrap_or(txt).trim().to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+            if !channel_name.is_empty() {
+                break;
+            }
+        }
+    }
+    if channel_name.is_empty() && !fallback_channel_name.is_empty() {
+        channel_name = fallback_channel_name.to_string();
+    }
+
+    let thumb_vm = lockup
+        .pointer("/contentImage/collectionThumbnailViewModel/primaryThumbnail/thumbnailViewModel")
+        .or_else(|| lockup.pointer("/contentImage/thumbnailViewModel"));
+
+    let thumbnail_url = thumb_vm
+        .and_then(|tvm| {
+            pick_json_sources_url(tvm.pointer("/image/sources").and_then(|v| v.as_array()), 320)
+        })
+        .unwrap_or_default();
+
+    let mut video_count_text = String::new();
+    if let Some(overlays) = thumb_vm
+        .and_then(|tvm| tvm.get("overlays"))
+        .and_then(|v| v.as_array())
+    {
+        for ov in overlays {
+            if let Some(badges) = ov
+                .pointer("/thumbnailOverlayBadgeViewModel/thumbnailBadges")
+                .and_then(|v| v.as_array())
+            {
+                for b in badges {
+                    if let Some(t) = b
+                        .pointer("/thumbnailBadgeViewModel/text")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        video_count_text = t.to_string();
+                        break;
+                    }
+                }
+            }
+            if !video_count_text.is_empty() {
+                break;
+            }
+        }
+    }
+    if video_count_text.is_empty() {
+        video_count_text = "Playlist".to_string();
+    }
+
+    Some(PlaylistSearchSummary {
+        id: cid.to_string(),
+        name,
+        channel_name,
+        video_count_text,
+        thumbnail_url,
+    })
+}
+
+fn collect_playlist_tracks_recursive(
+    node: &Value,
+    out_videos: &mut Vec<VideoSummary>,
+    seen_ids: &mut HashSet<String>,
+    out_ctoken: &mut Option<String>,
+) {
+    match node {
+        Value::Array(arr) => {
+            for item in arr {
+                collect_playlist_tracks_recursive(item, out_videos, seen_ids, out_ctoken);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(pvr) = map.get("playlistVideoRenderer") {
+                if let Some(v) = parse_playlist_video_renderer(pvr) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_videos.push(v);
+                    }
+                }
+                return;
+            }
+            if let Some(cont) = map.get("continuationItemRenderer") {
+                if let Some(tok) = extract_continuation_token_from_renderer(cont) {
+                    *out_ctoken = Some(tok);
+                }
+                return;
+            }
+            for (k, v) in map {
+                // Avoid descending into unrelated watch-next / sidebar recommendations
+                if k == "secondaryResults" || k == "playerOverlays" || k == "header" {
+                    continue;
+                }
+                collect_playlist_tracks_recursive(v, out_videos, seen_ids, out_ctoken);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_playlist_browse_response(val: &Value, playlist_id: &str) -> Option<RemotePlaylist> {
+    let mut videos = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ctoken = None;
+
+    if let Some(contents) = val.get("contents") {
+        collect_playlist_tracks_recursive(contents, &mut videos, &mut seen, &mut ctoken);
+    }
+    if let Some(actions) = val.get("onResponseReceivedActions") {
+        collect_playlist_tracks_recursive(actions, &mut videos, &mut seen, &mut ctoken);
+    }
+
+    let name = val
+        .pointer("/header/pageHeaderRenderer/content/pageHeaderViewModel/title/dynamicTextViewModel/text/content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            val.pointer("/header/pageHeaderRenderer/pageTitle")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| extract_yt_text(val.pointer("/header/playlistHeaderRenderer/title")))
+        .or_else(|| {
+            extract_yt_text(val.pointer(
+                "/sidebar/playlistSidebarRenderer/items/0/playlistSidebarPrimaryInfoRenderer/title",
+            ))
+        })
+        .or_else(|| {
+            val.pointer("/microformat/microformatDataRenderer/title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+
+    if name.is_empty() && videos.is_empty() {
+        return None;
+    }
+
+    let mut channel_name = String::new();
+    let mut video_count_text = String::new();
+
+    if let Some(rows) = val
+        .pointer("/header/pageHeaderRenderer/content/pageHeaderViewModel/metadata/contentMetadataViewModel/metadataRows")
+        .and_then(|v| v.as_array())
+    {
+        for row in rows {
+            if let Some(parts) = row.get("metadataParts").and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(av_txt) = part
+                        .pointer("/avatarStack/avatarStackViewModel/text/content")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if channel_name.is_empty() {
+                            channel_name = av_txt
+                                .strip_prefix("by ")
+                                .unwrap_or(av_txt)
+                                .trim()
+                                .to_string();
+                        }
+                    }
+                    if let Some(txt) = part
+                        .pointer("/text/content")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let lower = txt.to_ascii_lowercase();
+                        if video_count_text.is_empty()
+                            && (lower.contains("video")
+                                || lower.contains("song")
+                                || lower.contains("track"))
+                        {
+                            video_count_text = txt.to_string();
+                        } else if channel_name.is_empty()
+                            && !lower.contains("view")
+                            && !lower.contains("playlist")
+                            && !lower.contains("updated")
+                        {
+                            channel_name = txt
+                                .strip_prefix("by ")
+                                .unwrap_or(txt)
+                                .trim()
+                                .to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if channel_name.is_empty() {
+        channel_name = extract_yt_text(val.pointer("/header/playlistHeaderRenderer/ownerText"))
+            .or_else(|| {
+                extract_yt_text(val.pointer(
+                    "/sidebar/playlistSidebarRenderer/items/1/playlistSidebarSecondaryInfoRenderer/videoOwner/videoOwnerRenderer/title",
+                ))
+            })
+            .or_else(|| {
+                videos
+                    .first()
+                    .map(|v| v.channel_name.clone())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+    }
+
+    if video_count_text.is_empty() {
+        video_count_text =
+            extract_yt_text(val.pointer("/header/playlistHeaderRenderer/numVideosText"))
+                .or_else(|| {
+                    extract_yt_text(val.pointer(
+                        "/sidebar/playlistSidebarRenderer/items/0/playlistSidebarPrimaryInfoRenderer/stats/0",
+                    ))
+                })
+                .unwrap_or_else(|| format!("{} videos", videos.len()));
+    }
+
+    let next = ctoken.map(|tok| PageCursor {
+        ctoken: tok,
+        endpoint: ContinuationEndpoint::Browse,
+        visitor_data: None,
+        kind: CursorKind::DirectPlaylistVideos,
+    });
+
+    Some(RemotePlaylist {
+        id: playlist_id.to_string(),
+        name: if name.is_empty() {
+            "Playlist".to_string()
+        } else {
+            name
+        },
+        channel_name,
+        video_count_text,
+        videos,
+        next,
+    })
+}
+
+fn parse_playlist_continuation_response(val: &Value) -> PagedVideos {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ctoken = None;
+    if let Some(actions) = val.get("onResponseReceivedActions") {
+        collect_playlist_tracks_recursive(actions, &mut items, &mut seen, &mut ctoken);
+    }
+    let next = ctoken.map(|tok| PageCursor {
+        ctoken: tok,
+        endpoint: ContinuationEndpoint::Browse,
+        visitor_data: None,
+        kind: CursorKind::DirectPlaylistVideos,
+    });
+    PagedVideos { items, next }
+}
+
+fn collect_channel_playlists_recursive(
+    node: &Value,
+    fallback_channel_name: &str,
+    out: &mut Vec<PlaylistSearchSummary>,
+    seen: &mut HashSet<String>,
+    out_ctoken: &mut Option<String>,
+) {
+    match node {
+        Value::Array(arr) => {
+            for it in arr {
+                collect_channel_playlists_recursive(it, fallback_channel_name, out, seen, out_ctoken);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(lockup) = map.get("lockupViewModel") {
+                if let Some(pl) = parse_playlist_lockup_json(lockup, fallback_channel_name) {
+                    if seen.insert(pl.id.clone()) {
+                        out.push(pl);
+                    }
+                }
+                return;
+            }
+            for key in ["playlistRenderer", "gridPlaylistRenderer", "compactPlaylistRenderer"] {
+                if let Some(pr) = map.get(key) {
+                    if let Some(pl) = parse_playlist_renderer_json(pr, fallback_channel_name) {
+                        if seen.insert(pl.id.clone()) {
+                            out.push(pl);
+                        }
+                    }
+                    return;
+                }
+            }
+            if let Some(cont) = map.get("continuationItemRenderer") {
+                if let Some(tok) = extract_continuation_token_from_renderer(cont) {
+                    *out_ctoken = Some(tok);
+                }
+                return;
+            }
+            for (k, v) in map {
+                if k == "header" || k == "topbar" || k == "microformat" {
+                    continue;
+                }
+                collect_channel_playlists_recursive(v, fallback_channel_name, out, seen, out_ctoken);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_channel_playlists_browse_response(
+    val: &Value,
+    fallback_channel_name: &str,
+) -> PagedPlaylists {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ctoken = None;
+
+    if let Some(tabs) = val
+        .pointer("/contents/twoColumnBrowseResultsRenderer/tabs")
+        .and_then(|v| v.as_array())
+    {
+        if let Some(pl_tab) = tabs
+            .iter()
+            .filter_map(|t| t.get("tabRenderer"))
+            .find(|tr| {
+                tr.pointer("/endpoint/commandMetadata/webCommandMetadata/url")
+                    .and_then(|v| v.as_str())
+                    .map(|u| u.ends_with("/playlists"))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                tabs.iter()
+                    .filter_map(|t| t.get("tabRenderer"))
+                    .find(|tr| tr.get("selected").and_then(|v| v.as_bool()) == Some(true))
+            })
+        {
+            if let Some(content) = pl_tab.get("content") {
+                collect_channel_playlists_recursive(
+                    content,
+                    fallback_channel_name,
+                    &mut items,
+                    &mut seen,
+                    &mut ctoken,
+                );
+            }
+        }
+    }
+
+    if let Some(actions) = val.get("onResponseReceivedActions") {
+        collect_channel_playlists_recursive(
+            actions,
+            fallback_channel_name,
+            &mut items,
+            &mut seen,
+            &mut ctoken,
+        );
+    }
+
+    let next = ctoken.map(|tok| PageCursor {
+        ctoken: tok,
+        endpoint: ContinuationEndpoint::Browse,
+        visitor_data: None,
+        kind: CursorKind::DirectChannelPlaylists,
+    });
+
+    PagedPlaylists { items, next }
+}
+
+fn collect_search_entries_from_array(
+    arr: &[Value],
+    playlists_only: bool,
+    out_items: &mut Vec<SearchItem>,
+    seen_keys: &mut HashSet<String>,
+    out_ctoken: &mut Option<String>,
+) {
+    for entry in arr {
+        if let Some(sub) = entry
+            .pointer("/itemSectionRenderer/contents")
+            .and_then(|v| v.as_array())
+        {
+            collect_search_entries_from_array(
+                sub,
+                playlists_only,
+                out_items,
+                seen_keys,
+                out_ctoken,
+            );
+            continue;
+        }
+        if let Some(cont) = entry.get("continuationItemRenderer") {
+            if let Some(tok) = extract_continuation_token_from_renderer(cont) {
+                *out_ctoken = Some(tok);
+            }
+            continue;
+        }
+
+        let inner = entry
+            .pointer("/richItemRenderer/content")
+            .unwrap_or(entry);
+
+        if let Some(lockup) = inner.get("lockupViewModel") {
+            if let Some(pl) = parse_playlist_lockup_json(lockup, "") {
+                if seen_keys.insert(format!("pl:{}", pl.id)) {
+                    out_items.push(SearchItem::Playlist(pl));
+                }
+                continue;
+            }
+        }
+
+        if let Some(pr) = inner
+            .get("playlistRenderer")
+            .or_else(|| inner.get("compactPlaylistRenderer"))
+        {
+            if let Some(pl) = parse_playlist_renderer_json(pr, "") {
+                if seen_keys.insert(format!("pl:{}", pl.id)) {
+                    out_items.push(SearchItem::Playlist(pl));
+                }
+                continue;
+            }
+        }
+
+        if playlists_only {
+            continue;
+        }
+
+        if let Some(vr) = inner.get("videoRenderer") {
+            if let Some(v) = parse_video_renderer_json(vr) {
+                if seen_keys.insert(format!("vid:{}", v.id)) {
+                    out_items.push(SearchItem::Video(v));
+                }
+            }
+        } else if let Some(cr) = inner.get("channelRenderer") {
+            if let Some(c) = parse_channel_renderer_json(cr) {
+                if seen_keys.insert(format!("ch:{}", c.id)) {
+                    out_items.push(SearchItem::Channel(c));
+                }
+            }
+        } else if let Some(shelf_items) = inner
+            .pointer("/shelfRenderer/content/verticalListRenderer/items")
+            .and_then(|v| v.as_array())
+        {
+            collect_search_entries_from_array(
+                shelf_items,
+                playlists_only,
+                out_items,
+                seen_keys,
+                out_ctoken,
+            );
+        }
+    }
+}
+
+fn parse_direct_search_response(val: &Value, playlists_only: bool) -> PagedSearchItems {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ctoken = None;
+
+    if let Some(sections) = val
+        .pointer("/contents/twoColumnSearchResultsRenderer/primaryContents/sectionListRenderer/contents")
+        .and_then(|v| v.as_array())
+    {
+        collect_search_entries_from_array(
+            sections,
+            playlists_only,
+            &mut items,
+            &mut seen,
+            &mut ctoken,
+        );
+    }
+
+    for key in ["onResponseReceivedCommands", "onResponseReceivedActions"] {
+        if let Some(cmds) = val.get(key).and_then(|v| v.as_array()) {
+            for cmd in cmds {
+                if let Some(arr) = cmd
+                    .pointer("/appendContinuationItemsAction/continuationItems")
+                    .and_then(|v| v.as_array())
+                {
+                    collect_search_entries_from_array(
+                        arr,
+                        playlists_only,
+                        &mut items,
+                        &mut seen,
+                        &mut ctoken,
+                    );
+                }
+            }
+        }
+    }
+
+    let next = ctoken.map(|tok| PageCursor {
+        ctoken: tok,
+        endpoint: ContinuationEndpoint::Search,
+        visitor_data: None,
+        kind: CursorKind::DirectSearch,
+    });
+
+    PagedSearchItems { items, next }
 }
 
 fn map_youtube_item(item: YouTubeItem) -> SearchItem {
@@ -3399,8 +4438,169 @@ https://manifest.example/v1080_video.m3u8
             Some("NEXT_SHORTS_TOKEN")
         );
         assert_eq!(
-            paged.next.as_ref().map(|c| c.is_direct_browse_ctoken),
-            Some(true)
+            paged.next.as_ref().map(|c| c.kind),
+            Some(CursorKind::DirectChannelShorts)
+        );
+    }
+
+    #[test]
+    fn test_playlist_lockup_and_browse_parsing() {
+        let lockup = serde_json::json!({
+            "contentId": "PL1234567890ABCDEF",
+            "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+            "contentImage": {
+                "collectionThumbnailViewModel": {
+                    "primaryThumbnail": {
+                        "thumbnailViewModel": {
+                            "image": {
+                                "sources": [
+                                    { "url": "https://i.ytimg.com/vi/v1/mqdefault.jpg", "width": 320, "height": 180 }
+                                ]
+                            },
+                            "overlays": [
+                                {
+                                    "thumbnailOverlayBadgeViewModel": {
+                                        "thumbnailBadges": [
+                                            { "thumbnailBadgeViewModel": { "text": "24 videos" } }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "metadata": {
+                "lockupMetadataViewModel": {
+                    "title": { "content": "Rust Systems Programming" },
+                    "metadata": {
+                        "contentMetadataViewModel": {
+                            "metadataRows": [
+                                {
+                                    "metadataParts": [
+                                        { "text": { "content": "Jon Gjengset" } },
+                                        { "text": { "content": "Playlist" } }
+                                    ]
+                                },
+                                {}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let pl_card = parse_playlist_lockup_json(&lockup, "").unwrap();
+        assert_eq!(pl_card.id, "PL1234567890ABCDEF");
+        assert_eq!(pl_card.name, "Rust Systems Programming");
+        assert_eq!(pl_card.channel_name, "Jon Gjengset");
+        assert_eq!(pl_card.video_count_text, "24 videos");
+
+        let browse = serde_json::json!({
+            "header": {
+                "pageHeaderRenderer": {
+                    "content": {
+                        "pageHeaderViewModel": {
+                            "title": {
+                                "dynamicTextViewModel": {
+                                    "text": { "content": "Rust Systems Programming" }
+                                }
+                            },
+                            "metadata": {
+                                "contentMetadataViewModel": {
+                                    "metadataRows": [
+                                        {
+                                            "metadataParts": [
+                                                {
+                                                    "avatarStack": {
+                                                        "avatarStackViewModel": {
+                                                            "text": { "content": "by Jon Gjengset" }
+                                                        }
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "metadataParts": [
+                                                { "text": { "content": "Playlist" } },
+                                                { "text": { "content": "24 videos" } }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [
+                        {
+                            "tabRenderer": {
+                                "selected": true,
+                                "content": {
+                                    "sectionListRenderer": {
+                                        "contents": [
+                                            {
+                                                "itemSectionRenderer": {
+                                                    "contents": [
+                                                        {
+                                                            "playlistVideoListRenderer": {
+                                                                "contents": [
+                                                                    {
+                                                                        "playlistVideoRenderer": {
+                                                                            "videoId": "vid_crust_01",
+                                                                            "title": { "runs": [{ "text": "Crust of Rust: Lifetime Annotations" }] },
+                                                                            "shortBylineText": { "runs": [{ "text": "Jon Gjengset" }] },
+                                                                            "lengthSeconds": "5412",
+                                                                            "lengthText": { "simpleText": "1:30:12" },
+                                                                            "thumbnail": {
+                                                                                "thumbnails": [
+                                                                                    { "url": "https://i.ytimg.com/vi/vid_crust_01/mqdefault.jpg", "width": 320, "height": 180 }
+                                                                                ]
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    {
+                                                                        "continuationItemRenderer": {
+                                                                            "continuationEndpoint": {
+                                                                                "continuationCommand": {
+                                                                                    "token": "PL_NEXT_PAGE"
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                ]
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let remote = parse_playlist_browse_response(&browse, "PL1234567890ABCDEF").unwrap();
+        assert_eq!(remote.name, "Rust Systems Programming");
+        assert_eq!(remote.channel_name, "Jon Gjengset");
+        assert_eq!(remote.video_count_text, "24 videos");
+        assert_eq!(remote.videos.len(), 1);
+        assert_eq!(remote.videos[0].id, "vid_crust_01");
+        assert_eq!(remote.videos[0].duration_seconds, Some(5412));
+        assert_eq!(
+            remote.next.as_ref().map(|c| c.ctoken.as_str()),
+            Some("PL_NEXT_PAGE")
+        );
+        assert_eq!(
+            remote.next.as_ref().map(|c| c.kind),
+            Some(CursorKind::DirectPlaylistVideos)
         );
     }
 }

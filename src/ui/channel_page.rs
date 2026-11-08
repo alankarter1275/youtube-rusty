@@ -1,12 +1,14 @@
-use crate::backend::engine::{ChannelHeaderStats, Engine, PageCursor, PagedVideos};
+use crate::backend::engine::{
+    ChannelHeaderStats, Engine, PageCursor, PagedPlaylists, PagedVideos,
+};
 use crate::backend::models::{
-    matches_local_filters, ChannelDetails, ChannelSortOrder, DurationFilter, UploadDateFilter,
-    VideoSummary,
+    matches_local_filters, ChannelDetails, ChannelSortOrder, DurationFilter,
+    PlaylistSearchSummary, UploadDateFilter, VideoSummary,
 };
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
 use crate::ui::details_sheet::{CardActions, DetailsSheet};
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
-use crate::ui::video_card::VideoCard;
+use crate::ui::video_card::{ListCardLayout, PlaylistResultCard, VideoCard};
 use adw::prelude::*;
 use gtk4::gdk;
 use gtk4::glib;
@@ -20,10 +22,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+pub type ShortsPlayHandler =
+    Rc<dyn Fn(Vec<VideoSummary>, usize, Option<(PageCursor, Option<ChannelDetails>)>)>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChannelTab {
     Videos,
     Shorts,
+    Playlists,
 }
 
 pub struct ChannelPage {
@@ -35,7 +41,8 @@ pub struct ChannelPage {
     engine: Arc<Engine>,
     runtime: Arc<Runtime>,
     store: Arc<SubscriptionStore>,
-    on_play_shorts_queue: Rc<dyn Fn(Vec<VideoSummary>, usize)>,
+    on_play_shorts_queue: ShortsPlayHandler,
+    on_open_playlist: Rc<dyn Fn(String)>,
     avatar: adw::Avatar,
     name_label: Label,
     stats_label: Label,
@@ -45,6 +52,7 @@ pub struct ChannelPage {
     compact_search_box: GtkBox,
     tab_videos: ToggleButton,
     tab_shorts: ToggleButton,
+    tab_playlists: ToggleButton,
     play_all_btn: Button,
     search_entry: SearchEntry,
     compact_search_entry: SearchEntry,
@@ -62,6 +70,7 @@ pub struct ChannelPage {
     shorts_cols: Cell<u32>,
     is_loading: Cell<bool>,
     is_loading_more: Cell<bool>,
+    playlists_loaded: Cell<bool>,
     request_seq: Cell<u64>,
     reload_seq: Cell<u64>,
     date_filter: Cell<UploadDateFilter>,
@@ -71,8 +80,10 @@ pub struct ChannelPage {
     header_stats: RefCell<Option<ChannelHeaderStats>>,
     videos_list: RefCell<Vec<VideoSummary>>,
     shorts_list: RefCell<Vec<VideoSummary>>,
+    playlists_list: RefCell<Vec<PlaylistSearchSummary>>,
     videos_cursor: RefCell<Option<PageCursor>>,
     shorts_cursor: RefCell<Option<PageCursor>>,
+    playlists_cursor: RefCell<Option<PageCursor>>,
     search_results: RefCell<Option<Vec<VideoSummary>>>,
     selected_box: RefCell<Option<GtkBox>>,
     selected_play_cb: RefCell<Option<Rc<dyn Fn()>>>,
@@ -88,7 +99,8 @@ impl ChannelPage {
         engine: Arc<Engine>,
         runtime: Arc<Runtime>,
         store: Arc<SubscriptionStore>,
-        on_play_shorts_queue: Rc<dyn Fn(Vec<VideoSummary>, usize)>,
+        on_play_shorts_queue: ShortsPlayHandler,
+        on_open_playlist: Rc<dyn Fn(String)>,
         narrow: bool,
         compact: bool,
         grid_cols: u32,
@@ -157,8 +169,13 @@ impl ChannelPage {
         tab_shorts.add_css_class("yr-chip");
         tab_shorts.set_group(Some(&tab_videos));
 
+        let tab_playlists = ToggleButton::with_label("Playlists");
+        tab_playlists.add_css_class("yr-chip");
+        tab_playlists.set_group(Some(&tab_videos));
+
         seg_box.append(&tab_videos);
         seg_box.append(&tab_shorts);
+        seg_box.append(&tab_playlists);
         toolbar_box.append(&seg_box);
 
         let play_all_btn = Button::builder()
@@ -203,6 +220,7 @@ impl ChannelPage {
         set_pointer(&sub_btn);
         set_pointer(&tab_videos);
         set_pointer(&tab_shorts);
+        set_pointer(&tab_playlists);
         set_pointer(&play_all_btn);
 
         root_box.append(&toolbar_box);
@@ -287,6 +305,7 @@ impl ChannelPage {
             runtime,
             store,
             on_play_shorts_queue,
+            on_open_playlist,
             avatar,
             name_label,
             stats_label,
@@ -296,6 +315,7 @@ impl ChannelPage {
             compact_search_box,
             tab_videos,
             tab_shorts,
+            tab_playlists,
             play_all_btn,
             search_entry,
             compact_search_entry,
@@ -313,6 +333,7 @@ impl ChannelPage {
             shorts_cols: Cell::new(shorts_cols),
             is_loading: Cell::new(true),
             is_loading_more: Cell::new(false),
+            playlists_loaded: Cell::new(false),
             request_seq: Cell::new(0),
             reload_seq: Cell::new(0),
             date_filter: Cell::new(UploadDateFilter::AnyTime),
@@ -322,8 +343,10 @@ impl ChannelPage {
             header_stats: RefCell::new(None),
             videos_list: RefCell::new(Vec::new()),
             shorts_list: RefCell::new(Vec::new()),
+            playlists_list: RefCell::new(Vec::new()),
             videos_cursor: RefCell::new(None),
             shorts_cursor: RefCell::new(None),
+            playlists_cursor: RefCell::new(None),
             search_results: RefCell::new(None),
             selected_box: RefCell::new(None),
             selected_play_cb: RefCell::new(None),
@@ -391,6 +414,8 @@ impl ChannelPage {
                 if let Some(cp) = weak.upgrade() {
                     cp.active_tab.set(ChannelTab::Videos);
                     cp.play_all_btn.set_visible(false);
+                    cp.filter_btn.set_visible(true);
+                    cp.sort_btn.set_visible(true);
                     cp.update_grid_columns();
                     cp.scrolled.vadjustment().set_value(0.0);
                     if cp.sort_order.get() != ChannelSortOrder::Newest
@@ -411,6 +436,8 @@ impl ChannelPage {
                 if let Some(cp) = weak.upgrade() {
                     cp.active_tab.set(ChannelTab::Shorts);
                     cp.play_all_btn.set_visible(true);
+                    cp.filter_btn.set_visible(true);
+                    cp.sort_btn.set_visible(true);
                     cp.update_grid_columns();
                     cp.scrolled.vadjustment().set_value(0.0);
                     if cp.sort_order.get() != ChannelSortOrder::Newest
@@ -424,7 +451,27 @@ impl ChannelPage {
             }
         });
 
-        // Play all Shorts button
+        // Tab switching: Playlists
+        let weak = Rc::downgrade(self);
+        self.tab_playlists.connect_toggled(move |btn| {
+            if btn.is_active() {
+                if let Some(cp) = weak.upgrade() {
+                    cp.active_tab.set(ChannelTab::Playlists);
+                    cp.play_all_btn.set_visible(false);
+                    cp.filter_btn.set_visible(false);
+                    cp.sort_btn.set_visible(false);
+                    cp.update_grid_columns();
+                    cp.scrolled.vadjustment().set_value(0.0);
+                    if !cp.playlists_loaded.get() {
+                        cp.fetch_playlists_tab();
+                    } else {
+                        cp.render_active_tab();
+                    }
+                }
+            }
+        });
+
+        // Play all Shorts button (passes continuation cursor so remaining Shorts auto-load seamlessly)
         let weak = Rc::downgrade(self);
         self.play_all_btn.connect_clicked(move |_| {
             if let Some(cp) = weak.upgrade() {
@@ -432,7 +479,8 @@ impl ChannelPage {
                 if items.is_empty() {
                     (cp.actions.on_toast)("No Shorts available to play".to_string());
                 } else {
-                    (cp.on_play_shorts_queue)(items, 0);
+                    let cont = cp.shorts_continuation_payload();
+                    (cp.on_play_shorts_queue)(items, 0, cont);
                 }
             }
         });
@@ -885,6 +933,65 @@ impl ChannelPage {
         });
     }
 
+    fn shorts_continuation_payload(&self) -> Option<(PageCursor, Option<ChannelDetails>)> {
+        if self.search_results.borrow().is_some()
+            || self.date_filter.get() != UploadDateFilter::AnyTime
+            || self.duration_filter.get() != DurationFilter::AnyLength
+        {
+            return None;
+        }
+        self.shorts_cursor
+            .borrow()
+            .clone()
+            .map(|c| (c, self.channel_details.borrow().clone()))
+    }
+
+    fn fetch_playlists_tab(self: &Rc<Self>) {
+        let req_id = self.next_request_id();
+        self.is_loading.set(true);
+        self.show_skeletons();
+
+        let cid = self.channel_id.clone();
+        let fallback_name = self
+            .channel_details
+            .borrow()
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| self.initial_name.clone());
+        let engine = self.engine.clone();
+        let (tx, rx) = async_channel::bounded::<Result<PagedPlaylists, String>>(1);
+
+        self.runtime.spawn(async move {
+            let res = engine.channel_playlists(&cid, &fallback_name).await;
+            let _ = tx.send(res).await;
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(res) = rx.recv().await else {
+                return;
+            };
+            let Some(cp) = weak.upgrade() else {
+                return;
+            };
+            if cp.request_seq.get() != req_id {
+                return;
+            }
+            cp.is_loading.set(false);
+            cp.playlists_loaded.set(true);
+            match res {
+                Ok(paged) => {
+                    *cp.playlists_list.borrow_mut() = paged.items;
+                    *cp.playlists_cursor.borrow_mut() = paged.next;
+                    cp.render_active_tab();
+                }
+                Err(err) => {
+                    cp.show_status("Could not load channel playlists", &err);
+                }
+            }
+        });
+    }
+
     fn load_more_active_tab(self: &Rc<Self>) {
         if self.is_loading.get()
             || self.is_loading_more.get()
@@ -892,6 +999,47 @@ impl ChannelPage {
         {
             return;
         }
+
+        if self.active_tab.get() == ChannelTab::Playlists {
+            let Some(cursor) = self.playlists_cursor.borrow().clone() else {
+                return;
+            };
+            self.is_loading_more.set(true);
+            let fallback_name = self
+                .channel_details
+                .borrow()
+                .as_ref()
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| self.initial_name.clone());
+            let engine = self.engine.clone();
+            let (tx, rx) = async_channel::bounded::<Result<PagedPlaylists, String>>(1);
+            self.runtime.spawn(async move {
+                let res = engine
+                    .continue_channel_playlists(&cursor, &fallback_name)
+                    .await;
+                let _ = tx.send(res).await;
+            });
+
+            let weak = Rc::downgrade(self);
+            glib::spawn_future_local(async move {
+                let Ok(res) = rx.recv().await else {
+                    return;
+                };
+                let Some(cp) = weak.upgrade() else {
+                    return;
+                };
+                cp.is_loading_more.set(false);
+                if let Ok(paged) = res {
+                    cp.playlists_list.borrow_mut().extend(paged.items.clone());
+                    *cp.playlists_cursor.borrow_mut() = paged.next;
+                    if cp.active_tab.get() == ChannelTab::Playlists {
+                        cp.append_playlists_to_flow(&paged.items);
+                    }
+                }
+            });
+            return;
+        }
+
         let is_shorts = self.active_tab.get() == ChannelTab::Shorts;
         let cursor_opt = if is_shorts {
             self.shorts_cursor.borrow().clone()
@@ -1026,9 +1174,16 @@ impl ChannelPage {
     }
 
     fn update_grid_columns(&self) {
+        if self.active_tab.get() == ChannelTab::Playlists && self.search_results.borrow().is_none() {
+            self.flow_box.set_homogeneous(false);
+            self.flow_box.set_min_children_per_line(1);
+            self.flow_box.set_max_children_per_line(1);
+            self.flow_box.set_column_spacing(0);
+            return;
+        }
         self.flow_box.set_homogeneous(true);
         match self.active_tab.get() {
-            ChannelTab::Videos => {
+            ChannelTab::Videos | ChannelTab::Playlists => {
                 let cols = self.grid_cols.get();
                 self.flow_box.set_min_children_per_line(cols);
                 self.flow_box.set_max_children_per_line(cols);
@@ -1055,12 +1210,17 @@ impl ChannelPage {
 
         self.is_loading.set(true);
         self.is_loading_more.set(false);
+        self.playlists_loaded.set(false);
         *self.search_results.borrow_mut() = None;
         self.search_entry.set_text("");
         self.compact_search_entry.set_text("");
         self.sort_order.set(ChannelSortOrder::Newest);
         self.sort_btn.set_label("Sort: Newest");
         self.show_skeletons();
+
+        if self.active_tab.get() == ChannelTab::Playlists {
+            self.fetch_playlists_tab();
+        }
 
         let (ch_tx, ch_rx) =
             async_channel::bounded::<Result<(ChannelDetails, PagedVideos), String>>(1);
@@ -1295,7 +1455,7 @@ impl ChannelPage {
             v
         } else {
             match self.active_tab.get() {
-                ChannelTab::Videos => self.videos_list.borrow().clone(),
+                ChannelTab::Videos | ChannelTab::Playlists => self.videos_list.borrow().clone(),
                 ChannelTab::Shorts => self.shorts_list.borrow().clone(),
             }
         };
@@ -1317,6 +1477,20 @@ impl ChannelPage {
             self.flow_box.remove(&child);
         }
 
+        if self.active_tab.get() == ChannelTab::Playlists && self.search_results.borrow().is_none()
+        {
+            let pls = self.playlists_list.borrow().clone();
+            if pls.is_empty() {
+                self.show_status("Nothing here yet", "This channel has no public playlists.");
+                return;
+            }
+            self.status_box.set_visible(false);
+            self.flow_box.set_visible(true);
+            self.update_grid_columns();
+            self.append_playlists_to_flow(&pls);
+            return;
+        }
+
         let items = self.filtered_active_items();
         if items.is_empty() {
             let has_filter = self.date_filter.get() != UploadDateFilter::AnyTime
@@ -1331,6 +1505,7 @@ impl ChannelPage {
                 let label = match self.active_tab.get() {
                     ChannelTab::Videos => "This channel has no videos yet.",
                     ChannelTab::Shorts => "This channel has no Shorts yet.",
+                    ChannelTab::Playlists => "This channel has no public playlists.",
                 };
                 self.show_status("Nothing here yet", label);
             }
@@ -1345,6 +1520,95 @@ impl ChannelPage {
             self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none();
 
         self.append_items_to_flow(&items, is_shorts_tab, 0);
+    }
+
+    fn append_playlists_to_flow(self: &Rc<Self>, pls: &[PlaylistSearchSummary]) {
+        let layout = if self.is_narrow.get() {
+            ListCardLayout::Stacked
+        } else if self.is_compact.get() {
+            ListCardLayout::Compact
+        } else {
+            ListCardLayout::Wide
+        };
+
+        for pl in pls {
+            let initially_saved = self
+                .actions
+                .playlist_store
+                .find_by_source_id(&pl.id)
+                .is_some();
+            let pid_open = pl.id.clone();
+            let open_cb = self.on_open_playlist.clone();
+            let open_action: Rc<dyn Fn()> = Rc::new(move || open_cb(pid_open.clone()));
+
+            let cp_sel = Rc::downgrade(self);
+            let enter_cb = open_action.clone();
+            let open_dbl = open_action.clone();
+
+            let pid_save = pl.id.clone();
+            let pname_save = pl.name.clone();
+            let pchan_save = pl.channel_name.clone();
+            let cp_save = Rc::downgrade(self);
+
+            let card = PlaylistResultCard::new(
+                pl,
+                layout,
+                initially_saved,
+                move |hl| {
+                    if let Some(cp) = cp_sel.upgrade() {
+                        cp.select_card_box(hl, enter_cb.clone());
+                    }
+                },
+                move || open_dbl(),
+                move || {
+                    let Some(cp) = cp_save.upgrade() else {
+                        return;
+                    };
+                    if cp
+                        .actions
+                        .playlist_store
+                        .find_by_source_id(&pid_save)
+                        .is_some()
+                    {
+                        (cp.actions.on_toast)("Playlist already saved".to_string());
+                        return;
+                    }
+                    let engine = cp.engine.clone();
+                    let pid = pid_save.clone();
+                    let pname = pname_save.clone();
+                    let pchan = pchan_save.clone();
+                    let pstore = cp.actions.playlist_store.clone();
+                    let on_toast = cp.actions.on_toast.clone();
+                    let on_pl_changed = cp.actions.on_playlists_changed.clone();
+                    let (tx, rx) = async_channel::bounded::<
+                        Result<crate::backend::engine::RemotePlaylist, String>,
+                    >(1);
+                    cp.runtime.spawn(async move {
+                        let res = engine.fetch_playlist(&pid).await;
+                        let _ = tx.send(res).await;
+                    });
+                    glib::spawn_future_local(async move {
+                        if let Ok(Ok(remote)) = rx.recv().await {
+                            pstore.create_with_videos(
+                                &pname,
+                                remote.videos,
+                                Some(pid),
+                                &pchan,
+                            );
+                            on_pl_changed();
+                            on_toast(format!("Saved playlist “{pname}”"));
+                        }
+                    });
+                },
+            );
+
+            self.actions.image_loader.load_into_picture(
+                &format!("pl_{}", pl.id),
+                &pl.thumbnail_url,
+                &card.picture,
+            );
+            self.flow_box.append(&card.container);
+        }
     }
 
     fn append_items_to_flow(
@@ -1368,7 +1632,8 @@ impl ChannelPage {
                     if let Some(cp) = cp_weak_play.upgrade() {
                         let current_all = cp.filtered_active_items();
                         if !current_all.is_empty() {
-                            (cp.on_play_shorts_queue)(current_all, idx);
+                            let cont = cp.shorts_continuation_payload();
+                            (cp.on_play_shorts_queue)(current_all, idx, cont);
                         }
                     }
                 });

@@ -4,8 +4,8 @@ use crate::backend::engine::{
 };
 use crate::backend::history::HistoryStore;
 use crate::backend::models::{
-    format_queue_total_duration, looks_like_youtube_url, DurationFilter, PlaylistSearchSummary,
-    SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoSummary,
+    format_queue_total_duration, looks_like_youtube_url, ChannelDetails, DurationFilter,
+    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoSummary,
 };
 use crate::backend::playlists::PlaylistStore;
 use crate::backend::search_history::SearchHistoryStore;
@@ -14,7 +14,7 @@ use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
 use crate::backend::watch_later::WatchLaterStore;
 use crate::player::mpv::{Quality, ResolvedPlayback};
 use crate::player::mpv_ipc::{MpvEvent, MpvSession};
-use crate::ui::channel_page::ChannelPage;
+use crate::ui::channel_page::{ChannelPage, ShortsPlayHandler};
 use crate::ui::details_sheet::{CardActions, DetailsSheet};
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::image_loader::ImageLoader;
@@ -46,6 +46,13 @@ static PLAYLIST_SHUFFLE_SEED: AtomicU64 = AtomicU64::new(1);
 pub enum ViewMode {
     Grid,
     SearchList,
+}
+
+#[derive(Clone)]
+pub struct QueueContinuation {
+    pub cursor: PageCursor,
+    pub fallback_details: Option<ChannelDetails>,
+    pub is_shorts: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -134,6 +141,12 @@ pub struct MainWindow {
     mpv_player_cmd: RefCell<String>,
     mpv_became_active: Cell<bool>,
     playback_seq: Cell<u64>,
+    lookahead_gen: Cell<u64>,
+    mpv_base_index: Cell<usize>,
+    mpv_pushed_end: Cell<usize>,
+    lookahead_running: Cell<bool>,
+    queue_continuation: RefCell<Option<QueueContinuation>>,
+    queue_cont_fetching: Cell<bool>,
     playback_quality: Cell<Quality>,
     pub mpv_pos: Cell<f64>,
     pub mpv_duration: Cell<f64>,
@@ -528,6 +541,7 @@ impl MainWindow {
             .child(&content_v_box)
             .vexpand(true)
             .hexpand(true)
+            .focusable(true)
             .build();
         content_scrolled.add_css_class("yr-no-scrollbar");
 
@@ -705,6 +719,12 @@ impl MainWindow {
             mpv_player_cmd: RefCell::new(initial_settings.external_player.clone()),
             mpv_became_active: Cell::new(false),
             playback_seq: Cell::new(0),
+            lookahead_gen: Cell::new(0),
+            mpv_base_index: Cell::new(0),
+            mpv_pushed_end: Cell::new(0),
+            lookahead_running: Cell::new(false),
+            queue_continuation: RefCell::new(None),
+            queue_cont_fetching: Cell::new(false),
             playback_quality: Cell::new(initial_quality),
             mpv_pos: Cell::new(0.0),
             mpv_duration: Cell::new(0.0),
@@ -750,7 +770,20 @@ impl MainWindow {
         this.setup_search_suggestions_bar();
         this.setup_playlist_popovers();
         this.setup_events(&clear_hist_btn);
+        this.defocus_search_bar();
         this.load_trending();
+
+        // Warm YouTube session visitor_data + background idle MPV socket shortly after window paint
+        let weak_warm = Rc::downgrade(&this);
+        glib::timeout_add_local_once(Duration::from_millis(450), move || {
+            if let Some(w) = weak_warm.upgrade() {
+                let eng = w.engine.clone();
+                w.runtime.spawn(async move {
+                    eng.warm_startup().await;
+                });
+                let _ = w.ensure_mpv_session();
+            }
+        });
 
         this
     }
@@ -1102,7 +1135,14 @@ impl MainWindow {
         self.back_btn.set_visible(on_subpage || can_pop_view);
     }
 
+    fn defocus_search_bar(&self) {
+        self.hide_search_dropdown();
+        self.search_entry.select_region(0, 0);
+        gtk4::prelude::GtkWindowExt::set_focus(&self.window, Some(&self.content_scrolled));
+    }
+
     fn go_back(self: &Rc<Self>) {
+        self.defocus_search_bar();
         let on_subpage = self
             .nav_view
             .visible_page()
@@ -1111,6 +1151,7 @@ impl MainWindow {
             .unwrap_or(false);
         if on_subpage {
             self.nav_view.pop();
+            self.defocus_search_bar();
             return;
         }
         let av = self.active_view.borrow().clone();
@@ -1128,6 +1169,7 @@ impl MainWindow {
             }
             _ => {}
         }
+        self.defocus_search_bar();
     }
 
     fn restore_previous_non_search_view(self: &Rc<Self>) {
@@ -1216,27 +1258,40 @@ impl MainWindow {
         });
         self.search_entry.add_controller(focus_ctrl);
 
-        // Dismiss the in-window dropdown cleanly when clicking anywhere outside on the content view
+        // Unfocus the search bar and dismiss suggestions whenever clicking anywhere outside it
         let outside_click = GestureClick::new();
         outside_click.set_propagation_phase(PropagationPhase::Capture);
         let weak_out = Rc::downgrade(self);
-        outside_click.connect_pressed(move |_, _, _, _| {
-            if let Some(w) = weak_out.upgrade() {
-                if w.search_dropdown_clamp.is_visible() {
-                    w.hide_search_dropdown();
-                    let in_search = gtk4::prelude::GtkWindowExt::focus(&w.window)
-                        .map(|f| {
-                            f.is_ancestor(&w.search_entry)
-                                || &f == w.search_entry.upcast_ref::<gtk4::Widget>()
-                        })
-                        .unwrap_or(false);
-                    if in_search {
-                        gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
+        outside_click.connect_pressed(move |_, _, x, y| {
+            let Some(w) = weak_out.upgrade() else {
+                return;
+            };
+            let pt = gtk4::graphene::Point::new(x as f32, y as f32);
+            if let Some(bounds) = w.search_entry.compute_bounds(&w.toast_overlay) {
+                if bounds.contains_point(&pt) {
+                    return;
+                }
+            }
+            if w.search_dropdown_clamp.is_visible() {
+                if let Some(bounds) = w.search_dropdown_clamp.compute_bounds(&w.toast_overlay) {
+                    if bounds.contains_point(&pt) {
+                        return;
                     }
                 }
             }
+
+            let in_search = gtk4::prelude::GtkWindowExt::focus(&w.window)
+                .map(|f| {
+                    f.is_ancestor(&w.search_entry)
+                        || &f == w.search_entry.upcast_ref::<gtk4::Widget>()
+                })
+                .unwrap_or(false);
+
+            if w.search_dropdown_clamp.is_visible() || in_search {
+                w.defocus_search_bar();
+            }
         });
-        self.nav_view.add_controller(outside_click);
+        self.toast_overlay.add_controller(outside_click);
 
         // Up / Down / Escape keyboard navigation inside Search Entry
         let key_ctrl = EventControllerKey::new();
@@ -1266,7 +1321,7 @@ impl MainWindow {
                         w.hide_search_dropdown();
                         return glib::Propagation::Stop;
                     }
-                    gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
+                    w.defocus_search_bar();
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -1874,8 +1929,7 @@ impl MainWindow {
                     })
                     .unwrap_or(false);
                 if search_focused || w.search_dropdown_clamp.is_visible() {
-                    w.hide_search_dropdown();
-                    gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
+                    w.defocus_search_bar();
                     return glib::Propagation::Stop;
                 }
             }
@@ -1897,6 +1951,7 @@ impl MainWindow {
             let Some(w) = weak.upgrade() else {
                 return;
             };
+            w.defocus_search_bar();
             let is_home = nv
                 .visible_page()
                 .and_then(|p| p.tag())
@@ -1915,6 +1970,7 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.nav_view.connect_popped(move |_, popped_page| {
             if let Some(w) = weak.upgrade() {
+                w.defocus_search_bar();
                 w.open_channels
                     .borrow_mut()
                     .retain(|cp| &cp.page != popped_page);
@@ -1937,9 +1993,8 @@ impl MainWindow {
         self.search_entry.connect_activate(move |entry| {
             let query = entry.text().trim().to_string();
             if let Some(w) = weak.upgrade() {
-                w.hide_search_dropdown();
+                w.defocus_search_bar();
                 if !query.is_empty() {
-                    gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     w.submit_search_or_url(&query);
                 }
             }
@@ -2008,7 +2063,8 @@ impl MainWindow {
                         .add_toast(adw::Toast::new("This playlist has no videos yet"));
                 } else {
                     let q = Quality::from_setting(&w.settings_store.load().default_quality);
-                    w.play_queue_from(vids, 0, q, false);
+                    let cont = w.remote_playlist_queue_continuation();
+                    w.play_queue_from_with_continuation(vids, 0, q, false, cont);
                 }
             }
         });
@@ -2240,7 +2296,8 @@ impl MainWindow {
         self.player_card.connect_next(move || {
             if let Some(w) = weak.upgrade() {
                 if w.player_card.advance_next().is_some() {
-                    w.play_current_queue_track();
+                    let target = w.player_card.current_idx();
+                    w.jump_or_reload_queue_index(target);
                 } else {
                     w.toast_overlay
                         .add_toast(adw::Toast::new("End of queue"));
@@ -2252,7 +2309,8 @@ impl MainWindow {
         self.player_card.connect_prev(move || {
             if let Some(w) = weak.upgrade() {
                 if w.player_card.advance_prev().is_some() {
-                    w.play_current_queue_track();
+                    let target = w.player_card.current_idx();
+                    w.jump_or_reload_queue_index(target);
                 }
             }
         });
@@ -2261,7 +2319,14 @@ impl MainWindow {
         self.player_card.connect_jump_to(move |idx| {
             if let Some(w) = weak.upgrade() {
                 w.player_card.set_current_index(idx);
-                w.play_current_queue_track();
+                w.jump_or_reload_queue_index(idx);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.player_card.connect_queue_mutated(move || {
+            if let Some(w) = weak.upgrade() {
+                w.resync_mpv_upcoming_queue();
             }
         });
 
@@ -2280,7 +2345,7 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.player_card.connect_empty_stop(move || {
             if let Some(w) = weak.upgrade() {
-                w.next_playback_seq();
+                w.reset_mpv_queue_tracking();
                 w.player_card.set_loading(false);
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
                     session.stop();
@@ -2298,7 +2363,7 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.player_card.connect_clear(move || {
             if let Some(w) = weak.upgrade() {
-                w.next_playback_seq();
+                w.reset_mpv_queue_tracking();
                 w.player_card.set_loading(false);
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
                     session.stop();
@@ -2310,7 +2375,7 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.player_card.connect_close(move || {
             if let Some(w) = weak.upgrade() {
-                w.next_playback_seq();
+                w.reset_mpv_queue_tracking();
                 w.player_card.set_loading(false);
                 if let Some(session) = w.mpv_session.borrow().as_ref() {
                     session.stop();
@@ -2853,11 +2918,44 @@ impl MainWindow {
         next
     }
 
+    fn bump_lookahead_gen(&self) -> u64 {
+        let next = self.lookahead_gen.get().wrapping_add(1);
+        self.lookahead_gen.set(next);
+        next
+    }
+
+    fn reset_mpv_queue_tracking(&self) {
+        self.next_playback_seq();
+        self.bump_lookahead_gen();
+        self.mpv_base_index.set(0);
+        self.mpv_pushed_end.set(0);
+        self.lookahead_running.set(false);
+        *self.queue_continuation.borrow_mut() = None;
+        self.queue_cont_fetching.set(false);
+    }
+
+    fn remote_playlist_queue_continuation(&self) -> Option<QueueContinuation> {
+        if matches!(*self.active_view.borrow(), ActiveView::RemotePlaylist(_)) {
+            self.feed_cursor.borrow().clone().map(|cursor| QueueContinuation {
+                cursor,
+                fallback_details: None,
+                is_shorts: false,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn play_video(self: &Rc<Self>, summary: VideoSummary, quality: Quality) {
         self.play_queue_from(vec![summary], 0, quality, false);
     }
 
-    pub fn play_shorts_queue(self: &Rc<Self>, shorts: Vec<VideoSummary>, start_index: usize) {
+    pub fn play_shorts_queue(
+        self: &Rc<Self>,
+        shorts: Vec<VideoSummary>,
+        start_index: usize,
+        continuation: Option<(PageCursor, Option<ChannelDetails>)>,
+    ) {
         if shorts.is_empty() {
             return;
         }
@@ -2866,7 +2964,12 @@ impl MainWindow {
         if quality == Quality::AudioOnly {
             quality = Quality::P360;
         }
-        self.play_queue_from(shorts, start_index, quality, true);
+        let cont = continuation.map(|(cursor, fallback_details)| QueueContinuation {
+            cursor,
+            fallback_details,
+            is_shorts: true,
+        });
+        self.play_queue_from_with_continuation(shorts, start_index, quality, true, cont);
     }
 
     pub fn play_queue_from(
@@ -2876,20 +2979,88 @@ impl MainWindow {
         quality: Quality,
         shorts_mode: bool,
     ) {
+        self.play_queue_from_with_continuation(items, start_index, quality, shorts_mode, None);
+    }
+
+    pub fn play_queue_from_with_continuation(
+        self: &Rc<Self>,
+        items: Vec<VideoSummary>,
+        start_index: usize,
+        quality: Quality,
+        shorts_mode: bool,
+        continuation: Option<QueueContinuation>,
+    ) {
         if items.is_empty() {
             return;
         }
         let clamped_start = start_index.min(items.len() - 1);
         self.playback_quality.set(quality);
+        *self.queue_continuation.borrow_mut() = continuation;
+        self.queue_cont_fetching.set(false);
         self.player_card.set_queue(items, clamped_start, shorts_mode);
-        self.play_current_queue_track();
+        self.start_mpv_from_current_index();
     }
 
-    fn play_current_queue_track(self: &Rc<Self>) {
+    fn jump_or_reload_queue_index(self: &Rc<Self>, target_idx: usize) {
+        let base = self.mpv_base_index.get();
+        let pushed_end = self.mpv_pushed_end.get();
+        if pushed_end > base && target_idx >= base && target_idx < pushed_end {
+            if let Some(session) = self.mpv_session.borrow().as_ref() {
+                if session.is_alive() {
+                    let mpv_slot = target_idx - base;
+                    self.mpv_pos.set(0.0);
+                    if let Some(cur) = self.player_card.current_video() {
+                        self.mpv_duration
+                            .set(cur.duration_seconds.unwrap_or(0) as f64);
+                        if self.settings_store.load().save_history {
+                            self.history_store.add(cur);
+                        }
+                    }
+                    self.player_card.set_playing(true);
+                    session.set_playlist_pos(mpv_slot);
+                    self.pump_queue_continuation();
+                    self.pump_queue_lookahead();
+                    return;
+                }
+            }
+        }
+        self.start_mpv_from_current_index();
+    }
+
+    fn resync_mpv_upcoming_queue(self: &Rc<Self>) {
+        let pushed_end = self.mpv_pushed_end.get();
+        let base = self.mpv_base_index.get();
+        if pushed_end <= base || self.player_card.is_empty() {
+            return;
+        }
+        let Some(session) = self.mpv_session.borrow().clone() else {
+            return;
+        };
+        if !session.is_alive() {
+            return;
+        }
+
+        let cur_idx = self.player_card.current_idx();
+        self.bump_lookahead_gen();
+        self.lookahead_running.set(false);
+        session.clear_upcoming_except_current();
+        self.mpv_base_index.set(cur_idx);
+        self.mpv_pushed_end.set(cur_idx + 1);
+        self.pump_queue_continuation();
+        self.pump_queue_lookahead();
+    }
+
+    fn start_mpv_from_current_index(self: &Rc<Self>) {
         let Some(cur) = self.player_card.current_video() else {
             return;
         };
+        let cur_idx = self.player_card.current_idx();
         let seq = self.next_playback_seq();
+        self.bump_lookahead_gen();
+        self.mpv_base_index.set(cur_idx);
+        self.mpv_pushed_end.set(cur_idx);
+        self.lookahead_running.set(false);
+
         let quality = self.playback_quality.get();
         let session = self.ensure_mpv_session();
 
@@ -2935,11 +3106,156 @@ impl MainWindow {
                         }
                     }
                     session.play_resolved(&resolved, &title);
+                    w.mpv_pushed_end.set(cur_idx + 1);
+                    w.pump_queue_continuation();
+                    w.pump_queue_lookahead();
                 }
                 Err(err) => {
                     w.player_card.set_loading(false);
                     w.toast_overlay
                         .add_toast(adw::Toast::new(&format!("Could not play video: {err}")));
+                }
+            }
+        });
+    }
+
+    fn pump_queue_lookahead(self: &Rc<Self>) {
+        const MPV_LOOKAHEAD_WINDOW: usize = 8;
+
+        if self.lookahead_running.get() || self.player_card.is_empty() {
+            return;
+        }
+        let base = self.mpv_base_index.get();
+        let pushed_end = self.mpv_pushed_end.get();
+        if pushed_end <= base {
+            return;
+        }
+
+        let cur_idx = self.player_card.current_idx();
+        let q_len = self.player_card.queue_len();
+        let target_end = (cur_idx + 1 + MPV_LOOKAHEAD_WINDOW).min(q_len);
+        if pushed_end >= target_end {
+            return;
+        }
+
+        let Some(session) = self.mpv_session.borrow().clone() else {
+            return;
+        };
+        if !session.is_alive() {
+            return;
+        }
+
+        let Some(next_item) = self.player_card.item_at(pushed_end) else {
+            return;
+        };
+
+        self.lookahead_running.set(true);
+        let seq = self.playback_seq.get();
+        let la_gen = self.lookahead_gen.get();
+        let mpv_slot = pushed_end - base;
+        let quality = self.playback_quality.get();
+        let engine = self.engine.clone();
+        let vid_id = next_item.id.clone();
+        let title = next_item.title.clone();
+        let (tx, rx) = async_channel::bounded::<Result<ResolvedPlayback, String>>(1);
+
+        self.runtime.spawn(async move {
+            let res = engine.resolve_playback(&vid_id, quality).await;
+            let _ = tx.send(res).await;
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(res) = rx.recv().await else {
+                return;
+            };
+            let Some(w) = weak.upgrade() else {
+                return;
+            };
+            if w.playback_seq.get() != seq
+                || w.lookahead_gen.get() != la_gen
+                || w.mpv_pushed_end.get() != pushed_end
+            {
+                return;
+            }
+            w.lookahead_running.set(false);
+
+            if let Ok(resolved) = res {
+                session.append_resolved(&resolved, &title, mpv_slot);
+                w.mpv_pushed_end.set(pushed_end + 1);
+                w.pump_queue_lookahead();
+            }
+        });
+    }
+
+    fn pump_queue_continuation(self: &Rc<Self>) {
+        const CONT_PREFETCH_THRESHOLD: usize = 40;
+
+        if self.queue_cont_fetching.get() || self.player_card.is_empty() {
+            return;
+        }
+        let Some(cont) = self.queue_continuation.borrow().clone() else {
+            return;
+        };
+
+        let cur_idx = self.player_card.current_idx();
+        let q_len = self.player_card.queue_len();
+        let remaining_ahead = q_len.saturating_sub(cur_idx + 1);
+        if remaining_ahead >= CONT_PREFETCH_THRESHOLD {
+            return;
+        }
+
+        self.queue_cont_fetching.set(true);
+        let seq = self.playback_seq.get();
+        let engine = self.engine.clone();
+        let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
+
+        self.runtime.spawn(async move {
+            let res = engine
+                .load_more(
+                    &cont.cursor,
+                    cont.fallback_details.as_ref(),
+                    cont.is_shorts,
+                    false,
+                )
+                .await;
+            let _ = tx.send(res).await;
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(res) = rx.recv().await else {
+                return;
+            };
+            let Some(w) = weak.upgrade() else {
+                return;
+            };
+            if w.playback_seq.get() != seq {
+                return;
+            }
+            w.queue_cont_fetching.set(false);
+
+            match res {
+                Ok(paged) => {
+                    let has_items = !paged.items.is_empty();
+                    let next_cont = if has_items {
+                        paged.next.map(|cursor| QueueContinuation {
+                            cursor,
+                            fallback_details: cont.fallback_details,
+                            is_shorts: cont.is_shorts,
+                        })
+                    } else {
+                        None
+                    };
+                    *w.queue_continuation.borrow_mut() = next_cont;
+                    if has_items {
+                        w.player_card.append_items(paged.items);
+                        w.pump_queue_lookahead();
+                        w.pump_queue_continuation();
+                    }
+                }
+                Err(_) => {
+                    *w.queue_continuation.borrow_mut() = None;
                 }
             }
         });
@@ -2953,6 +3269,7 @@ impl MainWindow {
         }
 
         self.player_card.add_item(summary);
+        self.pump_queue_lookahead();
         self.toast_overlay
             .add_toast(adw::Toast::new("Added to queue"));
     }
@@ -3057,9 +3374,38 @@ impl MainWindow {
                     MpvEvent::Pause(p) => {
                         w.player_card.set_playing(!p);
                     }
+                    MpvEvent::PlaylistPos(mpv_idx) => {
+                        let base = w.mpv_base_index.get();
+                        let pushed_end = w.mpv_pushed_end.get();
+                        if pushed_end > base {
+                            let q_idx = base + mpv_idx;
+                            if q_idx < w.player_card.queue_len()
+                                && q_idx != w.player_card.current_idx()
+                            {
+                                w.player_card.set_current_index(q_idx);
+                                w.mpv_pos.set(0.0);
+                                if let Some(cur) = w.player_card.current_video() {
+                                    w.mpv_duration
+                                        .set(cur.duration_seconds.unwrap_or(0) as f64);
+                                    if w.settings_store.load().save_history {
+                                        w.history_store.add(cur);
+                                    }
+                                }
+                                w.player_card.set_playing(true);
+                                w.pump_queue_continuation();
+                                w.pump_queue_lookahead();
+                            }
+                        }
+                    }
                     MpvEvent::TrackEnded => {
-                        if w.player_card.advance_next().is_some() {
-                            w.play_current_queue_track();
+                        let cur_idx = w.player_card.current_idx();
+                        let next_idx = cur_idx + 1;
+                        let pushed_end = w.mpv_pushed_end.get();
+                        if next_idx < pushed_end {
+                            // MPV already has `next_idx` queued natively and transitions via `PlaylistPos`
+                        } else if next_idx < w.player_card.queue_len() {
+                            w.player_card.set_current_index(next_idx);
+                            w.start_mpv_from_current_index();
                         } else {
                             w.player_card.set_loading(false);
                             w.player_card.set_playing(false);
@@ -3078,6 +3424,7 @@ impl MainWindow {
                     }
                     MpvEvent::ProcessExited => {
                         *w.mpv_session.borrow_mut() = None;
+                        w.reset_mpv_queue_tracking();
                         w.player_card.set_loading(false);
                         w.player_card.set_queue(vec![], 0, false);
                         w.player_card.root.set_visible(false);
@@ -3098,15 +3445,22 @@ impl MainWindow {
         if channel_id.is_empty() {
             return None;
         }
+        self.defocus_search_bar();
 
         let actions = self.make_card_actions();
         let weak_shorts = Rc::downgrade(self);
-        let on_play_shorts: Rc<dyn Fn(Vec<VideoSummary>, usize)> =
-            Rc::new(move |shorts, start_idx| {
-                if let Some(w) = weak_shorts.upgrade() {
-                    w.play_shorts_queue(shorts, start_idx);
-                }
-            });
+        let on_play_shorts: ShortsPlayHandler = Rc::new(move |shorts, start_idx, cont| {
+            if let Some(w) = weak_shorts.upgrade() {
+                w.play_shorts_queue(shorts, start_idx, cont);
+            }
+        });
+
+        let weak_pl = Rc::downgrade(self);
+        let on_open_playlist: Rc<dyn Fn(String)> = Rc::new(move |playlist_id| {
+            if let Some(w) = weak_pl.upgrade() {
+                w.open_remote_playlist(&playlist_id);
+            }
+        });
 
         let channel_page = ChannelPage::new(
             channel_id,
@@ -3117,6 +3471,7 @@ impl MainWindow {
             self.runtime.clone(),
             self.subscription_store.clone(),
             on_play_shorts,
+            on_open_playlist,
             self.is_narrow.get(),
             self.is_compact.get(),
             self.grid_cols.get(),
@@ -3125,6 +3480,7 @@ impl MainWindow {
 
         self.open_channels.borrow_mut().push(channel_page.clone());
         self.nav_view.push(&channel_page.page);
+        self.defocus_search_bar();
         channel_page.reload();
 
         Some(channel_page)
@@ -3185,6 +3541,7 @@ impl MainWindow {
         show_history_header: bool,
         section_heading: Option<&str>,
     ) {
+        self.defocus_search_bar();
         self.nav_view.pop_to_page(&self.home_page);
         self.clear_card_selection();
 
@@ -3885,7 +4242,8 @@ impl MainWindow {
                 let all_vids = w.current_videos.borrow().clone();
                 if !all_vids.is_empty() {
                     let q = Quality::from_setting(&w.settings_store.load().default_quality);
-                    w.play_queue_from(all_vids, idx, q, false);
+                    let cont = w.remote_playlist_queue_continuation();
+                    w.play_queue_from_with_continuation(all_vids, idx, q, false, cont);
                 }
             }
         });

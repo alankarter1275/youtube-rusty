@@ -54,6 +54,7 @@ pub struct PlayerCard {
     on_jump_to: RefCell<Option<Rc<dyn Fn(usize)>>>,
     on_save_playlist: RefCell<Option<Rc<dyn Fn(String, Vec<VideoSummary>)>>>,
     on_empty_stop: RefCell<Option<Rc<dyn Fn()>>>,
+    on_queue_mutated: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl PlayerCard {
@@ -306,6 +307,7 @@ impl PlayerCard {
             on_jump_to: RefCell::new(None),
             on_save_playlist: RefCell::new(None),
             on_empty_stop: RefCell::new(None),
+            on_queue_mutated: RefCell::new(None),
         });
 
         set_pointer(&card.channel_btn);
@@ -331,11 +333,7 @@ impl PlayerCard {
                 if !c.is_narrow.get() {
                     c.queue_box.set_visible(next_exp);
                 }
-                let q_count = c.queue.borrow().len();
-                c.expand_btn.set_label(&format!(
-                    "Queue · {q_count} {}",
-                    if next_exp { "⌵" } else { "⌃" }
-                ));
+                c.update_ui();
             }
         });
 
@@ -474,6 +472,35 @@ impl PlayerCard {
     pub fn add_item(self: &Rc<Self>, item: VideoSummary) {
         self.queue.borrow_mut().push(item);
         self.update_ui();
+    }
+
+    pub fn append_items(self: &Rc<Self>, items: Vec<VideoSummary>) {
+        if items.is_empty() {
+            return;
+        }
+        {
+            let mut q = self.queue.borrow_mut();
+            let mut seen: std::collections::HashSet<String> =
+                q.iter().map(|v| v.id.clone()).collect();
+            for it in items {
+                if seen.insert(it.id.clone()) {
+                    q.push(it);
+                }
+            }
+        }
+        self.update_ui();
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.borrow().len()
+    }
+
+    pub fn current_idx(&self) -> usize {
+        self.current_index.get()
+    }
+
+    pub fn item_at(&self, idx: usize) -> Option<VideoSummary> {
+        self.queue.borrow().get(idx).cloned()
     }
 
     pub fn current_video(&self) -> Option<VideoSummary> {
@@ -654,6 +681,17 @@ impl PlayerCard {
         *self.on_empty_stop.borrow_mut() = Some(Rc::new(callback));
     }
 
+    pub fn connect_queue_mutated(&self, callback: impl Fn() + 'static) {
+        *self.on_queue_mutated.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    fn notify_queue_mutated(&self) {
+        let cb_opt = self.on_queue_mutated.borrow().clone();
+        if let Some(cb) = cb_opt {
+            cb();
+        }
+    }
+
     fn move_item_internal(&self, from_idx: usize, to_idx: usize) -> bool {
         let mut q = self.queue.borrow_mut();
         let len = q.len();
@@ -680,6 +718,7 @@ impl PlayerCard {
     pub fn move_item(self: &Rc<Self>, from_idx: usize, to_idx: usize) {
         if self.move_item_internal(from_idx, to_idx) {
             self.update_ui();
+            self.notify_queue_mutated();
         }
     }
 
@@ -717,6 +756,8 @@ impl PlayerCard {
             if let Some(cb) = cb_opt {
                 cb(self.current_index.get());
             }
+        } else {
+            self.notify_queue_mutated();
         }
     }
 
@@ -754,6 +795,7 @@ impl PlayerCard {
         }
 
         self.update_ui();
+        self.notify_queue_mutated();
     }
 
     fn update_header_labels(&self) {
@@ -833,6 +875,10 @@ impl PlayerCard {
 
         while let Some(child) = self.queue_list.first_child() {
             self.queue_list.remove(&child);
+        }
+
+        if !is_exp {
+            return;
         }
 
         let items_snapshot = self.queue.borrow().clone();

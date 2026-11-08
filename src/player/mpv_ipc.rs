@@ -17,6 +17,7 @@ pub enum MpvEvent {
     TimePos(f64),
     Duration(f64),
     Pause(bool),
+    PlaylistPos(usize),
     TrackEnded,
     Idle(bool),
     Error(String),
@@ -30,10 +31,24 @@ pub struct MpvSession {
     is_running: Arc<AtomicBool>,
 }
 
+fn per_file_options(resolved: &ResolvedPlayback, title: &str) -> serde_json::Value {
+    let mut opts = serde_json::Map::new();
+    opts.insert("force-media-title".to_string(), json!(title));
+    if !resolved.user_agent.is_empty() {
+        opts.insert("user-agent".to_string(), json!(resolved.user_agent));
+    }
+    opts.insert("referrer".to_string(), json!(resolved.referer));
+    opts.insert(
+        "vid".to_string(),
+        json!(if resolved.is_audio_only { "no" } else { "auto" }),
+    );
+    serde_json::Value::Object(opts)
+}
+
 impl MpvSession {
-    /// Creates an `MpvSession` handle immediately (`--ytdl=no`, zero Python / `yt-dlp`).
-    /// Keeps `--force-window=no` so MPV only shows a window when an actual video stream plays
-    /// (avoiding empty `"Drop files or URLs here to play"` idle windows on tiling WMs).
+    /// Spawns a persistent `mpv` IPC process (`--ytdl=no`, zero Python / `yt-dlp`).
+    /// Starts silently with `--force-window=no` while idle; once playback starts, `force-window`
+    /// switches to `yes` so tiling WMs (`swayfx`) keep a single MPV window across queue tracks.
     pub fn spawn(
         runtime: &Runtime,
         settings: &AppSettings,
@@ -103,9 +118,9 @@ impl MpvSession {
                 *guard = Some(child);
             }
 
-            // Wait up to 3 seconds for MPV's Unix IPC socket
+            // Wait up to 5 seconds for MPV's Unix IPC socket (accounts for cold HDD spin-up)
             let mut stream_opt = None;
-            for _ in 0..60 {
+            for _ in 0..100 {
                 if !running_for_task.load(Ordering::SeqCst) {
                     break;
                 }
@@ -154,6 +169,7 @@ impl MpvSession {
                 json!({"command": ["observe_property", 2, "duration"]}).to_string(),
                 json!({"command": ["observe_property", 3, "pause"]}).to_string(),
                 json!({"command": ["observe_property", 4, "idle-active"]}).to_string(),
+                json!({"command": ["observe_property", 5, "playlist-pos"]}).to_string(),
             ];
             for ic in init_cmds {
                 let line = format!("{ic}\n");
@@ -242,6 +258,15 @@ impl MpvSession {
                                             let _ = ev_tx.send(MpvEvent::Idle(idle)).await;
                                         }
                                     }
+                                    "playlist-pos" => {
+                                        if let Some(idx) =
+                                            data.and_then(|d| d.as_i64()).filter(|&i| i >= 0)
+                                        {
+                                            let _ = ev_tx
+                                                .send(MpvEvent::PlaylistPos(idx as usize))
+                                                .await;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -277,28 +302,63 @@ impl MpvSession {
         let _ = self.cmd_sender.send(value.to_string());
     }
 
+    /// Replaces MPV's playlist with `resolved` as entry `0` and keeps the Wayland window open
+    /// across subsequent track transitions (`force-window=yes` when video is enabled).
     pub fn play_resolved(&self, resolved: &ResolvedPlayback, title: &str) {
-        if !resolved.user_agent.is_empty() {
-            self.send_json(json!({
-                "command": ["set_property", "user-agent", resolved.user_agent]
-            }));
-        }
-        self.send_json(json!({
-            "command": ["set_property", "referrer", resolved.referer]
-        }));
-        self.send_json(json!({
-            "command": ["set_property", "force-window", "no"]
-        }));
         if resolved.is_audio_only {
-            self.send_json(json!({ "command": ["set_property", "vid", "no"] }));
+            self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
         } else {
-            self.send_json(json!({ "command": ["set_property", "vid", "auto"] }));
+            self.send_json(json!({ "command": ["set_property", "force-window", "yes"] }));
         }
         self.send_json(json!({ "command": ["set_property", "pause", false] }));
-        self.send_json(json!({ "command": ["set_property", "force-media-title", title] }));
 
         let load_url = resolved.to_loadfile_url();
-        self.send_json(json!({ "command": ["loadfile", load_url, "replace"] }));
+        let opts = per_file_options(resolved, title);
+        self.send_json(json!({
+            "command": {
+                "name": "loadfile",
+                "url": load_url,
+                "flags": "replace",
+                "options": opts
+            }
+        }));
+        self.send_json(json!({
+            "command": ["set_property", "playlist/0/title", title]
+        }));
+    }
+
+    /// Appends a pre-resolved track into MPV's native internal playlist at `mpv_index`
+    /// and sets `playlist/{mpv_index}/title` so ModernZ OSC displays the full queue and
+    /// transitions seamlessly inside the same MPV window.
+    pub fn append_resolved(&self, resolved: &ResolvedPlayback, title: &str, mpv_index: usize) {
+        let load_url = resolved.to_loadfile_url();
+        let opts = per_file_options(resolved, title);
+        self.send_json(json!({
+            "command": {
+                "name": "loadfile",
+                "url": load_url,
+                "flags": "append",
+                "options": opts
+            }
+        }));
+        self.send_json(json!({
+            "command": ["set_property", format!("playlist/{mpv_index}/title"), title]
+        }));
+    }
+
+    pub fn set_playlist_pos(&self, mpv_index: usize) {
+        self.send_json(json!({
+            "command": ["set_property", "playlist-pos", mpv_index]
+        }));
+        self.send_json(json!({
+            "command": ["set_property", "pause", false]
+        }));
+    }
+
+    pub fn clear_upcoming_except_current(&self) {
+        self.send_json(json!({
+            "command": ["playlist-clear"]
+        }));
     }
 
     pub fn set_hardware_decoding(&self, enabled: bool) {
@@ -310,8 +370,12 @@ impl MpvSession {
         self.send_json(json!({ "command": ["cycle", "pause"] }));
     }
 
+    /// Stops playback, clears MPV's playlist, and hides the MPV window (`force-window=no`)
+    /// while keeping the warm `mpv` process alive in the background for instant next playback.
     pub fn stop(&self) {
+        self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
         self.send_json(json!({ "command": ["stop"] }));
+        self.send_json(json!({ "command": ["playlist-clear"] }));
     }
 
     pub fn shutdown(&self) {

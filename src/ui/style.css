@@ -504,3 +504,8 @@ switch:checked slider {
   border-top: 1px solid alpha(#E8DDD5, 0.12);
   padding: 6px 8px;
 }
+
+scrolledwindow,
+scrolledwindow:focus {
+  outline: none;
+}
