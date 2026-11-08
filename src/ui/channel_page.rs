@@ -339,7 +339,8 @@ impl ChannelPage {
                         }
                     }
                 }
-                if let Some(cb) = cp.selected_play_cb.borrow().as_ref().cloned() {
+                let cb_opt = cp.selected_play_cb.borrow().clone();
+                if let Some(cb) = cb_opt {
                     cb();
                     return glib::Propagation::Stop;
                 }

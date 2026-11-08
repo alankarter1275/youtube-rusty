@@ -350,7 +350,8 @@ impl PlayerCard {
                 };
                 if let Some((cid, cname)) = maybe_chan {
                     if !cid.is_empty() {
-                        if let Some(cb) = c.on_open_channel.borrow().as_ref().cloned() {
+                        let cb_opt = c.on_open_channel.borrow().clone();
+                        if let Some(cb) = cb_opt {
                             cb(cid, cname);
                         }
                     }
@@ -429,7 +430,8 @@ impl PlayerCard {
             if let Some(c) = card_weak.upgrade() {
                 let items = c.queue.borrow().clone();
                 if !items.is_empty() {
-                    if let Some(cb) = c.on_save_playlist.borrow().as_ref().cloned() {
+                    let cb_opt = c.on_save_playlist.borrow().clone();
+                    if let Some(cb) = cb_opt {
                         cb(name, items);
                     }
                 }
@@ -695,7 +697,8 @@ impl PlayerCard {
         if len_after == 0 {
             self.current_index.set(0);
             self.root.set_visible(false);
-            if let Some(cb) = self.on_empty_stop.borrow().as_ref().cloned() {
+            let cb_opt = self.on_empty_stop.borrow().clone();
+            if let Some(cb) = cb_opt {
                 cb();
             }
             return;
@@ -710,7 +713,8 @@ impl PlayerCard {
 
         self.update_ui();
         if was_current {
-            if let Some(cb) = self.on_jump_to.borrow().as_ref().cloned() {
+            let cb_opt = self.on_jump_to.borrow().clone();
+            if let Some(cb) = cb_opt {
                 cb(self.current_index.get());
             }
         }
@@ -913,7 +917,8 @@ impl PlayerCard {
             row_click.connect_released(move |_, _, _, _| {
                 if let Some(card) = card_weak.upgrade() {
                     card.set_current_index(i);
-                    if let Some(cb) = card.on_jump_to.borrow().as_ref().cloned() {
+                    let cb_opt = card.on_jump_to.borrow().clone();
+                    if let Some(cb) = cb_opt {
                         cb(i);
                     }
                 }

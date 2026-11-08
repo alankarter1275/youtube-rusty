@@ -1749,7 +1749,8 @@ impl MainWindow {
                     .map(|t| t.as_str() == "home")
                     .unwrap_or(true);
                 if on_home {
-                    if let Some(cb) = w.selected_action_cb.borrow().as_ref().cloned() {
+                    let cb_opt = w.selected_action_cb.borrow().clone();
+                    if let Some(cb) = cb_opt {
                         cb();
                         return glib::Propagation::Stop;
                     }
@@ -1815,7 +1816,8 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.status_action_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                if let Some(cb) = w.status_action_cb.borrow().as_ref().cloned() {
+                let cb_opt = w.status_action_cb.borrow().clone();
+                if let Some(cb) = cb_opt {
                     cb();
                 }
             }

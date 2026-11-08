@@ -189,14 +189,12 @@ impl Engine {
     }
 
     async fn fetch_candidate_pool(&self, video_id: &str) -> Result<CandidatePool, String> {
-        let mut last_err = String::new();
-
         // 1. Direct Innertube ANDROID_VR (fast single POST, un-ciphered 360p/720p/1080p H.264/VP9 + AAC/Opus)
-        match self.fetch_innertube_vr(video_id).await {
+        let mut last_err = match self.fetch_innertube_vr(video_id).await {
             Ok(pool) if pool.has_playable_streams() => return Ok(pool),
-            Ok(_) => last_err = "No streams returned by VR player".to_string(),
-            Err(e) => last_err = e,
-        }
+            Ok(_) => "No streams returned by VR player".to_string(),
+            Err(e) => e,
+        };
 
         // 2. Modern iOS Innertube (fast single POST, un-ciphered streams + HLS live manifests)
         match self.fetch_innertube_modern_ios(video_id).await {
@@ -808,7 +806,6 @@ impl Engine {
             UrlTarget::Playlist { id } | UrlTarget::Album { id } => {
                 Ok(ResolvedUrl::Playlist { id })
             }
-            _ => Err("Unsupported YouTube link type.".to_string()),
         }
     }
 
@@ -853,12 +850,6 @@ impl Engine {
             .await
             .map_err(|e| format!("Could not fetch video info: {e}"))?;
 
-        let dur_secs = if details.duration > 0 {
-            Some(details.duration as u64)
-        } else {
-            None
-        };
-        let dur_txt = dur_secs.map(format_duration).unwrap_or_default();
         let view_txt = format!("{} views", format_count(details.view_count));
         let ch_avatar = pick_thumbnail_url(&details.channel.avatar, 88);
 
@@ -868,8 +859,8 @@ impl Engine {
             channel_id: details.channel.id,
             channel_name: details.channel.name,
             channel_avatar_url: ch_avatar,
-            duration_seconds: dur_secs,
-            duration_text: dur_txt,
+            duration_seconds: None,
+            duration_text: String::new(),
             view_count_text: view_txt,
             view_count: Some(details.view_count),
             published_text: details.publish_date_txt.unwrap_or_default(),
