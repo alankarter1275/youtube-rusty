@@ -47,6 +47,7 @@ fn main() {
                         "Playing \"{title}\" ({q_name}) in MPV..."
                     )));
                 };
+                let on_add_queue = move |_sum: backend::models::VideoSummary| {};
                 let on_open_channel = move |_cid: String, _cname: String| {};
 
                 ui::details_sheet::DetailsSheet::show(
@@ -55,9 +56,46 @@ fn main() {
                     None,
                     None,
                     on_play,
+                    on_add_queue,
                     on_toast,
                     on_open_channel,
                 );
+            });
+        }
+
+        if std::env::var("TEST_PLAYER").is_ok() {
+            let win_clone = window.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                let sample1 = backend::models::VideoSummary {
+                    id: "dQw4w9WgXcQ".to_string(),
+                    title: "Exploring the Ancient Terracotta Temples of Bishnupur".to_string(),
+                    channel_id: "UC_ancient_history".to_string(),
+                    channel_name: "Heritage Explorers".to_string(),
+                    channel_avatar_url: "".to_string(),
+                    duration_seconds: Some(742),
+                    duration_text: "12:22".to_string(),
+                    view_count_text: "1.4M views".to_string(),
+                    published_text: "3 days ago".to_string(),
+                    thumbnail_url: "".to_string(),
+                    description_snippet: "".to_string(),
+                };
+                let sample2 = backend::models::VideoSummary {
+                    id: "xyz123".to_string(),
+                    title: "Traditional Bengal Silk Weaving Documentary".to_string(),
+                    channel_id: "UC_crafts".to_string(),
+                    channel_name: "Heritage Explorers".to_string(),
+                    channel_avatar_url: "".to_string(),
+                    duration_seconds: Some(920),
+                    duration_text: "15:20".to_string(),
+                    view_count_text: "800K views".to_string(),
+                    published_text: "1 week ago".to_string(),
+                    thumbnail_url: "".to_string(),
+                    description_snippet: "".to_string(),
+                };
+                win_clone.player_card.set_queue(vec![sample1, sample2], 0);
+                win_clone.player_card.set_progress(252.0, 742.0);
+                win_clone.player_card.set_playing(true);
+                win_clone.player_card.expand_btn.emit_clicked();
             });
         }
     });

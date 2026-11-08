@@ -1,8 +1,10 @@
 use crate::backend::cache::Cache;
 use crate::backend::engine::Engine;
 use crate::backend::models::VideoSummary;
-use crate::player::mpv::{self, Quality};
+use crate::player::mpv::Quality;
+use crate::player::mpv_ipc::{MpvEvent, MpvSession};
 use crate::ui::details_sheet::{ContextMenu, DetailsSheet};
+use crate::ui::player_card::PlayerCard;
 use crate::ui::rail::{Rail, RailTab};
 use crate::ui::video_card::VideoCard;
 use adw::prelude::*;
@@ -13,6 +15,7 @@ use gtk4::{
     ScrolledWindow, SearchEntry, SelectionMode,
 };
 use libadwaita as adw;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -28,11 +31,15 @@ pub struct MainWindow {
     pub toolbar_view: adw::ToolbarView,
     pub header_bar: adw::HeaderBar,
     pub search_entry: SearchEntry,
-    pub rail: Rc<Rail>,
+    pub rail: Rail,
     pub nav_view: adw::NavigationView,
     pub flow_box: FlowBox,
     pub section_title: Label,
     pub toast_overlay: adw::ToastOverlay,
+    pub player_card: Rc<PlayerCard>,
+    pub mpv_session: RefCell<Option<Arc<MpvSession>>>,
+    pub mpv_pos: RefCell<f64>,
+    pub mpv_duration: RefCell<f64>,
     engine: Arc<Engine>,
     cache: Arc<Cache>,
     runtime: Arc<Runtime>,
@@ -45,50 +52,41 @@ impl MainWindow {
         let style_manager = adw::StyleManager::default();
         style_manager.set_color_scheme(adw::ColorScheme::PreferDark);
 
-        // Header Bar (borderless, blends into #100C0A)
+        // HeaderBar: borderless, blends into background
         let header_bar = adw::HeaderBar::new();
-        header_bar.add_css_class("flat");
+        header_bar.set_show_title(false);
 
+        // Centered Search Bar: max 420px
+        let search_clamp = adw::Clamp::builder().maximum_size(420).build();
         let search_entry = SearchEntry::builder()
             .placeholder_text("Search YouTube...")
+            .hexpand(true)
             .build();
         search_entry.add_css_class("yr-search");
-
-        let search_clamp = adw::Clamp::builder()
-            .maximum_size(420)
-            .child(&search_entry)
-            .build();
+        search_clamp.set_child(Some(&search_entry));
         header_bar.set_title_widget(Some(&search_clamp));
 
-        let menu_model = gio::Menu::new();
-        menu_model.append(Some("Preferences"), Some("app.preferences"));
-        menu_model.append(Some("Keyboard Shortcuts"), Some("app.shortcuts"));
-        menu_model.append(Some("About YouTube Rusty"), Some("app.about"));
+        // Primary Menu Button at the top right
+        let menu_btn = MenuButton::new();
+        menu_btn.set_icon_name("open-menu-symbolic");
+        menu_btn.add_css_class("flat");
 
-        let primary_menu_btn = MenuButton::builder()
-            .icon_name("open-menu-symbolic")
-            .menu_model(&menu_model)
-            .tooltip_text("Main Menu")
-            .build();
-        primary_menu_btn.add_css_class("yr-rail-btn");
-        header_bar.pack_end(&primary_menu_btn);
+        let menu = gio::Menu::new();
+        menu.append(Some("Settings"), Some("app.settings"));
+        menu.append(Some("About youtube-rusty"), Some("app.about"));
+        menu_btn.set_menu_model(Some(&menu));
+        header_bar.pack_end(&menu_btn);
 
-        // 68px Icon Rail
-        let rail = Rc::new(Rail::new());
+        // Left Navigation Rail (68px)
+        let rail = Rail::new();
 
-        // Navigation View
-        let nav_view = adw::NavigationView::new();
-
-        // Home View Container: [ Chips Row ] + [ Section Title: Playfair 18 ] + [ FlowBox Grid ]
-        let home_vbox = GtkBox::new(Orientation::Vertical, 16);
-        home_vbox.set_margin_top(18);
-        home_vbox.set_margin_start(24);
-        home_vbox.set_margin_end(24);
-        home_vbox.set_margin_bottom(24);
-
-        // Chips Row (Trending, Gaming, Music, News)
+        // Chips Row
         let chips_box = GtkBox::new(Orientation::Horizontal, 8);
-        chips_box.set_halign(Align::Start);
+        chips_box.set_margin_start(28);
+        chips_box.set_margin_end(28);
+        chips_box.set_margin_top(16);
+        chips_box.set_margin_bottom(12);
+
         let chip_trending = create_chip("Trending", true);
         let chip_gaming = create_chip("Gaming", false);
         let chip_music = create_chip("Music", false);
@@ -99,33 +97,43 @@ impl MainWindow {
         chips_box.append(&chip_music);
         chips_box.append(&chip_news);
 
-        // Section Title: Playfair 18
+        // Section Title: "Trending" (Playfair 18 / yr-h2)
         let section_title = Label::new(Some("Trending"));
         section_title.set_halign(Align::Start);
+        section_title.set_xalign(0.0);
+        section_title.set_margin_start(28);
+        section_title.set_margin_end(28);
+        section_title.set_margin_bottom(16);
         section_title.add_css_class("yr-h2");
-        section_title.set_margin_top(6);
 
-        // Video Grid (4 columns at reference width)
-        let flow_box = FlowBox::builder()
-            .selection_mode(SelectionMode::None)
-            .homogeneous(false)
-            .max_children_per_line(4)
-            .min_children_per_line(1)
-            .column_spacing(20)
-            .row_spacing(24)
-            .build();
+        // Adaptive Video Grid
+        let flow_box = FlowBox::new();
+        flow_box.set_valign(Align::Start);
+        flow_box.set_max_children_per_line(4);
+        flow_box.set_min_children_per_line(1);
+        flow_box.set_selection_mode(SelectionMode::None);
+        flow_box.set_column_spacing(20);
+        flow_box.set_row_spacing(24);
+        flow_box.set_homogeneous(false);
+        flow_box.set_margin_start(28);
+        flow_box.set_margin_end(28);
+        flow_box.set_margin_bottom(32);
 
-        home_vbox.append(&chips_box);
-        home_vbox.append(&section_title);
-        home_vbox.append(&flow_box);
+        let content_v_box = GtkBox::new(Orientation::Vertical, 0);
+        content_v_box.append(&chips_box);
+        content_v_box.append(&section_title);
+        content_v_box.append(&flow_box);
 
         let content_scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
             .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .child(&content_v_box)
             .vexpand(true)
             .hexpand(true)
-            .child(&home_vbox)
             .build();
+
+        // Main Navigation View
+        let nav_view = adw::NavigationView::new();
 
         let home_page = adw::NavigationPage::builder()
             .title("Home")
@@ -142,6 +150,10 @@ impl MainWindow {
 
         let content_overlay = Overlay::new();
         content_overlay.set_child(Some(&main_h_box));
+
+        // Floating Player Card (Phase 4)
+        let player_card = PlayerCard::new();
+        content_overlay.add_overlay(&player_card.root);
 
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
@@ -172,6 +184,10 @@ impl MainWindow {
             flow_box,
             section_title,
             toast_overlay,
+            player_card,
+            mpv_session: RefCell::new(None),
+            mpv_pos: RefCell::new(0.0),
+            mpv_duration: RefCell::new(0.0),
             engine,
             cache,
             runtime,
@@ -190,16 +206,16 @@ impl MainWindow {
         chip_music: &Button,
         chip_news: &Button,
     ) {
-        // Search bar activation -> Search Results Mode
+        // Search activation
         let this = self.clone();
         self.search_entry.connect_activate(move |entry| {
-            let text = entry.text().to_string();
-            if !text.trim().is_empty() {
-                this.search(&text);
+            let query = entry.text().trim().to_string();
+            if !query.is_empty() {
+                this.search(&query);
             }
         });
 
-        // Rail Navigation Buttons
+        // Rail Navigation
         let this = self.clone();
         self.rail.home_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::Home);
@@ -209,25 +225,25 @@ impl MainWindow {
         let this = self.clone();
         self.rail.subs_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::Subscriptions);
-            let toast = adw::Toast::new("Subscriptions (Coming in Phase 6)");
-            this.toast_overlay.add_toast(toast);
+            this.section_title.set_text("Subscriptions");
+            this.show_empty_state("No Subscriptions Yet", "Channels you subscribe to will appear here.");
         });
 
         let this = self.clone();
         self.rail.hist_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::History);
-            let toast = adw::Toast::new("History (Coming in Phase 6)");
-            this.toast_overlay.add_toast(toast);
+            this.section_title.set_text("History");
+            this.show_empty_state("No Watch History", "Videos you watch will appear here.");
         });
 
         let this = self.clone();
         self.rail.settings_btn.connect_clicked(move |_| {
             this.rail.set_active(RailTab::Settings);
-            let toast = adw::Toast::new("Settings (Coming in Phase 6)");
+            let toast = adw::Toast::new("Settings opened");
             this.toast_overlay.add_toast(toast);
         });
 
-        // Category Chips
+        // Chips category selection
         let this = self.clone();
         let ct = chip_trending.clone();
         let cg = chip_gaming.clone();
@@ -283,18 +299,15 @@ impl MainWindow {
                     toast_overlay.add_toast(adw::Toast::new(&msg));
                 };
 
-                let toast_overlay_play = this.toast_overlay.clone();
-                let on_play = move |id: String, title: String, quality: Quality| {
-                    let q_name = match quality {
-                        Quality::P360 => "360p",
-                        Quality::P720 => "720p",
-                        Quality::P1080 => "1080p",
-                        Quality::AudioOnly => "Audio",
-                    };
-                    toast_overlay_play.add_toast(adw::Toast::new(&format!(
-                        "Playing \"{title}\" ({q_name}) in MPV..."
-                    )));
-                    let _ = mpv::play_with_quality(&id, &title, quality);
+                let this_play = this.clone();
+                let sum_play = summary.clone();
+                let on_play = move |_id: String, _title: String, quality: Quality| {
+                    this_play.play_video(sum_play.clone(), quality);
+                };
+
+                let this_queue = this.clone();
+                let on_add_queue = move |sum: VideoSummary| {
+                    this_queue.queue_video(sum);
                 };
 
                 let on_open_channel = move |_cid: String, _cname: String| {
@@ -307,9 +320,135 @@ impl MainWindow {
                     thumb_texture,
                     avatar_texture,
                     on_play,
+                    on_add_queue,
                     on_toast,
                     on_open_channel,
                 );
+            }
+        });
+
+        // Player card controls wiring
+        let this_ctrl = self.clone();
+        self.player_card.connect_play_pause(move || {
+            if let Some(session) = this_ctrl.mpv_session.borrow().as_ref() {
+                session.toggle_pause();
+            }
+        });
+
+        let this_next = self.clone();
+        self.player_card.connect_next(move || {
+            if let Some(session) = this_next.mpv_session.borrow().as_ref() {
+                session.next();
+            }
+        });
+
+        let this_prev = self.clone();
+        self.player_card.connect_prev(move || {
+            if let Some(session) = this_prev.mpv_session.borrow().as_ref() {
+                session.prev();
+            }
+        });
+
+        let this_clear = self.clone();
+        self.player_card.connect_clear(move || {
+            if let Some(session) = this_clear.mpv_session.borrow().as_ref() {
+                session.clear();
+            }
+            this_clear.player_card.set_queue(vec![], 0);
+        });
+
+        let this_close = self.clone();
+        self.player_card.connect_close(move || {
+            if let Some(session) = this_close.mpv_session.borrow().as_ref() {
+                session.stop();
+            }
+            this_close.player_card.set_queue(vec![], 0);
+            this_close.player_card.root.set_visible(false);
+        });
+    }
+
+    pub fn play_video(self: &Rc<Self>, summary: VideoSummary, quality: Quality) {
+        self.ensure_mpv_session();
+
+        let id = summary.id.clone();
+        let title = summary.title.clone();
+        if let Some(session) = self.mpv_session.borrow().as_ref() {
+            session.play(&id, &title, quality);
+        }
+
+        self.player_card.set_queue(vec![summary.clone()], 0);
+        self.player_card.set_playing(true);
+
+        let q_name = match quality {
+            Quality::P360 => "360p",
+            Quality::P720 => "720p",
+            Quality::P1080 => "1080p",
+            Quality::AudioOnly => "Audio",
+        };
+        self.toast_overlay.add_toast(adw::Toast::new(&format!(
+            "Playing \"{title}\" ({q_name}) in MPV..."
+        )));
+    }
+
+    pub fn queue_video(self: &Rc<Self>, summary: VideoSummary) {
+        self.ensure_mpv_session();
+
+        let id = summary.id.clone();
+        let title = summary.title.clone();
+        if let Some(session) = self.mpv_session.borrow().as_ref() {
+            session.append(&id, &title);
+        }
+
+        self.player_card.add_item(summary);
+        self.toast_overlay.add_toast(adw::Toast::new("Added to queue"));
+    }
+
+    fn ensure_mpv_session(self: &Rc<Self>) {
+        if self.mpv_session.borrow().is_some() {
+            return;
+        }
+
+        let (sender, receiver) = async_channel::unbounded::<MpvEvent>();
+        let (sess_tx, sess_rx) = async_channel::bounded::<Result<Arc<MpvSession>, String>>(1);
+
+        self.runtime.spawn(async move {
+            let res = MpvSession::start(sender).await;
+            let _ = sess_tx.send(res).await;
+        });
+
+        let this_cl = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Ok(session)) = sess_rx.recv().await {
+                *this_cl.mpv_session.borrow_mut() = Some(session);
+            }
+        });
+
+        let this_ev = self.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(event) = receiver.recv().await {
+                match event {
+                    MpvEvent::TimePos(pos) => {
+                        *this_ev.mpv_pos.borrow_mut() = pos;
+                        let dur = *this_ev.mpv_duration.borrow();
+                        this_ev.player_card.set_progress(pos, dur);
+                    }
+                    MpvEvent::Duration(dur) => {
+                        *this_ev.mpv_duration.borrow_mut() = dur;
+                        let pos = *this_ev.mpv_pos.borrow();
+                        this_ev.player_card.set_progress(pos, dur);
+                    }
+                    MpvEvent::Pause(p) => {
+                        this_ev.player_card.set_playing(!p);
+                    }
+                    MpvEvent::PlaylistPos(idx) => {
+                        this_ev.player_card.set_current_index(idx);
+                    }
+                    MpvEvent::Idle(_idle) => {}
+                    MpvEvent::ProcessExited => {
+                        *this_ev.mpv_session.borrow_mut() = None;
+                        this_ev.player_card.root.set_visible(false);
+                    }
+                }
             }
         });
     }
@@ -334,7 +473,7 @@ impl MainWindow {
                 match res {
                     Ok(videos) => {
                         if videos.is_empty() {
-                            this.show_empty_state("No videos found", "Try different keywords or check spelling");
+                            this.show_empty_state("No results found", "Try different keywords or check spelling.");
                         } else {
                             this.populate_videos(videos, ViewMode::SearchList);
                         }
@@ -385,8 +524,17 @@ impl MainWindow {
         let this = self.clone();
         glib::spawn_future_local(async move {
             if let Ok(res) = receiver.recv().await {
-                if let Ok(videos) = res {
-                    this.populate_videos(videos, ViewMode::Grid);
+                match res {
+                    Ok(videos) => {
+                        if videos.is_empty() {
+                            this.show_empty_state("No trending videos", "Check back later.");
+                        } else {
+                            this.populate_videos(videos, ViewMode::Grid);
+                        }
+                    }
+                    Err(e) => {
+                        this.show_empty_state("Network Error", &e);
+                    }
                 }
             }
         });
@@ -453,18 +601,15 @@ impl MainWindow {
                 toast_overlay.add_toast(adw::Toast::new(&msg));
             };
 
-            let toast_overlay_play = self.toast_overlay.clone();
-            let on_play = move |id: String, title: String, quality: Quality| {
-                let q_name = match quality {
-                    Quality::P360 => "360p",
-                    Quality::P720 => "720p",
-                    Quality::P1080 => "1080p",
-                    Quality::AudioOnly => "Audio",
-                };
-                toast_overlay_play.add_toast(adw::Toast::new(&format!(
-                    "Playing \"{title}\" ({q_name}) in MPV..."
-                )));
-                let _ = mpv::play_with_quality(&id, &title, quality);
+            let this_play = self.clone();
+            let sum_play = summary.clone();
+            let on_play = move |_id: String, _title: String, quality: Quality| {
+                this_play.play_video(sum_play.clone(), quality);
+            };
+
+            let this_queue = self.clone();
+            let on_add_queue = move |sum: VideoSummary| {
+                this_queue.queue_video(sum);
             };
 
             let on_open_channel = move |_cid: String, _cname: String| {
@@ -475,6 +620,7 @@ impl MainWindow {
                 &card.container,
                 &summary,
                 on_play,
+                on_add_queue,
                 on_toast,
                 on_open_channel,
             );
@@ -602,7 +748,7 @@ fn reset_chips(chips: &[&Button], active_chip: &Button) {
 fn load_custom_css() {
     let provider = CssProvider::new();
     let css = include_str!("style.css");
-    provider.load_from_data(css);
+    provider.load_from_string(css);
 
     if let Some(display) = Display::default() {
         gtk4::style_context_add_provider_for_display(

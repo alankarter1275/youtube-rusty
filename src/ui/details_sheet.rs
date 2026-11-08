@@ -19,6 +19,7 @@ impl DetailsSheet {
         thumb_texture: Option<&Texture>,
         avatar_texture: Option<&Texture>,
         on_play: impl Fn(String, String, Quality) + 'static,
+        on_add_queue: impl Fn(VideoSummary) + 'static,
         on_toast: impl Fn(String) + 'static,
         on_open_channel: impl Fn(String, String) + 'static,
     ) {
@@ -198,6 +199,7 @@ impl DetailsSheet {
 
         // Connect button handlers
         let on_play_rc = Rc::new(on_play);
+        let on_add_q_rc = Rc::new(on_add_queue);
         let on_toast_rc = Rc::new(on_toast);
 
         let vid_id = summary.id.clone();
@@ -225,9 +227,10 @@ impl DetailsSheet {
             on_play_cl(vid_id.clone(), vid_title.clone(), quality);
         });
 
-        let on_toast_queue = on_toast_rc.clone();
+        let summary_q = summary.clone();
+        let on_add_q_cl = on_add_q_rc.clone();
         queue_btn.connect_clicked(move |_| {
-            on_toast_queue("Added to queue".to_string());
+            on_add_q_cl(summary_q.clone());
         });
 
         let on_toast_wl = on_toast_rc.clone();
@@ -260,6 +263,7 @@ impl ContextMenu {
         target: &impl IsA<gtk4::Widget>,
         summary: &VideoSummary,
         on_play: impl Fn(String, String, Quality) + 'static,
+        on_add_queue: impl Fn(VideoSummary) + 'static,
         on_toast: impl Fn(String) + 'static,
         on_open_channel: impl Fn(String, String) + 'static,
     ) {
@@ -291,6 +295,7 @@ impl ContextMenu {
         popover.set_child(Some(&menu_box));
 
         let on_play_rc = Rc::new(on_play);
+        let on_add_q_rc = Rc::new(on_add_queue);
         let on_toast_rc = Rc::new(on_toast);
         let on_open_channel_rc = Rc::new(on_open_channel);
 
@@ -307,12 +312,13 @@ impl ContextMenu {
         });
 
         let pop_weak = popover.downgrade();
-        let on_toast_q = on_toast_rc.clone();
+        let summary_q = summary.clone();
+        let on_add_q_cl = on_add_q_rc.clone();
         queue_btn.connect_clicked(move |_| {
             if let Some(pop) = pop_weak.upgrade() {
                 pop.popdown();
             }
-            on_toast_q("Added to queue".to_string());
+            on_add_q_cl(summary_q.clone());
         });
 
         let pop_weak = popover.downgrade();
