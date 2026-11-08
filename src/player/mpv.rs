@@ -1,51 +1,61 @@
-use std::process::{Command, Stdio};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Quality {
+    #[default]
     P360,
     P720,
     P1080,
     AudioOnly,
 }
 
-impl Default for Quality {
-    fn default() -> Self {
-        Quality::P360
-    }
-}
-
-pub fn play_with_quality(video_id: &str, title: &str, quality: Quality) -> std::io::Result<()> {
-    let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let title_arg = format!("--force-media-title={title}");
-
-    let mut cmd = Command::new("mpv");
-    cmd.arg(&title_arg)
-        .arg("--hwdec=auto-safe")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    match quality {
-        Quality::P360 => {
-            cmd.arg("--ytdl-format=bestvideo[height<=360]+bestaudio/best[height<=360]");
-        }
-        Quality::P720 => {
-            cmd.arg("--ytdl-format=bestvideo[height<=720]+bestaudio/best[height<=720]");
-        }
-        Quality::P1080 => {
-            cmd.arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]");
-        }
-        Quality::AudioOnly => {
-            cmd.arg("--no-video");
+impl Quality {
+    pub fn from_setting(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "720p" => Quality::P720,
+            "1080p" => Quality::P1080,
+            "audio" | "audio only" | "audio_only" => Quality::AudioOnly,
+            _ => Quality::P360,
         }
     }
 
-    cmd.arg(&url);
-    cmd.spawn()?;
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Quality::P360 => "360p",
+            Quality::P720 => "720p",
+            Quality::P1080 => "1080p",
+            Quality::AudioOnly => "audio",
+        }
+    }
 
-    Ok(())
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::P360 => "360p",
+            Quality::P720 => "720p",
+            Quality::P1080 => "1080p",
+            Quality::AudioOnly => "Audio",
+        }
+    }
+
+    pub fn ytdl_format(self) -> Option<&'static str> {
+        match self {
+            Quality::P360 => Some("bestvideo[height<=360]+bestaudio/best[height<=360]/best"),
+            Quality::P720 => Some("bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
+            Quality::P1080 => Some("bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
+            Quality::AudioOnly => None,
+        }
+    }
 }
 
-pub fn play(video_id: &str, title: &str) -> std::io::Result<()> {
-    play_with_quality(video_id, title, Quality::default())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quality_parsing() {
+        assert_eq!(Quality::from_setting("360p"), Quality::P360);
+        assert_eq!(Quality::from_setting("720p"), Quality::P720);
+        assert_eq!(Quality::from_setting("1080p"), Quality::P1080);
+        assert_eq!(Quality::from_setting("audio"), Quality::AudioOnly);
+        assert_eq!(Quality::from_setting("Audio only"), Quality::AudioOnly);
+        assert_eq!(Quality::from_setting("unknown"), Quality::P360);
+    }
 }

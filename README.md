@@ -1,28 +1,31 @@
 # YouTube Rusty (`youtube-rusty`)
 
-A lightweight, modern desktop YouTube client for Linux (Wayland / SwayFX), built with **Rust**, **GTK4**, and **Libadwaita**.
+A fast, lightweight desktop YouTube app for Linux, built with **Rust**, **GTK4**, and **Libadwaita**.
 
 ## Features
-- **Ultra Lightweight**: Zero Electron or Chromium runtime overhead (< 50MB RAM).
-- **Fast Async Scraping**: Powered by `rustypipe` (native Rust YouTube API client) with sub-second queries.
-- **Pixel-Perfect Thumbnails**: Crisp native image rendering with local disk caching (`~/.cache/youtube-rusty/`).
-- **Modern Aesthetics**: Native Libadwaita dark theme with smooth responsive card grids.
-- **Integrated MPV Streaming**: Clicking any video seamlessly launches your configured `mpv` player with hardware acceleration (VA-API), 360p default, and ModernZ OSD.
+- **Fast & Lightweight**: Uses very little memory compared to a web browser.
+- **Home, Search & Categories**: Browse Trending, Gaming, Music, News, or search YouTube with upload date, length, and sort filters.
+- **Channel Pages & Shorts**: View any channel's Videos and Shorts, search inside a channel, filter, sort, and subscribe locally.
+- **Subscriptions & History**: Follow your favorite channels and keep track of watched videos on your computer (`~/.config/youtube-rusty/`).
+- **Watch Later & Downloads**: Save videos to Watch Later or download videos and audio directly to your `Downloads` folder using `yt-dlp`.
+- **MPV Player & Queue Card**: Streams videos in `mpv` (360p, 720p, 1080p, or Audio only) with a built-in floating queue card that supports pause/resume, next/previous, shuffle, remove, and drag-and-drop reordering.
+- **Customizable Look**: Warm Kalam dark theme by default, with Light/System mode and Terracotta, Forest, Plum, and Teal accent colors in Preferences.
 
-## Build and Run
+## Install Requirements
 
-### Prerequisites (Arch Linux)
+### Arch Linux
 ```bash
 sudo pacman -S rust cargo gtk4 libadwaita mpv yt-dlp
 ```
 
-### Running
+## How to Run
 ```bash
-cd ~/Projects/youtube-rusty
 cargo run --release
 ```
 
-## Controls
-- **Search**: Type in the top search bar and hit `Enter`.
-- **Play Video**: Click on any video card to stream immediately in `mpv`.
-- **Quality**: In `mpv`, click the `HQ` button or press `Shift + f` to switch video resolutions on the fly.
+## Helpful Shortcuts
+- **`/`** or **`Ctrl + F`**: Jump to the search bar
+- **`Enter`**: Start search
+- **`Esc`**: Close popups or leave the search bar
+- **`Alt + Left`**: Go back from a Channel page
+- **`Space`**: Pause or resume when the player card is selected

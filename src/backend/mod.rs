@@ -4,3 +4,4 @@ pub mod history;
 pub mod models;
 pub mod settings;
 pub mod subscriptions;
+pub mod watch_later;

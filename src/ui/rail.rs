@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, Image, Orientation, Overlay};
+use gtk4::{Align, Box as GtkBox, Button, Orientation, Overlay};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailTab {
@@ -11,6 +11,7 @@ pub enum RailTab {
 
 pub struct Rail {
     pub container: Overlay,
+    pub logo_btn: Button,
     pub home_btn: Button,
     pub subs_btn: Button,
     pub hist_btn: Button,
@@ -23,15 +24,15 @@ impl Rail {
         rail_box.add_css_class("yr-rail");
         rail_box.set_width_request(68);
 
-        // Logo at top: 28px from top (terracotta rounded square with play icon)
-        let logo_box = GtkBox::new(Orientation::Vertical, 0);
-        logo_box.set_halign(Align::Center);
-        logo_box.set_valign(Align::Start);
-        logo_box.add_css_class("yr-logo");
-        let logo_icon = Image::from_icon_name("media-playback-start-symbolic");
-        logo_icon.set_pixel_size(18);
-        logo_box.append(&logo_icon);
-        rail_box.append(&logo_box);
+        // Clickable Terracotta play logo at top
+        let logo_btn = Button::from_icon_name("media-playback-start-symbolic");
+        logo_btn.add_css_class("yr-logo");
+        logo_btn.set_tooltip_text(Some("Home"));
+        logo_btn.set_halign(Align::Center);
+        logo_btn.set_valign(Align::Start);
+        logo_btn.set_width_request(40);
+        logo_btn.set_height_request(40);
+        rail_box.append(&logo_btn);
 
         // Center navigation group: Home, Subscriptions, History
         let center_box = GtkBox::new(Orientation::Vertical, 16);
@@ -48,7 +49,7 @@ impl Rail {
         center_box.append(&hist_btn);
         rail_box.append(&center_box);
 
-        // Settings button pinned to bottom (24px bottom inset)
+        // Settings button pinned to bottom
         let settings_btn = create_rail_button("emblem-system-symbolic", "Settings", false);
         settings_btn.set_valign(Align::End);
         settings_btn.set_halign(Align::Center);
@@ -59,6 +60,7 @@ impl Rail {
         sep.add_css_class("yr-rail-sep");
         sep.set_width_request(2);
         sep.set_halign(Align::End);
+        sep.set_can_target(false);
 
         let container = Overlay::new();
         container.set_child(Some(&rail_box));
@@ -66,6 +68,7 @@ impl Rail {
 
         Self {
             container,
+            logo_btn,
             home_btn,
             subs_btn,
             hist_btn,
