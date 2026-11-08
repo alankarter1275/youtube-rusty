@@ -660,9 +660,7 @@ impl MainWindow {
                         | gdk::ModifierType::SUPER_MASK,
                 )
             {
-                let in_editable = w
-                    .window
-                    .focus()
+                let in_editable = gtk4::prelude::GtkWindowExt::focus(&w.window)
                     .map(|f| f.is::<Editable>())
                     .unwrap_or(false);
                 if !in_editable {
@@ -672,16 +670,14 @@ impl MainWindow {
             }
 
             if key == gdk::Key::Escape {
-                let search_focused = w
-                    .window
-                    .focus()
+                let search_focused = gtk4::prelude::GtkWindowExt::focus(&w.window)
                     .map(|f| {
                         f.is_ancestor(&w.search_entry)
                             || &f == w.search_entry.upcast_ref::<gtk4::Widget>()
                     })
                     .unwrap_or(false);
                 if search_focused {
-                    w.window.set_focus(gtk4::Widget::NONE);
+                    gtk4::prelude::GtkWindowExt::set_focus(&w.window, gtk4::Widget::NONE);
                     return glib::Propagation::Stop;
                 }
             }

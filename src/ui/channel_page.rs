@@ -429,11 +429,12 @@ impl ChannelPage {
         let pending_date = Rc::new(Cell::new(UploadDateFilter::AnyTime));
         let mut date_buttons: Vec<(UploadDateFilter, &'static str, Button)> = Vec::new();
         for (val, label) in date_specs {
-            let btn = create_pop_item(if val == UploadDateFilter::AnyTime {
-                &format!("{label} ✓")
+            let init_text = if val == UploadDateFilter::AnyTime {
+                format!("{label} ✓")
             } else {
-                label
-            });
+                label.to_string()
+            };
+            let btn = create_pop_item(&init_text);
             if val == UploadDateFilter::AnyTime {
                 btn.add_css_class("selected");
             }
@@ -478,11 +479,12 @@ impl ChannelPage {
         let pending_dur = Rc::new(Cell::new(DurationFilter::AnyLength));
         let mut dur_buttons: Vec<(DurationFilter, &'static str, Button)> = Vec::new();
         for (val, label) in dur_specs {
-            let btn = create_pop_item(if val == DurationFilter::AnyLength {
-                &format!("{label} ✓")
+            let init_text = if val == DurationFilter::AnyLength {
+                format!("{label} ✓")
             } else {
-                label
-            });
+                label.to_string()
+            };
+            let btn = create_pop_item(&init_text);
             if val == DurationFilter::AnyLength {
                 btn.add_css_class("selected");
             }
@@ -612,11 +614,12 @@ impl ChannelPage {
 
         let mut sort_buttons: Vec<(ChannelSortOrder, &'static str, Button)> = Vec::new();
         for (ord, lbl) in specs {
-            let btn = create_pop_item(if ord == ChannelSortOrder::Newest {
-                &format!("{lbl} ✓")
+            let init_text = if ord == ChannelSortOrder::Newest {
+                format!("{lbl} ✓")
             } else {
-                lbl
-            });
+                lbl.to_string()
+            };
+            let btn = create_pop_item(&init_text);
             if ord == ChannelSortOrder::Newest {
                 btn.add_css_class("selected");
             }
