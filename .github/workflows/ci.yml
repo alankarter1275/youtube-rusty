@@ -5,7 +5,7 @@ on:
   pull_request:
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
 
 jobs:
   check:
@@ -22,12 +22,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "true"
 
-      - name: Cargo check (all targets)
-        run: cargo check --all-targets
+      - name: Cargo check, test, and build
+        run: |
+          python3 - << 'PY'
+          import subprocess, sys
 
-      - name: Cargo test
-        run: cargo test
+          def emit(level, title, text):
+              esc = (
+                  text.replace("%", "%25")
+                      .replace("\r", "%0D")
+                      .replace("\n", "%0A")
+              )
+              # Split into <=60000-char chunks so nothing is ever truncated
+              chunk_size = 55000
+              parts = [esc[i:i+chunk_size] for i in range(0, max(1, len(esc)), chunk_size)]
+              for idx, part in enumerate(parts, 1):
+                  t = title if len(parts) == 1 else f"{title} ({idx}/{len(parts)})"
+                  print(f"::{level} title={t}::{part}", flush=True)
 
-      - name: Cargo build
-        run: cargo build
+          steps = [
+              ("cargo check --all-targets", ["cargo", "check", "--all-targets"]),
+              ("cargo test", ["cargo", "test"]),
+              ("cargo build", ["cargo", "build"]),
+          ]
+
+          for label, cmd in steps:
+              print(f"=== Running: {label} ===", flush=True)
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              out = proc.stdout or ""
+              print(out, flush=True)
+              if proc.returncode != 0:
+                  # Filter out "Compiling ..." lines so only warnings/errors remain
+                  relevant = "\n".join(
+                      line for line in out.splitlines()
+                      if not line.strip().startswith(("Compiling ", "Downloading ", "Downloaded ", "Locking ", "Updating "))
+                  )
+                  emit("error", f"Failed: {label}", relevant[-180000:])
+                  sys.exit(proc.returncode)
+              else:
+                  # Surface any compiler warnings too
+                  relevant = "\n".join(
+                      line for line in out.splitlines()
+                      if not line.strip().startswith(("Compiling ", "Downloading ", "Downloaded ", "Locking ", "Updating "))
+                  )
+                  if "warning:" in relevant:
+                      emit("warning", f"Warnings: {label}", relevant[-50000:])
+
+          emit("notice", "CI Passed", "cargo check, cargo test, and cargo build all succeeded cleanly.")
+          PY
