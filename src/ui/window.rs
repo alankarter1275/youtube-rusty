@@ -3207,6 +3207,8 @@ impl MainWindow {
 
         self.queue_cont_fetching.set(true);
         let seq = self.playback_seq.get();
+        let fallback_for_next = cont.fallback_details.clone();
+        let is_shorts_for_next = cont.is_shorts;
         let engine = self.engine.clone();
         let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
 
@@ -3232,7 +3234,7 @@ impl MainWindow {
             };
             if w.playback_seq.get() != seq {
                 return;
-            }
+            };
             w.queue_cont_fetching.set(false);
 
             match res {
@@ -3241,8 +3243,8 @@ impl MainWindow {
                     let next_cont = if has_items {
                         paged.next.map(|cursor| QueueContinuation {
                             cursor,
-                            fallback_details: cont.fallback_details,
-                            is_shorts: cont.is_shorts,
+                            fallback_details: fallback_for_next,
+                            is_shorts: is_shorts_for_next,
                         })
                     } else {
                         None

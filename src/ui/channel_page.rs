@@ -1535,7 +1535,7 @@ impl ChannelPage {
             let initially_saved = self
                 .actions
                 .playlist_store
-                .find_by_source_id(&pl.id)
+                .find_by_youtube_id(&pl.id)
                 .is_some();
             let pid_open = pl.id.clone();
             let open_cb = self.on_open_playlist.clone();
@@ -1567,7 +1567,7 @@ impl ChannelPage {
                     if cp
                         .actions
                         .playlist_store
-                        .find_by_source_id(&pid_save)
+                        .find_by_youtube_id(&pid_save)
                         .is_some()
                     {
                         (cp.actions.on_toast)("Playlist already saved".to_string());
