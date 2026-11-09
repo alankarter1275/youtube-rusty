@@ -55,6 +55,21 @@ pub struct QueueContinuation {
     pub is_shorts: bool,
 }
 
+#[derive(Clone)]
+enum NavHistoryEntry {
+    MainView {
+        view: ActiveView,
+        search_tab: SearchTab,
+        search_date: UploadDateFilter,
+        search_dur: DurationFilter,
+        search_sort: SearchSortOrder,
+    },
+    Channel {
+        id: String,
+        name: String,
+    },
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum ActiveView {
     HomeTrending,
@@ -119,7 +134,6 @@ pub struct MainWindow {
     playlist_header_box: GtkBox,
     playlist_title_lbl: Label,
     playlist_meta_lbl: Label,
-    playlist_back_btn: Button,
     playlist_play_all_btn: Button,
     playlist_shuffle_btn: Button,
     playlist_save_remote_btn: Button,
@@ -156,7 +170,9 @@ pub struct MainWindow {
     shorts_cols: Cell<u32>,
     view_mode: Cell<ViewMode>,
     active_view: RefCell<ActiveView>,
-    prev_non_search_view: RefCell<ActiveView>,
+    nav_history: RefCell<Vec<NavHistoryEntry>>,
+    suppress_nav_push: Cell<bool>,
+    channel_over_transient_home: Cell<bool>,
     current_videos: RefCell<Vec<VideoSummary>>,
     current_search_items: RefCell<Vec<SearchItem>>,
     remote_playlist_data: RefCell<Option<RemotePlaylist>>,
@@ -326,10 +342,6 @@ impl MainWindow {
         let pl_top_row = GtkBox::new(Orientation::Horizontal, 12);
         pl_top_row.set_valign(Align::Center);
 
-        let playlist_back_btn = Button::with_label("← Playlists");
-        playlist_back_btn.add_css_class("yr-chip");
-        set_pointer(&playlist_back_btn);
-
         let pl_title_col = GtkBox::new(Orientation::Vertical, 2);
         pl_title_col.set_hexpand(true);
 
@@ -348,7 +360,6 @@ impl MainWindow {
         pl_title_col.append(&playlist_title_lbl);
         pl_title_col.append(&playlist_meta_lbl);
 
-        pl_top_row.append(&playlist_back_btn);
         pl_top_row.append(&pl_title_col);
 
         let pl_actions_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -697,7 +708,6 @@ impl MainWindow {
             playlist_header_box,
             playlist_title_lbl,
             playlist_meta_lbl,
-            playlist_back_btn,
             playlist_play_all_btn,
             playlist_shuffle_btn,
             playlist_save_remote_btn,
@@ -734,7 +744,9 @@ impl MainWindow {
             shorts_cols: Cell::new(6),
             view_mode: Cell::new(ViewMode::Grid),
             active_view: RefCell::new(ActiveView::HomeTrending),
-            prev_non_search_view: RefCell::new(ActiveView::HomeTrending),
+            nav_history: RefCell::new(Vec::new()),
+            suppress_nav_push: Cell::new(false),
+            channel_over_transient_home: Cell::new(false),
             current_videos: RefCell::new(Vec::new()),
             current_search_items: RefCell::new(Vec::new()),
             remote_playlist_data: RefCell::new(None),
@@ -1125,14 +1137,24 @@ impl MainWindow {
             .and_then(|p| p.tag())
             .map(|t| t.as_str() != "home")
             .unwrap_or(false);
-        let av = self.active_view.borrow();
-        let can_pop_view = matches!(
-            *av,
-            ActiveView::Search(_)
-                | ActiveView::SavedPlaylistDetail(_)
-                | ActiveView::RemotePlaylist(_)
-        );
-        self.back_btn.set_visible(on_subpage || can_pop_view);
+        let has_history = !self.nav_history.borrow().is_empty();
+        self.back_btn.set_visible(on_subpage || has_history);
+    }
+
+    fn reset_nav_root<F: FnOnce()>(&self, action: F) {
+        self.nav_history.borrow_mut().clear();
+        self.channel_over_transient_home.set(false);
+        let prev = self.suppress_nav_push.replace(true);
+        action();
+        self.suppress_nav_push.set(prev);
+        self.update_back_button_visibility();
+    }
+
+    fn with_suppressed_nav_push<F: FnOnce()>(&self, action: F) {
+        let prev = self.suppress_nav_push.replace(true);
+        action();
+        self.suppress_nav_push.set(prev);
+        self.update_back_button_visibility();
     }
 
     fn defocus_search_bar(&self) {
@@ -1150,65 +1172,99 @@ impl MainWindow {
             .map(|t| t.as_str() != "home")
             .unwrap_or(false);
         if on_subpage {
+            let single_channel = self.open_channels.borrow().len() <= 1;
             self.nav_view.pop();
+            if single_channel && self.channel_over_transient_home.replace(false) {
+                if let Some(entry) = self.nav_history.borrow_mut().pop() {
+                    self.restore_nav_entry(entry);
+                }
+            }
+            self.update_back_button_visibility();
             self.defocus_search_bar();
             return;
         }
-        let av = self.active_view.borrow().clone();
-        match av {
-            ActiveView::SavedPlaylistDetail(_) => {
-                self.set_active_nav(Some(RailTab::Playlists));
-                self.load_playlists_overview();
-            }
-            ActiveView::RemotePlaylist(_) => {
-                self.restore_previous_non_search_view();
-            }
-            ActiveView::Search(_) => {
-                self.clear_search_bar_quietly();
-                self.restore_previous_non_search_view();
-            }
-            _ => {}
+
+        if let Some(entry) = self.nav_history.borrow_mut().pop() {
+            self.restore_nav_entry(entry);
         }
+        self.update_back_button_visibility();
         self.defocus_search_bar();
     }
 
-    fn restore_previous_non_search_view(self: &Rc<Self>) {
-        let prev = self.prev_non_search_view.borrow().clone();
-        match prev {
-            ActiveView::HomeCategory(cat) => {
-                self.set_active_nav(Some(RailTab::Home));
-                match cat.as_str() {
-                    "Gaming" => self.highlight_chip(Some(&self.chip_gaming)),
-                    "Music" => self.highlight_chip(Some(&self.chip_music)),
-                    "News" => self.highlight_chip(Some(&self.chip_news)),
-                    _ => self.highlight_chip(Some(&self.chip_trending)),
+    fn restore_nav_entry(self: &Rc<Self>, entry: NavHistoryEntry) {
+        match entry {
+            NavHistoryEntry::Channel { id, name } => {
+                self.channel_over_transient_home.set(true);
+                self.open_channel(&id, &name);
+            }
+            NavHistoryEntry::MainView {
+                view,
+                search_tab,
+                search_date,
+                search_dur,
+                search_sort,
+            } => {
+                self.channel_over_transient_home.set(false);
+                if let ActiveView::Search(ref q) = view {
+                    self.search_tab.set(search_tab);
+                    self.search_date_filter.set(search_date);
+                    self.search_dur_filter.set(search_dur);
+                    self.search_sort_order.set(search_sort);
+                    self.set_search_text_quietly(q);
+                    let q_owned = q.clone();
+                    let this = self.clone();
+                    self.with_suppressed_nav_push(|| {
+                        this.search(&q_owned);
+                    });
+                    return;
                 }
-                self.search_category(&cat);
-            }
-            ActiveView::WatchLater => {
-                self.set_active_nav(Some(RailTab::Home));
-                self.highlight_chip(Some(&self.chip_watch_later));
-                self.load_watch_later();
-            }
-            ActiveView::Subscriptions => {
-                self.set_active_nav(Some(RailTab::Subscriptions));
-                self.load_subscriptions();
-            }
-            ActiveView::Playlists | ActiveView::SavedPlaylistDetail(_) => {
-                self.set_active_nav(Some(RailTab::Playlists));
-                self.load_playlists_overview();
-            }
-            ActiveView::History => {
-                self.set_active_nav(Some(RailTab::History));
-                self.load_history();
-            }
-            ActiveView::Preferences => {
-                self.open_settings();
-            }
-            _ => {
-                self.set_active_nav(Some(RailTab::Home));
-                self.highlight_chip(Some(&self.chip_trending));
-                self.load_trending();
+
+                self.clear_search_bar_quietly();
+                let this = self.clone();
+                self.with_suppressed_nav_push(|| match view {
+                    ActiveView::HomeCategory(cat) => {
+                        this.set_active_nav(Some(RailTab::Home));
+                        match cat.as_str() {
+                            "Gaming" => this.highlight_chip(Some(&this.chip_gaming)),
+                            "Music" => this.highlight_chip(Some(&this.chip_music)),
+                            "News" => this.highlight_chip(Some(&this.chip_news)),
+                            _ => this.highlight_chip(Some(&this.chip_trending)),
+                        }
+                        this.search_category(&cat);
+                    }
+                    ActiveView::WatchLater => {
+                        this.set_active_nav(Some(RailTab::Home));
+                        this.highlight_chip(Some(&this.chip_watch_later));
+                        this.load_watch_later();
+                    }
+                    ActiveView::Subscriptions => {
+                        this.set_active_nav(Some(RailTab::Subscriptions));
+                        this.load_subscriptions();
+                    }
+                    ActiveView::Playlists => {
+                        this.set_active_nav(Some(RailTab::Playlists));
+                        this.load_playlists_overview();
+                    }
+                    ActiveView::SavedPlaylistDetail(pid) => {
+                        this.set_active_nav(Some(RailTab::Playlists));
+                        this.open_saved_playlist(&pid);
+                    }
+                    ActiveView::RemotePlaylist(pid) => {
+                        this.open_remote_playlist(&pid);
+                    }
+                    ActiveView::History => {
+                        this.set_active_nav(Some(RailTab::History));
+                        this.load_history();
+                    }
+                    ActiveView::Preferences => {
+                        this.open_settings();
+                    }
+                    ActiveView::HomeTrending | ActiveView::Search(_) => {
+                        this.set_active_nav(Some(RailTab::Home));
+                        this.highlight_chip(Some(&this.chip_trending));
+                        this.load_trending();
+                    }
+                });
             }
         }
     }
@@ -2048,13 +2104,6 @@ impl MainWindow {
 
         // Playlist detail header buttons
         let weak = Rc::downgrade(self);
-        self.playlist_back_btn.connect_clicked(move |_| {
-            if let Some(w) = weak.upgrade() {
-                w.go_back();
-            }
-        });
-
-        let weak = Rc::downgrade(self);
         self.playlist_play_all_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
                 let vids = w.current_videos.borrow().clone();
@@ -2111,10 +2160,22 @@ impl MainWindow {
                 };
                 if let Some(pid) = pid_opt {
                     w.playlist_store.delete(&pid);
+                    w.nav_history.borrow_mut().retain(|e| {
+                        !matches!(
+                            e,
+                            NavHistoryEntry::MainView {
+                                view: ActiveView::SavedPlaylistDetail(ref saved_id),
+                                ..
+                            } if saved_id == &pid
+                        )
+                    });
                     w.toast_overlay
                         .add_toast(adw::Toast::new("Deleted playlist"));
-                    w.set_active_nav(Some(RailTab::Playlists));
-                    w.load_playlists_overview();
+                    let win = w.clone();
+                    w.with_suppressed_nav_push(|| {
+                        win.set_active_nav(Some(RailTab::Playlists));
+                        win.load_playlists_overview();
+                    });
                 }
             }
         });
@@ -2145,54 +2206,72 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.rail.logo_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Home));
-                w.highlight_chip(Some(&w.chip_trending));
-                w.load_trending();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Home));
+                    win.highlight_chip(Some(&win.chip_trending));
+                    win.load_trending();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.rail.home_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Home));
-                w.highlight_chip(Some(&w.chip_trending));
-                w.load_trending();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Home));
+                    win.highlight_chip(Some(&win.chip_trending));
+                    win.load_trending();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.rail.subs_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Subscriptions));
-                w.load_subscriptions();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Subscriptions));
+                    win.load_subscriptions();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.rail.playlists_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Playlists));
-                w.load_playlists_overview();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Playlists));
+                    win.load_playlists_overview();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.rail.hist_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::History));
-                w.load_history();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::History));
+                    win.load_history();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.rail.settings_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.open_settings();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.open_settings();
+                });
             }
         });
 
@@ -2200,44 +2279,59 @@ impl MainWindow {
         let weak = Rc::downgrade(self);
         self.bottom_home.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Home));
-                w.highlight_chip(Some(&w.chip_trending));
-                w.load_trending();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Home));
+                    win.highlight_chip(Some(&win.chip_trending));
+                    win.load_trending();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.bottom_subs.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Subscriptions));
-                w.load_subscriptions();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Subscriptions));
+                    win.load_subscriptions();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.bottom_playlists.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Playlists));
-                w.load_playlists_overview();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::Playlists));
+                    win.load_playlists_overview();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.bottom_hist.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::History));
-                w.load_history();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.clear_search_bar_quietly();
+                    win.set_active_nav(Some(RailTab::History));
+                    win.load_history();
+                });
             }
         });
 
         let weak = Rc::downgrade(self);
         self.bottom_settings.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                w.open_settings();
+                let win = w.clone();
+                w.reset_nav_root(|| {
+                    win.open_settings();
+                });
             }
         });
 
@@ -3511,21 +3605,22 @@ impl MainWindow {
         }
 
         let av = self.active_view.borrow().clone();
-        match av {
-            ActiveView::HomeTrending => self.load_trending(),
-            ActiveView::HomeCategory(cat) => self.search_category(&cat),
-            ActiveView::WatchLater => self.load_watch_later(),
-            ActiveView::Search(query) => self.search(&query),
-            ActiveView::Subscriptions => self.load_subscriptions(),
-            ActiveView::Playlists => self.load_playlists_overview(),
-            ActiveView::SavedPlaylistDetail(pid) => self.open_saved_playlist(&pid),
-            ActiveView::RemotePlaylist(pid) => self.open_remote_playlist(&pid),
-            ActiveView::History => self.load_history(),
+        let this = self.clone();
+        self.with_suppressed_nav_push(|| match av {
+            ActiveView::HomeTrending => this.load_trending_opts(true),
+            ActiveView::HomeCategory(cat) => this.search_category_opts(&cat, true),
+            ActiveView::WatchLater => this.load_watch_later(),
+            ActiveView::Search(query) => this.search(&query),
+            ActiveView::Subscriptions => this.load_subscriptions(),
+            ActiveView::Playlists => this.load_playlists_overview(),
+            ActiveView::SavedPlaylistDetail(pid) => this.open_saved_playlist(&pid),
+            ActiveView::RemotePlaylist(pid) => this.open_remote_playlist(&pid),
+            ActiveView::History => this.load_history(),
             ActiveView::Preferences => {
-                let current = self.settings_store.load();
-                self.sync_preferences_ui(&current);
+                let current = this.settings_store.load();
+                this.sync_preferences_ui(&current);
             }
-        }
+        });
     }
 
     fn next_request_id(&self) -> u64 {
@@ -3544,15 +3639,58 @@ impl MainWindow {
         section_heading: Option<&str>,
     ) {
         self.defocus_search_bar();
+        let was_on_subpage = self
+            .nav_view
+            .visible_page()
+            .and_then(|p| p.tag())
+            .map(|t| t.as_str() != "home")
+            .unwrap_or(false);
+        let popped_channel_info = if was_on_subpage {
+            self.open_channels
+                .borrow()
+                .last()
+                .map(|cp| (cp.channel_id().to_string(), cp.page.title().to_string()))
+        } else {
+            None
+        };
+
         self.nav_view.pop_to_page(&self.home_page);
         self.clear_card_selection();
 
-        if !matches!(
-            view,
-            ActiveView::Search(_) | ActiveView::RemotePlaylist(_)
-        ) {
-            *self.prev_non_search_view.borrow_mut() = view.clone();
+        if !self.suppress_nav_push.get() {
+            let old_view = self.active_view.borrow().clone();
+            if old_view != view {
+                let mut hist = self.nav_history.borrow_mut();
+                hist.push(NavHistoryEntry::MainView {
+                    view: old_view,
+                    search_tab: self.search_tab.get(),
+                    search_date: self.search_date_filter.get(),
+                    search_dur: self.search_dur_filter.get(),
+                    search_sort: self.search_sort_order.get(),
+                });
+                if let Some((cid, cname)) = popped_channel_info {
+                    hist.push(NavHistoryEntry::Channel {
+                        id: cid,
+                        name: cname,
+                    });
+                }
+                if hist.len() > 32 {
+                    let drop_n = hist.len() - 32;
+                    hist.drain(0..drop_n);
+                }
+            } else if let Some((cid, cname)) = popped_channel_info {
+                let mut hist = self.nav_history.borrow_mut();
+                hist.push(NavHistoryEntry::Channel {
+                    id: cid,
+                    name: cname,
+                });
+                if hist.len() > 32 {
+                    let drop_n = hist.len() - 32;
+                    hist.drain(0..drop_n);
+                }
+            }
         }
+
         *self.active_view.borrow_mut() = view.clone();
         *self.feed_cursor.borrow_mut() = None;
         self.trending_cursors.borrow_mut().clear();
@@ -4040,7 +4178,6 @@ impl MainWindow {
             None,
         );
 
-        self.playlist_back_btn.set_label("← Playlists");
         self.playlist_title_lbl.set_text(&pl.name);
         let total_secs: u64 = pl.videos.iter().filter_map(|v| v.duration_seconds).sum();
         let dur_str = format_queue_total_duration(total_secs);
@@ -4129,7 +4266,6 @@ impl MainWindow {
             None,
         );
 
-        self.playlist_back_btn.set_label("← Back");
         self.playlist_title_lbl.set_text("Loading playlist…");
         self.playlist_meta_lbl.set_text("");
         self.playlist_rename_btn.set_visible(false);
@@ -4274,6 +4410,10 @@ impl MainWindow {
     }
 
     pub fn search_category(self: &Rc<Self>, category: &str) {
+        self.search_category_opts(category, false);
+    }
+
+    pub fn search_category_opts(self: &Rc<Self>, category: &str, force_refresh: bool) {
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::HomeCategory(category.to_string()),
@@ -4291,7 +4431,7 @@ impl MainWindow {
         let cat_ui = category.to_string();
 
         self.runtime.spawn(async move {
-            let res = engine.category_feed(&cat).await;
+            let res = engine.category_feed(&cat, force_refresh).await;
             let _ = sender.send(res).await;
         });
 
@@ -4462,6 +4602,10 @@ impl MainWindow {
     }
 
     pub fn load_trending(self: &Rc<Self>) {
+        self.load_trending_opts(false);
+    }
+
+    pub fn load_trending_opts(self: &Rc<Self>, force_refresh: bool) {
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::HomeTrending,
@@ -4477,7 +4621,7 @@ impl MainWindow {
         let engine = self.engine.clone();
 
         self.runtime.spawn(async move {
-            let res = engine.trending_initial().await;
+            let res = engine.trending_initial(force_refresh).await;
             let _ = sender.send(res).await;
         });
 

@@ -76,6 +76,7 @@ pub enum CursorKind {
     RustyPipe,
     DirectChannelShorts,
     DirectPlaylistVideos,
+    DirectHomeFeed,
     DirectSearch,
     DirectChannelPlaylists,
 }
@@ -224,6 +225,10 @@ pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
     visitor_data: RwLock<Option<String>>,
+    home_seed: AtomicU64,
+    seen_home_ids: RwLock<Vec<String>>,
+    category_seed: AtomicU64,
+    seen_category_ids: RwLock<Vec<String>>,
 }
 
 impl Engine {
@@ -240,10 +245,18 @@ impl Engine {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let init_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+            .unwrap_or(7);
         Self {
             rp,
             http,
             visitor_data: RwLock::new(None),
+            home_seed: AtomicU64::new(init_seed),
+            seen_home_ids: RwLock::new(Vec::new()),
+            category_seed: AtomicU64::new(init_seed.wrapping_add(3)),
+            seen_category_ids: RwLock::new(Vec::new()),
         }
     }
 
@@ -1234,48 +1247,132 @@ impl Engine {
         }
 
         let browse_id = format!("VL{clean_id}");
-        if let Ok(val) = self
-            .fetch_channel_browse_json(&browse_id, Some("wgYCCAA%3D"), None)
+        let mut header_only: Option<RemotePlaylist> = None;
+
+        // 1. Plain `VL<id>` browse (supports standard playlists, Podcasts, Courses, and lockupViewModel items)
+        let mut initial_val = self
+            .fetch_channel_browse_json(&browse_id, None, None)
             .await
-        {
-            if let Some(parsed) = parse_playlist_browse_response(&val, clean_id) {
-                if !parsed.videos.is_empty() || !parsed.name.is_empty() {
+            .ok();
+        if initial_val.is_none() {
+            initial_val = self
+                .fetch_channel_browse_json(&browse_id, Some("wgYCCAA="), None)
+                .await
+                .ok();
+        }
+
+        if let Some(val) = initial_val {
+            if let Some(mut parsed) = parse_playlist_browse_response(&val, clean_id) {
+                // 2. If initial browse returned header + lazy continuation token, resolve first page immediately
+                if parsed.videos.is_empty() {
+                    if let Some(ref next_cur) = parsed.next.clone() {
+                        if let Ok(cont_page) =
+                            self.continue_playlist_videos_direct(&next_cur.ctoken).await
+                        {
+                            parsed.videos = cont_page.items;
+                            parsed.next = cont_page.next;
+                        }
+                    }
+                }
+
+                // 3. If still empty (e.g. YouTube's new lockup playlist interface omitting inline `contents`),
+                // request the explicit initial PlaylistContinuation protobuf token on `/youtubei/v1/browse`
+                if parsed.videos.is_empty() {
+                    let synth_ctoken = build_initial_playlist_continuation_token(clean_id);
+                    if let Ok(cont_val) = self
+                        .fetch_channel_browse_json("", None, Some(&synth_ctoken))
+                        .await
+                    {
+                        let cont_page = parse_playlist_continuation_response(&cont_val);
+                        if !cont_page.items.is_empty() {
+                            parsed.videos = cont_page.items;
+                            parsed.next = cont_page.next;
+                        }
+                    }
+                }
+
+                // Backfill playlist owner name onto Podcast/Course episodes where YouTube omits redundant bylines
+                if !parsed.channel_name.is_empty() {
+                    for v in &mut parsed.videos {
+                        if v.channel_name.is_empty() {
+                            v.channel_name = parsed.channel_name.clone();
+                        }
+                    }
+                }
+
+                if !parsed.videos.is_empty() {
                     return Ok(parsed);
+                }
+                header_only = Some(parsed);
+            }
+        }
+
+        // 4. Even if metadata browse failed, try synthetic initial continuation token directly
+        if header_only.is_none() {
+            let synth_ctoken = build_initial_playlist_continuation_token(clean_id);
+            if let Ok(cont_val) = self
+                .fetch_channel_browse_json("", None, Some(&synth_ctoken))
+                .await
+            {
+                let cont_page = parse_playlist_continuation_response(&cont_val);
+                if !cont_page.items.is_empty() {
+                    let channel_name = cont_page
+                        .items
+                        .first()
+                        .map(|v| v.channel_name.clone())
+                        .unwrap_or_default();
+                    let video_count_text = format!("{} videos", cont_page.items.len());
+                    return Ok(RemotePlaylist {
+                        id: clean_id.to_string(),
+                        name: "Playlist".to_string(),
+                        channel_name,
+                        video_count_text,
+                        videos: cont_page.items,
+                        next: cont_page.next,
+                    });
                 }
             }
         }
 
-        let pl = self
-            .rp
-            .query()
-            .playlist(clean_id)
-            .await
-            .map_err(|e| format!("Could not load playlist: {e}"))?;
+        match self.rp.query().playlist(clean_id).await {
+            Ok(pl) => {
+                let channel_name = pl.channel.map(|c| c.name).unwrap_or_default();
+                let video_count_text = if pl.video_count > 0 {
+                    format!("{} videos", format_count(pl.video_count))
+                } else {
+                    format!("{} videos", pl.videos.items.len())
+                };
+                let next = cursor_from_paginator(&pl.videos);
+                let videos: Vec<VideoSummary> = pl
+                    .videos
+                    .items
+                    .into_iter()
+                    .map(|it| map_video_item(it, None, false))
+                    .collect();
 
-        let channel_name = pl.channel.map(|c| c.name).unwrap_or_default();
+                if videos.is_empty() {
+                    if let Some(h) = header_only {
+                        return Ok(h);
+                    }
+                }
 
-        let video_count_text = if pl.video_count > 0 {
-            format!("{} videos", format_count(pl.video_count))
-        } else {
-            format!("{} videos", pl.videos.items.len())
-        };
-
-        let next = cursor_from_paginator(&pl.videos);
-        let videos = pl
-            .videos
-            .items
-            .into_iter()
-            .map(|it| map_video_item(it, None, false))
-            .collect();
-
-        Ok(RemotePlaylist {
-            id: pl.id,
-            name: pl.name,
-            channel_name,
-            video_count_text,
-            videos,
-            next,
-        })
+                Ok(RemotePlaylist {
+                    id: pl.id,
+                    name: pl.name,
+                    channel_name,
+                    video_count_text,
+                    videos,
+                    next,
+                })
+            }
+            Err(e) => {
+                if let Some(h) = header_only {
+                    Ok(h)
+                } else {
+                    Err(format!("Could not load playlist: {e}"))
+                }
+            }
+        }
     }
 
     pub async fn channel_playlists(
@@ -1548,22 +1645,71 @@ impl Engine {
         Ok(PagedVideos { items, next })
     }
 
-    pub async fn category_feed(&self, category: &str) -> Result<PagedVideos, String> {
+    pub async fn category_feed(
+        &self,
+        category: &str,
+        force_refresh: bool,
+    ) -> Result<PagedVideos, String> {
+        let variants: &[&str] = match category.to_ascii_lowercase().as_str() {
+            "gaming" => &[
+                "Gaming",
+                "gaming highlights",
+                "game review gameplay",
+                "esports tournament",
+                "indie games showcase",
+            ],
+            "music" => &[
+                "Music",
+                "live music session",
+                "official music video",
+                "acoustic performance",
+                "concert live performance",
+            ],
+            "news" => &[
+                "News",
+                "world news analysis",
+                "breaking news report",
+                "global current affairs",
+                "economics geopolitics news",
+            ],
+            _ => &[],
+        };
+
+        let step = if force_refresh {
+            self.category_seed.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        } else {
+            self.category_seed.load(Ordering::Relaxed)
+        };
+
+        let chosen_query = if variants.is_empty() {
+            category
+        } else if !force_refresh {
+            variants[0]
+        } else {
+            variants[(step as usize) % variants.len()]
+        };
+
+        let date_window = match step % 3 {
+            1 if force_refresh => UploadDate::Day,
+            2 if force_refresh => UploadDate::Month,
+            _ => UploadDate::Week,
+        };
+
         let filter = SearchFilter::new()
             .item_type(ItemType::Video)
-            .date(UploadDate::Week);
+            .date(date_window);
 
         let paginator = match self
             .rp
             .query()
-            .search_filter::<VideoItem, _>(category, &filter)
+            .search_filter::<VideoItem, _>(chosen_query, &filter)
             .await
         {
             Ok(res) if !res.items.items.is_empty() => res.items,
             _ => {
                 self.rp
                     .query()
-                    .search::<VideoItem, _>(category)
+                    .search::<VideoItem, _>(chosen_query)
                     .await
                     .map_err(|e| format!("Category error: {e}"))?
                     .items
@@ -1571,12 +1717,41 @@ impl Engine {
         };
 
         let next = cursor_from_paginator(&paginator);
-        let items = paginator
+        let all_mapped: Vec<VideoSummary> = paginator
             .items
             .into_iter()
             .filter(|it| !it.is_short)
             .map(|it| map_video_item(it, None, false))
             .collect();
+
+        let prev_seen: HashSet<String> = if force_refresh {
+            self.seen_category_ids.read().await.iter().cloned().collect()
+        } else {
+            HashSet::new()
+        };
+
+        let mut items: Vec<VideoSummary> = all_mapped
+            .iter()
+            .filter(|v| !prev_seen.contains(&v.id))
+            .cloned()
+            .collect();
+        if items.len() < 8 {
+            items = all_mapped;
+        }
+        if force_refresh && items.len() > 2 {
+            shuffle_videos_seeded(&mut items, step ^ 0x9E37_79B9_7F4A_7C15);
+        }
+
+        {
+            let mut guard = self.seen_category_ids.write().await;
+            for v in items.iter().take(24) {
+                guard.push(v.id.clone());
+            }
+            if guard.len() > 96 {
+                let drain_n = guard.len() - 96;
+                guard.drain(0..drain_n);
+            }
+        }
 
         Ok(PagedVideos { items, next })
     }
@@ -1594,8 +1769,17 @@ impl Engine {
                     .continue_channel_shorts_direct(&cursor.ctoken, fallback_details)
                     .await;
             }
-            CursorKind::DirectPlaylistVideos => {
-                return self.continue_playlist_videos_direct(&cursor.ctoken).await;
+            CursorKind::DirectPlaylistVideos | CursorKind::DirectHomeFeed => {
+                let mut page = self.continue_playlist_videos_direct(&cursor.ctoken).await?;
+                if cursor.kind == CursorKind::DirectHomeFeed {
+                    if let Some(ref mut nc) = page.next {
+                        nc.kind = CursorKind::DirectHomeFeed;
+                    }
+                    if filter_out_shorts {
+                        page.items.retain(|v| !v.is_short);
+                    }
+                }
+                return Ok(page);
             }
             _ => {}
         }
@@ -1628,18 +1812,56 @@ impl Engine {
         Ok(PagedVideos { items, next })
     }
 
-    /// Lightweight initial Trending page (~16-20 videos from 2 concurrent discovery queries)
-    /// plus continuation cursors so additional videos are fetched only when scrolling near bottom.
-    pub async fn trending_initial(&self) -> Result<PagedTrending, String> {
-        let topics = ["music", "technology"];
+    /// Dynamic Home discovery feed: blends YouTube `FEwhat_to_watch` (when available) with a rotating
+    /// 16-topic discovery pool and deduplicates recently displayed videos so Refresh (`Ctrl+R` / `↻`)
+    /// always delivers a genuinely fresh page of videos.
+    pub async fn trending_initial(&self, force_refresh: bool) -> Result<PagedTrending, String> {
+        const HOME_DISCOVERY_TOPICS: &[&str] = &[
+            "technology review",
+            "science documentary",
+            "podcast interview",
+            "world news analysis",
+            "software engineering",
+            "cinema video essay",
+            "history explained",
+            "live music performance",
+            "space astronomy",
+            "gaming highlights",
+            "economics finance",
+            "hardware build",
+            "standup comedy",
+            "geopolitics documentary",
+            "physics explained",
+            "engineering documentary",
+        ];
+
+        if force_refresh {
+            *self.visitor_data.write().await = None;
+        }
+
+        let step = self.home_seed.fetch_add(1, Ordering::Relaxed);
+        let base_idx = ((step as usize) * 4) % HOME_DISCOVERY_TOPICS.len();
+        let chosen_topics: [&str; 4] = [
+            HOME_DISCOVERY_TOPICS[base_idx % HOME_DISCOVERY_TOPICS.len()],
+            HOME_DISCOVERY_TOPICS[(base_idx + 1) % HOME_DISCOVERY_TOPICS.len()],
+            HOME_DISCOVERY_TOPICS[(base_idx + 2) % HOME_DISCOVERY_TOPICS.len()],
+            HOME_DISCOVERY_TOPICS[(base_idx + 3) % HOME_DISCOVERY_TOPICS.len()],
+        ];
+
+        let date_mode = step % 3;
         let mut join_set = JoinSet::new();
 
-        for (idx, topic) in topics.into_iter().enumerate() {
+        for (idx, topic) in chosen_topics.into_iter().enumerate() {
             let rp = self.rp.clone();
+            let upload_date = match (date_mode + idx as u64) % 3 {
+                0 => UploadDate::Week,
+                1 => UploadDate::Day,
+                _ => UploadDate::Month,
+            };
             join_set.spawn(async move {
                 let filter = SearchFilter::new()
                     .item_type(ItemType::Video)
-                    .date(UploadDate::Week);
+                    .date(upload_date);
                 let res = rp
                     .query()
                     .search_filter::<VideoItem, _>(topic, &filter)
@@ -1650,9 +1872,26 @@ impl Engine {
             });
         }
 
-        let mut buckets: Vec<Vec<VideoSummary>> = vec![Vec::new(); topics.len()];
+        let home_browse_fut = self.fetch_channel_browse_json("FEwhat_to_watch", None, None);
+        let home_browse_res = tokio::time::timeout(Duration::from_secs(4), home_browse_fut).await;
+
+        let mut buckets: Vec<Vec<VideoSummary>> = vec![Vec::new(); chosen_topics.len() + 1];
         let mut cursors = Vec::new();
         let mut last_err = None;
+
+        if let Ok(Ok(home_json)) = home_browse_res {
+            let home_page = parse_home_feed_response(&home_json);
+            if !home_page.items.is_empty() {
+                if let Some(c) = home_page.next {
+                    cursors.push(c);
+                }
+                buckets[0] = home_page
+                    .items
+                    .into_iter()
+                    .filter(|v| !v.is_short && v.duration_seconds.unwrap_or(120) >= 60)
+                    .collect();
+            }
+        }
 
         while let Some(joined) = join_set.join_next().await {
             if let Ok((idx, res)) = joined {
@@ -1661,7 +1900,7 @@ impl Engine {
                         if let Some(c) = cursor_from_paginator(&paginator) {
                             cursors.push(c);
                         }
-                        buckets[idx] = paginator
+                        buckets[idx + 1] = paginator
                             .items
                             .into_iter()
                             .filter(|it| !it.is_short && it.duration.unwrap_or(120) >= 60)
@@ -1673,28 +1912,48 @@ impl Engine {
             }
         }
 
-        let mut merged = Vec::new();
+        let recently_seen: HashSet<String> = self.seen_home_ids.read().await.iter().cloned().collect();
+
+        let mut fresh = Vec::new();
+        let mut fallback_repeats = Vec::new();
         let mut seen = HashSet::new();
         let max_len = buckets.iter().map(|b| b.len()).max().unwrap_or(0);
         for i in 0..max_len {
             for bucket in &buckets {
                 if let Some(v) = bucket.get(i) {
                     if seen.insert(v.id.clone()) {
-                        merged.push(v.clone());
-                        if merged.len() >= 16 {
-                            return Ok(PagedTrending {
-                                items: merged,
-                                cursors,
-                            });
+                        if recently_seen.contains(&v.id) {
+                            fallback_repeats.push(v.clone());
+                        } else {
+                            fresh.push(v.clone());
                         }
                     }
                 }
             }
         }
 
-        if !merged.is_empty() {
+        shuffle_videos_seeded(&mut fresh, step.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+        fresh.truncate(20);
+        if fresh.len() < 16 {
+            for rep in fallback_repeats {
+                if fresh.len() >= 16 {
+                    break;
+                }
+                fresh.push(rep);
+            }
+        }
+
+        if !fresh.is_empty() {
+            let mut guard = self.seen_home_ids.write().await;
+            for v in &fresh {
+                guard.push(v.id.clone());
+            }
+            if guard.len() > 120 {
+                let drain_n = guard.len() - 120;
+                guard.drain(0..drain_n);
+            }
             return Ok(PagedTrending {
-                items: merged,
+                items: fresh,
                 cursors,
             });
         }
@@ -3650,6 +3909,281 @@ fn parse_playlist_lockup_json(
     })
 }
 
+fn push_proto_varint(out: &mut Vec<u8>, mut val: u64) {
+    while val >= 0x80 {
+        out.push(((val as u8) & 0x7F) | 0x80);
+        val >>= 7;
+    }
+    out.push(val as u8);
+}
+
+fn push_proto_bytes_field(out: &mut Vec<u8>, field_number: u64, data: &[u8]) {
+    let tag = (field_number << 3) | 2;
+    push_proto_varint(out, tag);
+    push_proto_varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+fn encode_base64_url_safe_pct(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((bytes.len() * 4) / 3 + 8);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+        out.push(TABLE[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let n = (bytes[i] as u32) << 16;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push_str("%3D%3D");
+    } else if rem == 2 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3F) as usize] as char);
+        out.push_str("%3D");
+    }
+    out
+}
+
+/// Builds YouTube's `PlaylistContinuation` protobuf token (`field 80226972`) used by YouTube's
+/// new `lockupViewModel` / Podcast / Course playlist pages to fetch initial items.
+fn build_initial_playlist_continuation_token(playlist_id: &str) -> String {
+    let browse_id = format!("VL{playlist_id}");
+    let mut inner = Vec::with_capacity(browse_id.len() + playlist_id.len() + 32);
+    push_proto_bytes_field(&mut inner, 2, browse_id.as_bytes());
+    push_proto_bytes_field(&mut inner, 3, b"CADCBgIIAA%3D%3D");
+    push_proto_bytes_field(&mut inner, 35, playlist_id.as_bytes());
+
+    let mut outer = Vec::with_capacity(inner.len() + 12);
+    push_proto_bytes_field(&mut outer, 80_226_972, &inner);
+    encode_base64_url_safe_pct(&outer)
+}
+
+fn shuffle_videos_seeded(items: &mut [VideoSummary], mut state: u64) {
+    if state == 0 {
+        state = 0xCAFE_BABE_DEAD_BEEF;
+    }
+    for i in (1..items.len()).rev() {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let j = (z as usize) % (i + 1);
+        items.swap(i, j);
+    }
+}
+
+fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
+    let content_type = lockup
+        .get("contentType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if content_type == "LOCKUP_CONTENT_TYPE_PLAYLIST"
+        || content_type == "LOCKUP_CONTENT_TYPE_PODCAST"
+        || content_type == "LOCKUP_CONTENT_TYPE_ALBUM"
+        || content_type == "LOCKUP_CONTENT_TYPE_CHANNEL"
+    {
+        return None;
+    }
+
+    let vid = lockup
+        .get("contentId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| {
+            s.len() == 11
+                && !s.starts_with("PL")
+                && !s.starts_with("OL")
+                && !s.starts_with("RD")
+                && !s.starts_with("UU")
+        })
+        .or_else(|| {
+            lockup
+                .pointer("/rendererContext/commandContext/onTap/innertubeCommand/watchEndpoint/videoId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            lockup
+                .pointer("/rendererContext/commandContext/onTap/innertubeCommand/reelWatchEndpoint/videoId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })?;
+
+    let title = lockup
+        .pointer("/metadata/lockupMetadataViewModel/title/content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| extract_yt_text(lockup.pointer("/metadata/lockupMetadataViewModel/title")))?;
+
+    if title == "[Private video]" || title == "[Deleted video]" {
+        return None;
+    }
+
+    let mut is_short = lockup
+        .pointer("/rendererContext/commandContext/onTap/innertubeCommand/reelWatchEndpoint")
+        .is_some();
+    let mut duration_text = String::new();
+
+    if let Some(overlays) = lockup
+        .pointer("/contentImage/thumbnailViewModel/overlays")
+        .and_then(|v| v.as_array())
+    {
+        for ov in overlays {
+            let badge_arrays = [
+                ov.pointer("/thumbnailBottomOverlayViewModel/badges")
+                    .and_then(|v| v.as_array()),
+                ov.pointer("/thumbnailOverlayBadgeViewModel/thumbnailBadges")
+                    .and_then(|v| v.as_array()),
+            ];
+            for badges in badge_arrays.into_iter().flatten() {
+                for b in badges {
+                    let Some(vm) = b.get("thumbnailBadgeViewModel") else {
+                        continue;
+                    };
+                    if let Some(txt) = vm.get("text").and_then(|v| v.as_str()).map(str::trim) {
+                        if txt.eq_ignore_ascii_case("SHORTS") {
+                            is_short = true;
+                        } else if duration_text.is_empty()
+                            && txt.chars().any(|c| c.is_ascii_digit())
+                        {
+                            duration_text = txt.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let duration_seconds = parse_mmss_to_seconds(&duration_text);
+
+    let mut channel_name = String::new();
+    let mut channel_id = lockup
+        .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("UC"))
+        .unwrap_or_default()
+        .to_string();
+    let channel_avatar_url = pick_json_sources_url(
+        lockup
+            .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/avatar/avatarViewModel/image/sources")
+            .and_then(|v| v.as_array()),
+        64,
+    )
+    .unwrap_or_default();
+
+    let mut view_count_text = String::new();
+    let mut published_text = String::new();
+
+    if let Some(rows) = lockup
+        .pointer("/metadata/lockupMetadataViewModel/metadata/contentMetadataViewModel/metadataRows")
+        .and_then(|v| v.as_array())
+    {
+        for row in rows {
+            let Some(parts) = row.get("metadataParts").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for part in parts {
+                let Some(txt) = part
+                    .pointer("/text/content")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                if channel_id.is_empty() {
+                    if let Some(bid) = part
+                        .pointer("/text/commandRuns/0/onTap/innertubeCommand/browseEndpoint/browseId")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| s.starts_with("UC"))
+                    {
+                        channel_id = bid.to_string();
+                        if channel_name.is_empty() {
+                            channel_name = txt.to_string();
+                            continue;
+                        }
+                    }
+                }
+                let lower = txt.to_ascii_lowercase();
+                if view_count_text.is_empty()
+                    && (lower.contains("view") || lower.contains("watching"))
+                {
+                    view_count_text = txt.to_string();
+                } else if published_text.is_empty()
+                    && (lower.contains("ago")
+                        || lower.contains("streamed")
+                        || lower.contains("premiered"))
+                {
+                    published_text = txt.to_string();
+                } else if channel_name.is_empty()
+                    && !lower.contains("episode")
+                    && !lower.contains("lesson")
+                    && !lower.contains("updated")
+                    && txt != "•"
+                    && txt != "·"
+                {
+                    channel_name = txt.to_string();
+                }
+            }
+        }
+    }
+
+    let view_count = parse_compact_count_str(&view_count_text);
+    let thumbnail_url = pick_json_sources_url(
+        lockup
+            .pointer("/contentImage/thumbnailViewModel/image/sources")
+            .and_then(|v| v.as_array()),
+        320,
+    )
+    .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+
+    Some(VideoSummary {
+        id: vid.to_string(),
+        title,
+        channel_id,
+        channel_name,
+        channel_avatar_url,
+        duration_seconds,
+        duration_text,
+        view_count_text,
+        view_count,
+        published_text,
+        published_unix: None,
+        is_short,
+        thumbnail_url,
+        description_snippet: String::new(),
+    })
+}
+
+fn parse_home_feed_response(val: &Value) -> PagedVideos {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ctoken = None;
+    if let Some(contents) = val.get("contents") {
+        collect_playlist_tracks_recursive(contents, &mut items, &mut seen, &mut ctoken);
+    }
+    if let Some(actions) = val.get("onResponseReceivedActions") {
+        collect_playlist_tracks_recursive(actions, &mut items, &mut seen, &mut ctoken);
+    }
+    let next = ctoken.map(|tok| PageCursor {
+        ctoken: tok,
+        endpoint: ContinuationEndpoint::Browse,
+        visitor_data: None,
+        kind: CursorKind::DirectHomeFeed,
+    });
+    PagedVideos { items, next }
+}
+
 fn collect_playlist_tracks_recursive(
     node: &Value,
     out_videos: &mut Vec<VideoSummary>,
@@ -3663,8 +4197,46 @@ fn collect_playlist_tracks_recursive(
             }
         }
         Value::Object(map) => {
-            if let Some(pvr) = map.get("playlistVideoRenderer") {
+            if let Some(pvr) = map
+                .get("playlistVideoRenderer")
+                .or_else(|| map.get("playlistPanelVideoRenderer"))
+            {
                 if let Some(v) = parse_playlist_video_renderer(pvr) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_videos.push(v);
+                    }
+                }
+                return;
+            }
+            if let Some(lockup) = map.get("lockupViewModel") {
+                if let Some(v) = parse_video_lockup_json(lockup) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_videos.push(v);
+                    }
+                }
+                return;
+            }
+            if let Some(vr) = map
+                .get("videoRenderer")
+                .or_else(|| map.get("gridVideoRenderer"))
+            {
+                if let Some(v) = parse_video_renderer_json(vr) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_videos.push(v);
+                    }
+                }
+                return;
+            }
+            if let Some(sl) = map.get("shortsLockupViewModel") {
+                if let Some(v) = parse_short_lockup_item(sl, "", None) {
+                    if seen_ids.insert(v.id.clone()) {
+                        out_videos.push(v);
+                    }
+                }
+                return;
+            }
+            if let Some(reel) = map.get("reelItemRenderer") {
+                if let Some(v) = parse_reel_item(reel, "", None) {
                     if seen_ids.insert(v.id.clone()) {
                         out_videos.push(v);
                     }
@@ -3677,9 +4249,24 @@ fn collect_playlist_tracks_recursive(
                 }
                 return;
             }
+            if let Some(cvm) = map.get("continuationItemViewModel") {
+                if let Some(tok) = cvm
+                    .pointer("/continuationCommand/innertubeCommand/continuationCommand/token")
+                    .or_else(|| cvm.pointer("/continuationCommand/token"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    *out_ctoken = Some(tok.to_string());
+                }
+                return;
+            }
             for (k, v) in map {
                 // Avoid descending into unrelated watch-next / sidebar recommendations
-                if k == "secondaryResults" || k == "playerOverlays" || k == "header" {
+                if k == "secondaryResults"
+                    || k == "playerOverlays"
+                    || k == "header"
+                    || k == "topbar"
+                {
                     continue;
                 }
                 collect_playlist_tracks_recursive(v, out_videos, seen_ids, out_ctoken);
@@ -3699,6 +4286,9 @@ fn parse_playlist_browse_response(val: &Value, playlist_id: &str) -> Option<Remo
     }
     if let Some(actions) = val.get("onResponseReceivedActions") {
         collect_playlist_tracks_recursive(actions, &mut videos, &mut seen, &mut ctoken);
+    }
+    if let Some(cont_contents) = val.get("continuationContents") {
+        collect_playlist_tracks_recursive(cont_contents, &mut videos, &mut seen, &mut ctoken);
     }
 
     let name = val
@@ -3841,6 +4431,9 @@ fn parse_playlist_continuation_response(val: &Value) -> PagedVideos {
     let mut ctoken = None;
     if let Some(actions) = val.get("onResponseReceivedActions") {
         collect_playlist_tracks_recursive(actions, &mut items, &mut seen, &mut ctoken);
+    }
+    if let Some(cont_contents) = val.get("continuationContents") {
+        collect_playlist_tracks_recursive(cont_contents, &mut items, &mut seen, &mut ctoken);
     }
     let next = ctoken.map(|tok| PageCursor {
         ctoken: tok,
@@ -3997,6 +4590,14 @@ fn collect_search_entries_from_array(
                     out_items.push(SearchItem::Playlist(pl));
                 }
                 continue;
+            }
+            if !playlists_only {
+                if let Some(v) = parse_video_lockup_json(lockup) {
+                    if seen_keys.insert(format!("vid:{}", v.id)) {
+                        out_items.push(SearchItem::Video(v));
+                    }
+                    continue;
+                }
             }
         }
 
@@ -4601,6 +5202,130 @@ https://manifest.example/v1080_video.m3u8
         assert_eq!(
             remote.next.as_ref().map(|c| c.kind),
             Some(CursorKind::DirectPlaylistVideos)
+        );
+    }
+
+    #[test]
+    fn test_podcast_lockup_playlist_and_synth_continuation() {
+        let tok = build_initial_playlist_continuation_token("PL1234567890ABCDEF");
+        assert!(!tok.is_empty());
+        assert!(!tok.contains('+'));
+        assert!(!tok.contains('/'));
+
+        let podcast_browse = json!({
+            "header": {
+                "pageHeaderRenderer": {
+                    "content": {
+                        "pageHeaderViewModel": {
+                            "title": {
+                                "dynamicTextViewModel": {
+                                    "text": { "content": "FarsaCast | The Uncomfortable Truth" }
+                                }
+                            },
+                            "metadata": {
+                                "contentMetadataViewModel": {
+                                    "metadataRows": [
+                                        {
+                                            "metadataParts": [
+                                                {
+                                                    "avatarStack": {
+                                                        "avatarStackViewModel": {
+                                                            "text": { "content": "Ajeet Bharti" }
+                                                        }
+                                                    }
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "metadataParts": [
+                                                { "text": { "content": "Podcast" } },
+                                                { "text": { "content": "13 videos" } }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "onResponseReceivedActions": [
+                {
+                    "appendContinuationItemsAction": {
+                        "continuationItems": [
+                            {
+                                "lockupViewModel": {
+                                    "contentId": "dQw4w9WgXcQ",
+                                    "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                                    "contentImage": {
+                                        "thumbnailViewModel": {
+                                            "image": {
+                                                "sources": [
+                                                    { "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg", "width": 320, "height": 180 }
+                                                ]
+                                            },
+                                            "overlays": [
+                                                {
+                                                    "thumbnailBottomOverlayViewModel": {
+                                                        "badges": [
+                                                            {
+                                                                "thumbnailBadgeViewModel": {
+                                                                    "text": "42:15"
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    "metadata": {
+                                        "lockupMetadataViewModel": {
+                                            "title": { "content": "Episode 1 - The Beginning" },
+                                            "metadata": {
+                                                "contentMetadataViewModel": {
+                                                    "metadataRows": [
+                                                        {
+                                                            "metadataParts": [
+                                                                { "text": { "content": "120K views" } },
+                                                                { "text": { "content": "2 weeks ago" } }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "continuationItemViewModel": {
+                                    "continuationCommand": {
+                                        "innertubeCommand": {
+                                            "continuationCommand": {
+                                                "token": "PODCAST_PAGE_2"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let parsed = parse_playlist_browse_response(&podcast_browse, "PL_FARSACAST").unwrap();
+        assert_eq!(parsed.name, "FarsaCast | The Uncomfortable Truth");
+        assert_eq!(parsed.channel_name, "Ajeet Bharti");
+        assert_eq!(parsed.video_count_text, "13 videos");
+        assert_eq!(parsed.videos.len(), 1);
+        assert_eq!(parsed.videos[0].id, "dQw4w9WgXcQ");
+        assert_eq!(parsed.videos[0].title, "Episode 1 - The Beginning");
+        assert_eq!(parsed.videos[0].duration_seconds, Some(2535));
+        assert_eq!(
+            parsed.next.as_ref().map(|c| c.ctoken.as_str()),
+            Some("PODCAST_PAGE_2")
         );
     }
 }
