@@ -12,8 +12,8 @@ use crate::backend::search_history::SearchHistoryStore;
 use crate::backend::settings::{AppSettings, SettingsStore};
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
 use crate::backend::watch_later::WatchLaterStore;
-use crate::player::mpv::{Quality, ResolvedPlayback};
-use crate::player::mpv_ipc::{MpvEvent, MpvSession};
+use crate::player::mpv::Quality;
+use crate::player::mpv_ipc::{MpvEvent, MpvQueueItem, MpvSession};
 use crate::ui::channel_page::{ChannelPage, ShortsPlayHandler};
 use crate::ui::details_sheet::{CardActions, DetailsSheet};
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
@@ -155,10 +155,8 @@ pub struct MainWindow {
     mpv_player_cmd: RefCell<String>,
     mpv_became_active: Cell<bool>,
     playback_seq: Cell<u64>,
-    lookahead_gen: Cell<u64>,
-    mpv_base_index: Cell<usize>,
-    mpv_pushed_end: Cell<usize>,
-    lookahead_running: Cell<bool>,
+    mpv_sync_gen: Cell<u64>,
+    mpv_acked_gen: Cell<u64>,
     queue_continuation: RefCell<Option<QueueContinuation>>,
     queue_cont_fetching: Cell<bool>,
     playback_quality: Cell<Quality>,
@@ -729,10 +727,8 @@ impl MainWindow {
             mpv_player_cmd: RefCell::new(initial_settings.external_player.clone()),
             mpv_became_active: Cell::new(false),
             playback_seq: Cell::new(0),
-            lookahead_gen: Cell::new(0),
-            mpv_base_index: Cell::new(0),
-            mpv_pushed_end: Cell::new(0),
-            lookahead_running: Cell::new(false),
+            mpv_sync_gen: Cell::new(0),
+            mpv_acked_gen: Cell::new(0),
             queue_continuation: RefCell::new(None),
             queue_cont_fetching: Cell::new(false),
             playback_quality: Cell::new(initial_quality),
@@ -2567,6 +2563,9 @@ impl MainWindow {
                         let q = Quality::from_setting(key);
                         s.default_quality = q.as_setting().to_string();
                         w.playback_quality.set(q);
+                        if let Some(sess) = w.mpv_session.borrow().as_ref() {
+                            sess.set_default_quality(q);
+                        }
                         w.settings_store.save(&s);
                         w.sync_preferences_ui(&s);
                     }
@@ -3016,18 +3015,16 @@ impl MainWindow {
         next
     }
 
-    fn bump_lookahead_gen(&self) -> u64 {
-        let next = self.lookahead_gen.get().wrapping_add(1);
-        self.lookahead_gen.set(next);
+    fn next_mpv_sync_gen(&self) -> u64 {
+        let next = self.mpv_sync_gen.get().wrapping_add(1).max(1);
+        self.mpv_sync_gen.set(next);
         next
     }
 
     fn reset_mpv_queue_tracking(&self) {
         self.next_playback_seq();
-        self.bump_lookahead_gen();
-        self.mpv_base_index.set(0);
-        self.mpv_pushed_end.set(0);
-        self.lookahead_running.set(false);
+        self.mpv_sync_gen.set(0);
+        self.mpv_acked_gen.set(0);
         *self.queue_continuation.borrow_mut() = None;
         self.queue_cont_fetching.set(false);
     }
@@ -3052,13 +3049,16 @@ impl MainWindow {
         self: &Rc<Self>,
         shorts: Vec<VideoSummary>,
         start_index: usize,
+        explicit_quality: Option<Quality>,
         continuation: Option<(PageCursor, Option<ChannelDetails>)>,
     ) {
         if shorts.is_empty() {
             return;
         }
-        let settings = self.settings_store.load();
-        let mut quality = Quality::from_setting(&settings.default_quality);
+        let mut quality = explicit_quality.unwrap_or_else(|| {
+            let settings = self.settings_store.load();
+            Quality::from_setting(&settings.default_quality)
+        });
         if quality == Quality::AudioOnly {
             quality = Quality::P360;
         }
@@ -3096,17 +3096,24 @@ impl MainWindow {
         *self.queue_continuation.borrow_mut() = continuation;
         self.queue_cont_fetching.set(false);
         self.player_card.set_queue(items, clamped_start, shorts_mode);
-        self.start_mpv_from_current_index();
+        self.start_mpv_full_queue();
+    }
+
+    fn to_mpv_queue_items(items: &[VideoSummary]) -> Vec<MpvQueueItem> {
+        items
+            .iter()
+            .map(|v| MpvQueueItem {
+                video_id: v.id.clone(),
+                title: v.title.clone(),
+            })
+            .collect()
     }
 
     fn jump_or_reload_queue_index(self: &Rc<Self>, target_idx: usize) {
-        let base = self.mpv_base_index.get();
-        let pushed_end = self.mpv_pushed_end.get();
-        if pushed_end > base && target_idx >= base && target_idx < pushed_end {
+        if self.mpv_sync_gen.get() > 0 && target_idx < self.player_card.queue_len() {
             let session_opt = self.mpv_session.borrow().clone();
             if let Some(session) = session_opt {
                 if session.is_alive() {
-                    let mpv_slot = target_idx - base;
                     self.mpv_pos.set(0.0);
                     if let Some(cur) = self.player_card.current_video() {
                         self.mpv_duration
@@ -3116,20 +3123,19 @@ impl MainWindow {
                         }
                     }
                     self.player_card.set_playing(true);
-                    session.set_playlist_pos(mpv_slot);
+                    self.player_card.set_loading(true);
+                    session.set_playlist_pos(target_idx);
+                    self.prefetch_next_track_pool();
                     self.pump_queue_continuation();
-                    self.pump_queue_lookahead();
                     return;
                 }
             }
         }
-        self.start_mpv_from_current_index();
+        self.start_mpv_full_queue();
     }
 
     fn resync_mpv_upcoming_queue(self: &Rc<Self>) {
-        let pushed_end = self.mpv_pushed_end.get();
-        let base = self.mpv_base_index.get();
-        if pushed_end <= base || self.player_card.is_empty() {
+        if self.mpv_sync_gen.get() == 0 || self.player_card.is_empty() {
             return;
         }
         let Some(session) = self.mpv_session.borrow().clone() else {
@@ -3139,156 +3145,64 @@ impl MainWindow {
             return;
         }
 
+        let all = self.player_card.all_items();
         let cur_idx = self.player_card.current_idx();
-        self.bump_lookahead_gen();
-        self.lookahead_running.set(false);
-        session.clear_upcoming_except_current();
-        self.mpv_base_index.set(cur_idx);
-        self.mpv_pushed_end.set(cur_idx + 1);
+        let sync_gen = self.next_mpv_sync_gen();
+        session.sync_queue(&Self::to_mpv_queue_items(&all), cur_idx, sync_gen);
+        self.prefetch_next_track_pool();
         self.pump_queue_continuation();
-        self.pump_queue_lookahead();
     }
 
-    fn start_mpv_from_current_index(self: &Rc<Self>) {
-        let Some(cur) = self.player_card.current_video() else {
+    fn start_mpv_full_queue(self: &Rc<Self>) {
+        let all = self.player_card.all_items();
+        if all.is_empty() {
             return;
-        };
-        let cur_idx = self.player_card.current_idx();
-        let seq = self.next_playback_seq();
-        self.bump_lookahead_gen();
-        self.mpv_base_index.set(cur_idx);
-        self.mpv_pushed_end.set(cur_idx);
-        self.lookahead_running.set(false);
+        }
+        let cur_idx = self.player_card.current_idx().min(all.len() - 1);
+        let _seq = self.next_playback_seq();
+        let sync_gen = self.next_mpv_sync_gen();
 
         let quality = self.playback_quality.get();
         let session = self.ensure_mpv_session();
+        session.set_default_quality(quality);
 
         self.mpv_became_active.set(false);
         self.mpv_pos.set(0.0);
-        self.mpv_duration
-            .set(cur.duration_seconds.unwrap_or(0) as f64);
-
-        if self.settings_store.load().save_history {
-            self.history_store.add(cur.clone());
+        if let Some(cur) = all.get(cur_idx) {
+            self.mpv_duration
+                .set(cur.duration_seconds.unwrap_or(0) as f64);
+            if self.settings_store.load().save_history {
+                self.history_store.add(cur.clone());
+            }
         }
 
         self.player_card.set_playing(true);
         self.player_card.set_loading(true);
 
-        let engine = self.engine.clone();
-        let vid_id = cur.id.clone();
-        let title = cur.title.clone();
-        let (tx, rx) = async_channel::bounded::<Result<ResolvedPlayback, String>>(1);
-
-        self.runtime.spawn(async move {
-            let res = engine.resolve_playback(&vid_id, quality).await;
-            let _ = tx.send(res).await;
-        });
-
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let Ok(res) = rx.recv().await else {
-                return;
-            };
-            let Some(w) = weak.upgrade() else {
-                return;
-            };
-            if w.playback_seq.get() != seq {
-                return;
-            }
-
-            match res {
-                Ok(resolved) => {
-                    if let Some(d) = resolved.duration_secs {
-                        if w.mpv_duration.get() <= 0.0 {
-                            w.mpv_duration.set(d as f64);
-                        }
-                    }
-                    session.play_resolved(&resolved, &title);
-                    w.mpv_pushed_end.set(cur_idx + 1);
-                    w.pump_queue_continuation();
-                    w.pump_queue_lookahead();
-                }
-                Err(err) => {
-                    w.player_card.set_loading(false);
-                    w.toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Could not play video: {err}")));
-                }
-            }
-        });
+        session.load_queue(
+            &Self::to_mpv_queue_items(&all),
+            cur_idx,
+            quality == Quality::AudioOnly,
+            sync_gen,
+        );
+        self.prefetch_next_track_pool();
+        self.pump_queue_continuation();
     }
 
-    fn pump_queue_lookahead(self: &Rc<Self>) {
-        const MPV_LOOKAHEAD_WINDOW: usize = 8;
-
-        if self.lookahead_running.get() || self.player_card.is_empty() {
-            return;
+    fn prefetch_next_track_pool(&self) {
+        let next_idx = self.player_card.current_idx() + 1;
+        if let Some(next_item) = self.player_card.item_at(next_idx) {
+            let engine = self.engine.clone();
+            let vid_id = next_item.id;
+            self.runtime.spawn(async move {
+                engine.prefetch_video_pool(&vid_id).await;
+            });
         }
-        let base = self.mpv_base_index.get();
-        let pushed_end = self.mpv_pushed_end.get();
-        if pushed_end <= base {
-            return;
-        }
-
-        let cur_idx = self.player_card.current_idx();
-        let q_len = self.player_card.queue_len();
-        let target_end = (cur_idx + 1 + MPV_LOOKAHEAD_WINDOW).min(q_len);
-        if pushed_end >= target_end {
-            return;
-        }
-
-        let Some(session) = self.mpv_session.borrow().clone() else {
-            return;
-        };
-        if !session.is_alive() {
-            return;
-        }
-
-        let Some(next_item) = self.player_card.item_at(pushed_end) else {
-            return;
-        };
-
-        self.lookahead_running.set(true);
-        let seq = self.playback_seq.get();
-        let la_gen = self.lookahead_gen.get();
-        let mpv_slot = pushed_end - base;
-        let quality = self.playback_quality.get();
-        let engine = self.engine.clone();
-        let vid_id = next_item.id.clone();
-        let title = next_item.title.clone();
-        let (tx, rx) = async_channel::bounded::<Result<ResolvedPlayback, String>>(1);
-
-        self.runtime.spawn(async move {
-            let res = engine.resolve_playback(&vid_id, quality).await;
-            let _ = tx.send(res).await;
-        });
-
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let Ok(res) = rx.recv().await else {
-                return;
-            };
-            let Some(w) = weak.upgrade() else {
-                return;
-            };
-            if w.playback_seq.get() != seq
-                || w.lookahead_gen.get() != la_gen
-                || w.mpv_pushed_end.get() != pushed_end
-            {
-                return;
-            }
-            w.lookahead_running.set(false);
-
-            if let Ok(resolved) = res {
-                session.append_resolved(&resolved, &title, mpv_slot);
-                w.mpv_pushed_end.set(pushed_end + 1);
-                w.pump_queue_lookahead();
-            }
-        });
     }
 
     fn pump_queue_continuation(self: &Rc<Self>) {
-        const CONT_PREFETCH_THRESHOLD: usize = 40;
+        const EAGER_QUEUE_TARGET: usize = 500;
+        const LAZY_REFILL_THRESHOLD: usize = 100;
 
         if self.queue_cont_fetching.get() || self.player_card.is_empty() {
             return;
@@ -3300,7 +3214,7 @@ impl MainWindow {
         let cur_idx = self.player_card.current_idx();
         let q_len = self.player_card.queue_len();
         let remaining_ahead = q_len.saturating_sub(cur_idx + 1);
-        if remaining_ahead >= CONT_PREFETCH_THRESHOLD {
+        if q_len >= EAGER_QUEUE_TARGET && remaining_ahead >= LAZY_REFILL_THRESHOLD {
             return;
         }
 
@@ -3333,7 +3247,7 @@ impl MainWindow {
             };
             if w.playback_seq.get() != seq {
                 return;
-            };
+            }
             w.queue_cont_fetching.set(false);
 
             match res {
@@ -3350,8 +3264,15 @@ impl MainWindow {
                     };
                     *w.queue_continuation.borrow_mut() = next_cont;
                     if has_items {
-                        w.player_card.append_items(paged.items);
-                        w.pump_queue_lookahead();
+                        let added = w.player_card.append_items(paged.items);
+                        if !added.is_empty() && w.mpv_sync_gen.get() > 0 {
+                            if let Some(session) = w.mpv_session.borrow().as_ref() {
+                                if session.is_alive() {
+                                    session.append_queue(&Self::to_mpv_queue_items(&added));
+                                }
+                            }
+                        }
+                        w.prefetch_next_track_pool();
                         w.pump_queue_continuation();
                     }
                 }
@@ -3369,8 +3290,19 @@ impl MainWindow {
             return;
         }
 
+        let mpv_item = MpvQueueItem {
+            video_id: summary.id.clone(),
+            title: summary.title.clone(),
+        };
         self.player_card.add_item(summary);
-        self.pump_queue_lookahead();
+        if self.mpv_sync_gen.get() > 0 {
+            if let Some(session) = self.mpv_session.borrow().as_ref() {
+                if session.is_alive() {
+                    session.append_queue(&[mpv_item]);
+                }
+            }
+        }
+        self.prefetch_next_track_pool();
         self.toast_overlay
             .add_toast(adw::Toast::new("Added to queue"));
     }
@@ -3433,7 +3365,7 @@ impl MainWindow {
         }
 
         let (sender, receiver) = async_channel::unbounded::<MpvEvent>();
-        let session = MpvSession::spawn(&self.runtime, &settings, sender);
+        let session = MpvSession::spawn(&self.runtime, self.engine.clone(), &settings, sender);
         *self.mpv_player_cmd.borrow_mut() = settings.external_player.clone();
         *self.mpv_session.borrow_mut() = Some(session.clone());
 
@@ -3468,46 +3400,46 @@ impl MainWindow {
                         w.player_card.set_progress(pos, dur);
                     }
                     MpvEvent::Duration(dur) => {
-                        w.mpv_duration.set(dur);
-                        let pos = w.mpv_pos.get();
-                        w.player_card.set_progress(pos, dur);
+                        if dur > 0.0 {
+                            w.mpv_duration.set(dur);
+                            let pos = w.mpv_pos.get();
+                            w.player_card.set_progress(pos, dur);
+                        }
                     }
                     MpvEvent::Pause(p) => {
                         w.player_card.set_playing(!p);
                     }
+                    MpvEvent::QueueSynced(gen_num) => {
+                        if gen_num > w.mpv_acked_gen.get() {
+                            w.mpv_acked_gen.set(gen_num);
+                        }
+                    }
                     MpvEvent::PlaylistPos(mpv_idx) => {
-                        let base = w.mpv_base_index.get();
-                        let pushed_end = w.mpv_pushed_end.get();
-                        if pushed_end > base {
-                            let q_idx = base + mpv_idx;
-                            if q_idx < w.player_card.queue_len()
-                                && q_idx != w.player_card.current_idx()
-                            {
-                                w.player_card.set_current_index(q_idx);
-                                w.mpv_pos.set(0.0);
-                                if let Some(cur) = w.player_card.current_video() {
-                                    w.mpv_duration
-                                        .set(cur.duration_seconds.unwrap_or(0) as f64);
-                                    if w.settings_store.load().save_history {
-                                        w.history_store.add(cur);
-                                    }
+                        let sync_gen = w.mpv_sync_gen.get();
+                        if sync_gen > 0
+                            && w.mpv_acked_gen.get() == sync_gen
+                            && mpv_idx < w.player_card.queue_len()
+                            && mpv_idx != w.player_card.current_idx()
+                        {
+                            w.player_card.set_current_index(mpv_idx);
+                            w.mpv_pos.set(0.0);
+                            if let Some(cur) = w.player_card.current_video() {
+                                w.mpv_duration
+                                    .set(cur.duration_seconds.unwrap_or(0) as f64);
+                                if w.settings_store.load().save_history {
+                                    w.history_store.add(cur);
                                 }
-                                w.player_card.set_playing(true);
-                                w.pump_queue_continuation();
-                                w.pump_queue_lookahead();
                             }
+                            w.player_card.set_playing(true);
+                            w.prefetch_next_track_pool();
+                            w.pump_queue_continuation();
                         }
                     }
                     MpvEvent::TrackEnded => {
                         let cur_idx = w.player_card.current_idx();
-                        let next_idx = cur_idx + 1;
-                        let pushed_end = w.mpv_pushed_end.get();
-                        if next_idx < pushed_end {
-                            // MPV already has `next_idx` queued natively and transitions via `PlaylistPos`
-                        } else if next_idx < w.player_card.queue_len() {
-                            w.player_card.set_current_index(next_idx);
-                            w.start_mpv_from_current_index();
-                        } else {
+                        if cur_idx + 1 >= w.player_card.queue_len()
+                            && w.queue_continuation.borrow().is_none()
+                        {
                             w.player_card.set_loading(false);
                             w.player_card.set_playing(false);
                         }
@@ -3550,11 +3482,12 @@ impl MainWindow {
 
         let actions = self.make_card_actions();
         let weak_shorts = Rc::downgrade(self);
-        let on_play_shorts: ShortsPlayHandler = Rc::new(move |shorts, start_idx, cont| {
-            if let Some(w) = weak_shorts.upgrade() {
-                w.play_shorts_queue(shorts, start_idx, cont);
-            }
-        });
+        let on_play_shorts: ShortsPlayHandler =
+            Rc::new(move |shorts, start_idx, explicit_q, cont| {
+                if let Some(w) = weak_shorts.upgrade() {
+                    w.play_shorts_queue(shorts, start_idx, explicit_q, cont);
+                }
+            });
 
         let weak_pl = Rc::downgrade(self);
         let on_open_playlist: Rc<dyn Fn(String)> = Rc::new(move |playlist_id| {
@@ -4388,25 +4321,45 @@ impl MainWindow {
         self.image_loader
             .load_into_picture(&vid.id, &vid.thumbnail_url, &card.picture);
 
+        let vid_id = vid.id.clone();
+        let vid_id_det = vid.id.clone();
         let weak_play = Rc::downgrade(self);
         let play_cb: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(w) = weak_play.upgrade() {
                 let all_vids = w.current_videos.borrow().clone();
                 if !all_vids.is_empty() {
+                    let target_idx = all_vids
+                        .iter()
+                        .position(|v| v.id == vid_id)
+                        .unwrap_or(idx);
                     let q = Quality::from_setting(&w.settings_store.load().default_quality);
                     let cont = w.remote_playlist_queue_continuation();
-                    w.play_queue_from_with_continuation(all_vids, idx, q, false, cont);
+                    w.play_queue_from_with_continuation(all_vids, target_idx, q, false, cont);
                 }
             }
         });
 
         let weak_sel = Rc::downgrade(self);
+        let weak_det_play = Rc::downgrade(self);
         let play_enter = play_cb.clone();
         let play_dbl = play_cb;
 
         let weak_det = Rc::downgrade(self);
         let sum_det = vid.clone();
-        let act_det = actions.clone();
+        let mut act_det = actions.clone();
+        act_det.on_play = Rc::new(move |_summary, q| {
+            if let Some(w) = weak_det_play.upgrade() {
+                let all_vids = w.current_videos.borrow().clone();
+                if !all_vids.is_empty() {
+                    let target_idx = all_vids
+                        .iter()
+                        .position(|v| v.id == vid_id_det)
+                        .unwrap_or(idx);
+                    let cont = w.remote_playlist_queue_continuation();
+                    w.play_queue_from_with_continuation(all_vids, target_idx, q, false, cont);
+                }
+            }
+        });
 
         card.connect_card_interactions(
             move |hl| {

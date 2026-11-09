@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
@@ -170,10 +170,13 @@ enum SimpleAudioCodec {
 
 #[derive(Clone, Debug)]
 struct RawVideoCandidate {
+    itag: u32,
     url: String,
+    width: u32,
     height: u32,
     fps: u32,
     bitrate: u32,
+    filesize: Option<u64>,
     hdr: bool,
     is_mp4: bool,
     codec: SimpleVideoCodec,
@@ -181,8 +184,11 @@ struct RawVideoCandidate {
 
 #[derive(Clone, Debug)]
 struct RawAudioCandidate {
+    itag: u32,
     url: String,
     bitrate: u32,
+    sample_rate: u32,
+    filesize: Option<u64>,
     is_m4a: bool,
     codec: SimpleAudioCodec,
 }
@@ -212,6 +218,17 @@ impl CandidatePool {
     }
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedPoolEntry {
+    video_id: String,
+    fetched_at: Instant,
+    pool: CandidatePool,
+    hls_manifest: Option<String>,
+}
+
+const VERIFIED_POOL_TTL: Duration = Duration::from_secs(720);
+const VERIFIED_POOL_CAP: usize = 24;
+
 fn cursor_from_paginator<T>(p: &Paginator<T>) -> Option<PageCursor> {
     p.ctoken.as_ref().map(|ctoken| PageCursor {
         ctoken: ctoken.clone(),
@@ -225,6 +242,7 @@ pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
     visitor_data: RwLock<Option<String>>,
+    verified_pools: RwLock<Vec<VerifiedPoolEntry>>,
     home_seed: AtomicU64,
     seen_home_ids: RwLock<Vec<String>>,
     category_seed: AtomicU64,
@@ -253,6 +271,7 @@ impl Engine {
             rp,
             http,
             visitor_data: RwLock::new(None),
+            verified_pools: RwLock::new(Vec::new()),
             home_seed: AtomicU64::new(init_seed),
             seen_home_ids: RwLock::new(Vec::new()),
             category_seed: AtomicU64::new(init_seed.wrapping_add(3)),
@@ -324,15 +343,58 @@ impl Engine {
         video_id: &str,
         quality: Quality,
     ) -> Result<ResolvedPlayback, String> {
-        let mut last_err = String::new();
+        self.resolve_playback_for_mpv(video_id, quality, None).await
+    }
 
-        // 1. VISIONOS App (NewPipe 2026.11 spec: POT-free & JS-free direct MP4 + HLS)
+    /// Resolves playback for MPV, populating a `quality-menu.lua`-compatible `ytdl_json` format
+    /// catalog and honoring optional per-file `ytdl-format` selections (e.g. `v247+a251`, `hls-720`).
+    /// Verified stream pools are cached in memory for 12 minutes so mid-video resolution switches
+    /// and 1-ahead track transitions complete in 0ms without re-querying Innertube.
+    pub async fn resolve_playback_for_mpv(
+        &self,
+        video_id: &str,
+        default_quality: Quality,
+        ytdl_format_override: Option<&str>,
+    ) -> Result<ResolvedPlayback, String> {
+        let entry = self.fetch_or_get_verified_pool(video_id).await?;
+        resolve_from_verified_entry(&entry, default_quality, ytdl_format_override)
+            .ok_or_else(|| "No playable streams available for this video.".to_string())
+    }
+
+    /// Warms the verified stream pool for `video_id` in background so upcoming queue transitions
+    /// open instantaneously when MPV advances.
+    pub async fn prefetch_video_pool(&self, video_id: &str) {
+        if !video_id.is_empty() {
+            let _ = self.fetch_or_get_verified_pool(video_id).await;
+        }
+    }
+
+    async fn fetch_or_get_verified_pool(&self, video_id: &str) -> Result<VerifiedPoolEntry, String> {
+        {
+            let guard = self.verified_pools.read().await;
+            if let Some(found) = guard
+                .iter()
+                .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL)
+            {
+                return Ok(found.clone());
+            }
+        }
+
+        let mut last_err = String::new();
+        let mut sd_fallback: Option<VerifiedPoolEntry> = None;
+
+        // 1. VISIONOS App (NewPipe 2026.11 spec: POT-free & JS-free direct MP4 + full HLS ladder)
         match self.fetch_innertube_visionos_app(video_id).await {
             Ok(pool) if pool.has_playable_streams() => {
-                if let Some(play) = self.verify_and_select_playback(&pool, quality).await {
-                    return Ok(play);
+                if let Some(entry) = self.probe_pool_into_verified(video_id, pool).await {
+                    if verified_entry_has_hd(&entry) {
+                        self.store_verified_pool(entry.clone()).await;
+                        return Ok(entry);
+                    }
+                    sd_fallback = Some(entry);
+                } else {
+                    last_err = "VisionOS app streams returned HTTP 403".to_string();
                 }
-                last_err = "VisionOS app streams returned HTTP 403".to_string();
             }
             Ok(_) => {}
             Err(e) => last_err = e,
@@ -341,10 +403,17 @@ impl Engine {
         // 2. VISIONOS Safari (yt-dlp 2026.10 `_DEFAULT_JSLESS_CLIENTS` spec)
         match self.fetch_innertube_visionos_safari(video_id).await {
             Ok(pool) if pool.has_playable_streams() => {
-                if let Some(play) = self.verify_and_select_playback(&pool, quality).await {
-                    return Ok(play);
+                if let Some(entry) = self.probe_pool_into_verified(video_id, pool).await {
+                    if verified_entry_has_hd(&entry) {
+                        self.store_verified_pool(entry.clone()).await;
+                        return Ok(entry);
+                    }
+                    if sd_fallback.is_none() {
+                        sd_fallback = Some(entry);
+                    }
+                } else {
+                    last_err = "VisionOS Safari streams returned HTTP 403".to_string();
                 }
-                last_err = "VisionOS Safari streams returned HTTP 403".to_string();
             }
             Ok(_) => {}
             Err(e) => last_err = e,
@@ -359,8 +428,9 @@ impl Engine {
                 Ok(player) => {
                     let pool = pool_from_rustypipe(player, ua, YT_WEB_REFERER);
                     if pool.has_playable_streams() {
-                        if let Some(play) = self.verify_and_select_playback(&pool, quality).await {
-                            return Ok(play);
+                        if let Some(entry) = self.probe_pool_into_verified(video_id, pool).await {
+                            self.store_verified_pool(entry.clone()).await;
+                            return Ok(entry);
                         }
                     }
                 }
@@ -370,10 +440,95 @@ impl Engine {
             }
         }
 
+        if let Some(entry) = sd_fallback {
+            self.store_verified_pool(entry.clone()).await;
+            return Ok(entry);
+        }
+
         if last_err.is_empty() {
             Err("No playable streams available for this video.".to_string())
         } else {
             Err(format!("Stream extraction failed: {last_err}"))
+        }
+    }
+
+    async fn store_verified_pool(&self, entry: VerifiedPoolEntry) {
+        let mut guard = self.verified_pools.write().await;
+        guard.retain(|e| {
+            e.video_id != entry.video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL
+        });
+        if guard.len() >= VERIFIED_POOL_CAP {
+            guard.remove(0);
+        }
+        guard.push(entry);
+    }
+
+    async fn probe_pool_into_verified(
+        &self,
+        video_id: &str,
+        mut pool: CandidatePool,
+    ) -> Option<VerifiedPoolEntry> {
+        let ua = pool.user_agent.clone();
+        let referer = pool.referer.clone();
+        let muxed_url = pool.muxed.first().map(|m| m.url.clone());
+        let adap_url = pool.adaptive_video.first().map(|v| v.url.clone());
+        let aud_url = pool.audio.first().map(|a| a.url.clone());
+        let hls_url = pool.hls_url.clone();
+
+        let (muxed_ok, adap_ok, aud_ok, hls_manifest) = tokio::join!(
+            async {
+                match muxed_url {
+                    Some(ref u) => self.probe_media_url(u, &ua, &referer).await,
+                    None => false,
+                }
+            },
+            async {
+                match adap_url {
+                    Some(ref u) => self.probe_media_url(u, &ua, &referer).await,
+                    None => false,
+                }
+            },
+            async {
+                match aud_url {
+                    Some(ref u) => self.probe_media_url(u, &ua, &referer).await,
+                    None => false,
+                }
+            },
+            async {
+                match hls_url {
+                    Some(ref u) => self.fetch_text_checked(u, &ua, &referer).await,
+                    None => None,
+                }
+            }
+        );
+
+        if !muxed_ok {
+            pool.muxed.clear();
+        }
+        if !(adap_ok && aud_ok) {
+            pool.adaptive_video.clear();
+        }
+        if !aud_ok {
+            pool.audio.clear();
+        }
+        if hls_manifest.is_none() {
+            pool.hls_url = None;
+        }
+
+        let has_playable = !pool.muxed.is_empty()
+            || (!pool.adaptive_video.is_empty() && !pool.audio.is_empty())
+            || !pool.audio.is_empty()
+            || hls_manifest.is_some();
+
+        if has_playable {
+            Some(VerifiedPoolEntry {
+                video_id: video_id.to_string(),
+                fetched_at: Instant::now(),
+                pool,
+                hls_manifest,
+            })
+        } else {
+            None
         }
     }
 
@@ -421,66 +576,6 @@ impl Engine {
             Err("Could not extract playable stream URLs.".to_string())
         } else {
             Err(format!("Stream extraction failed: {last_err}"))
-        }
-    }
-
-    async fn verify_and_select_playback(
-        &self,
-        pool: &CandidatePool,
-        quality: Quality,
-    ) -> Option<ResolvedPlayback> {
-        let direct_opt = select_direct_playback(pool, quality);
-        let hls_opt = pool.hls_url.as_deref();
-
-        match (direct_opt, hls_opt) {
-            (Some(direct), Some(hls_master)) => {
-                let (direct_ok, hls_res) = tokio::join!(
-                    self.verify_resolved_urls(&direct),
-                    self.resolve_hls_playback(hls_master, pool, quality)
-                );
-                if direct_ok {
-                    return Some(direct);
-                }
-                if let Some(hls_play) = hls_res {
-                    return Some(hls_play);
-                }
-                if direct.audio_url.is_some() {
-                    if let Some(muxed_only) = select_muxed_fallback(pool, quality) {
-                        if self.verify_resolved_urls(&muxed_only).await {
-                            return Some(muxed_only);
-                        }
-                    }
-                }
-                None
-            }
-            (Some(direct), None) => {
-                if self.verify_resolved_urls(&direct).await {
-                    return Some(direct);
-                }
-                if direct.audio_url.is_some() {
-                    if let Some(muxed_only) = select_muxed_fallback(pool, quality) {
-                        if self.verify_resolved_urls(&muxed_only).await {
-                            return Some(muxed_only);
-                        }
-                    }
-                }
-                None
-            }
-            (None, Some(hls_master)) => self.resolve_hls_playback(hls_master, pool, quality).await,
-            (None, None) => None,
-        }
-    }
-
-    async fn verify_resolved_urls(&self, play: &ResolvedPlayback) -> bool {
-        if let Some(ref aud_url) = play.audio_url {
-            let (v_ok, a_ok) = tokio::join!(
-                self.probe_media_url(&play.primary_url, &play.user_agent, &play.referer),
-                self.probe_media_url(aud_url, &play.user_agent, &play.referer)
-            );
-            v_ok && a_ok
-        } else {
-            self.probe_media_url(&play.primary_url, &play.user_agent, &play.referer)
-                .await
         }
     }
 
@@ -563,6 +658,7 @@ impl Engine {
                 referer: pool.referer.clone(),
                 is_audio_only: quality == Quality::AudioOnly,
                 duration_secs: pool.duration_secs,
+                ytdl_json: None,
             });
         }
 
@@ -573,6 +669,7 @@ impl Engine {
             referer: pool.referer.clone(),
             is_audio_only: quality == Quality::AudioOnly,
             duration_secs: pool.duration_secs,
+            ytdl_json: None,
         })
     }
 
@@ -2463,7 +2560,9 @@ fn parse_json_video_stream(fmt: &Value) -> Option<RawVideoCandidate> {
     if url.is_empty() {
         return None;
     }
+    let itag = fmt.get("itag").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let mime = fmt.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
+    let width = fmt.get("width").and_then(|w| w.as_u64()).unwrap_or(0) as u32;
     let height = fmt.get("height").and_then(|h| h.as_u64()).unwrap_or(0) as u32;
     let fps = fmt.get("fps").and_then(|f| f.as_u64()).unwrap_or(30) as u32;
     let bitrate = fmt
@@ -2471,6 +2570,14 @@ fn parse_json_video_stream(fmt: &Value) -> Option<RawVideoCandidate> {
         .or_else(|| fmt.get("bitrate"))
         .and_then(|b| b.as_u64())
         .unwrap_or(0) as u32;
+    let filesize = fmt
+        .get("contentLength")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| v.as_u64())
+        })
+        .filter(|&sz| sz > 0);
     let qual_label = fmt
         .get("qualityLabel")
         .and_then(|q| q.as_str())
@@ -2490,10 +2597,13 @@ fn parse_json_video_stream(fmt: &Value) -> Option<RawVideoCandidate> {
     };
 
     Some(RawVideoCandidate {
+        itag,
         url,
+        width,
         height,
         fps,
         bitrate,
+        filesize,
         hdr,
         is_mp4,
         codec,
@@ -2514,12 +2624,21 @@ fn parse_json_audio_stream(fmt: &Value) -> Option<RawAudioCandidate> {
             return None;
         }
     }
+    let itag = fmt.get("itag").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let mime = fmt.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
     let bitrate = fmt
         .get("averageBitrate")
         .or_else(|| fmt.get("bitrate"))
         .and_then(|b| b.as_u64())
         .unwrap_or(0) as u32;
+    let filesize = fmt
+        .get("contentLength")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| v.as_u64())
+        })
+        .filter(|&sz| sz > 0);
     let is_m4a = mime.starts_with("audio/mp4");
     let codec = if mime.contains("mp4a") {
         SimpleAudioCodec::Aac
@@ -2528,10 +2647,27 @@ fn parse_json_audio_stream(fmt: &Value) -> Option<RawAudioCandidate> {
     } else {
         SimpleAudioCodec::Other
     };
+    let default_sr = if codec == SimpleAudioCodec::Opus {
+        48_000
+    } else {
+        44_100
+    };
+    let sample_rate = fmt
+        .get("audioSampleRate")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .or_else(|| v.as_u64().map(|n| n as u32))
+        })
+        .filter(|&sr| sr > 0)
+        .unwrap_or(default_sr);
 
     Some(RawAudioCandidate {
+        itag,
         url,
         bitrate,
+        sample_rate,
+        filesize,
         is_m4a,
         codec,
     })
@@ -2542,7 +2678,9 @@ fn pool_from_rustypipe(player: VideoPlayer, ua: &str, referer: &str) -> Candidat
         .video_streams
         .into_iter()
         .map(|s| RawVideoCandidate {
+            itag: s.itag,
             url: s.url,
+            width: s.width,
             height: s.height,
             fps: s.fps as u32,
             bitrate: if s.average_bitrate > 0 {
@@ -2550,6 +2688,7 @@ fn pool_from_rustypipe(player: VideoPlayer, ua: &str, referer: &str) -> Candidat
             } else {
                 s.bitrate
             },
+            filesize: s.size.filter(|&sz| sz > 0),
             hdr: s.hdr,
             is_mp4: s.mime.starts_with("video/mp4"),
             codec: map_rp_video_codec(s.codec),
@@ -2560,7 +2699,9 @@ fn pool_from_rustypipe(player: VideoPlayer, ua: &str, referer: &str) -> Candidat
         .video_only_streams
         .into_iter()
         .map(|s| RawVideoCandidate {
+            itag: s.itag,
             url: s.url,
+            width: s.width,
             height: s.height,
             fps: s.fps as u32,
             bitrate: if s.average_bitrate > 0 {
@@ -2568,6 +2709,7 @@ fn pool_from_rustypipe(player: VideoPlayer, ua: &str, referer: &str) -> Candidat
             } else {
                 s.bitrate
             },
+            filesize: s.size.filter(|&sz| sz > 0),
             hdr: s.hdr,
             is_mp4: s.mime.starts_with("video/mp4"),
             codec: map_rp_video_codec(s.codec),
@@ -2577,19 +2719,30 @@ fn pool_from_rustypipe(player: VideoPlayer, ua: &str, referer: &str) -> Candidat
     let audio = player
         .audio_streams
         .into_iter()
-        .map(|s| RawAudioCandidate {
-            url: s.url,
-            bitrate: if s.average_bitrate > 0 {
-                s.average_bitrate
-            } else {
-                s.bitrate
-            },
-            is_m4a: s.mime.starts_with("audio/mp4"),
-            codec: match s.codec {
+        .map(|s| {
+            let codec = match s.codec {
                 AudioCodec::Mp4a => SimpleAudioCodec::Aac,
                 AudioCodec::Opus => SimpleAudioCodec::Opus,
                 _ => SimpleAudioCodec::Other,
-            },
+            };
+            let sample_rate = if codec == SimpleAudioCodec::Opus {
+                48_000
+            } else {
+                44_100
+            };
+            RawAudioCandidate {
+                itag: s.itag,
+                url: s.url,
+                bitrate: if s.average_bitrate > 0 {
+                    s.average_bitrate
+                } else {
+                    s.bitrate
+                },
+                sample_rate,
+                filesize: Some(s.size).filter(|&sz| sz > 0),
+                is_m4a: s.mime.starts_with("audio/mp4"),
+                codec,
+            }
         })
         .collect();
 
@@ -2632,8 +2785,12 @@ fn pick_best_video(streams: &[RawVideoCandidate], target_height: u32) -> Option<
         return None;
     }
 
-    // Prefer streams at or below target_height; if all exceed target_height, pick lowest above it.
-    let has_within_target = streams.iter().any(|s| s.height > 0 && s.height <= target_height);
+    // Prefer streams at or below target_height (using short edge on portrait Shorts);
+    // if all exceed target_height, pick lowest above it.
+    let has_within_target = streams.iter().any(|s| {
+        let q = effective_quality_dim(s.width, s.height);
+        q > 0 && q <= target_height
+    });
 
     streams.iter().max_by(|a, b| {
         // 1. Prefer SDR over HDR on modest displays/GPUs
@@ -2642,19 +2799,21 @@ fn pick_best_video(streams: &[RawVideoCandidate], target_height: u32) -> Option<
             return sdr_cmp;
         }
 
+        let aq = effective_quality_dim(a.width, a.height);
+        let bq = effective_quality_dim(b.width, b.height);
+
         if has_within_target {
-            let a_ok = a.height > 0 && a.height <= target_height;
-            let b_ok = b.height > 0 && b.height <= target_height;
+            let a_ok = aq > 0 && aq <= target_height;
+            let b_ok = bq > 0 && bq <= target_height;
             if a_ok != b_ok {
                 return a_ok.cmp(&b_ok);
             }
-            // Closest height up to target_height
-            if a.height != b.height {
-                return a.height.cmp(&b.height);
+            if aq != bq {
+                return aq.cmp(&bq);
             }
-        } else if a.height != b.height {
+        } else if aq != bq {
             // All streams exceed target: pick smallest height first
-            return b.height.cmp(&a.height);
+            return bq.cmp(&aq);
         }
 
         // 2. Modest-hardware codec priority: H.264 > VP9 > MP4V > AV1
@@ -2687,105 +2846,492 @@ fn pick_best_audio(streams: &[RawAudioCandidate]) -> Option<&RawAudioCandidate> 
     })
 }
 
-fn select_muxed_fallback(pool: &CandidatePool, quality: Quality) -> Option<ResolvedPlayback> {
-    let target_h = quality.target_height().unwrap_or(360);
-    let muxed = pick_best_video(&pool.muxed, target_h).or_else(|| pool.muxed.first())?;
-    Some(ResolvedPlayback {
-        primary_url: muxed.url.clone(),
-        audio_url: None,
-        user_agent: pool.user_agent.clone(),
-        referer: pool.referer.clone(),
-        is_audio_only: quality == Quality::AudioOnly,
-        duration_secs: pool.duration_secs,
+fn effective_quality_dim(width: u32, height: u32) -> u32 {
+    if width > 0 && height > 0 && width < height {
+        width
+    } else {
+        height
+    }
+}
+
+fn verified_entry_has_hd(entry: &VerifiedPoolEntry) -> bool {
+    entry
+        .pool
+        .adaptive_video
+        .iter()
+        .any(|v| v.width.max(v.height) >= 720)
+        || entry
+            .pool
+            .muxed
+            .iter()
+            .any(|v| v.width.max(v.height) >= 720)
+        || entry
+            .hls_manifest
+            .as_deref()
+            .map(|m| {
+                m.contains("x720")
+                    || m.contains("720x")
+                    || m.contains("x1080")
+                    || m.contains("1080x")
+            })
+            .unwrap_or(false)
+}
+
+#[derive(Clone, Debug)]
+enum CatalogVideoSource {
+    Adaptive { url: String },
+    Muxed { url: String },
+    Hls { uri: String, paired_audio: Option<String> },
+}
+
+#[derive(Clone, Debug)]
+struct CatalogVideo {
+    format_id: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u64,
+    filesize: Option<u64>,
+    hdr: bool,
+    codec: SimpleVideoCodec,
+    has_embedded_or_paired_audio: bool,
+    source: CatalogVideoSource,
+}
+
+impl CatalogVideo {
+    fn vcodec_name(&self) -> &'static str {
+        match self.codec {
+            SimpleVideoCodec::H264 => "avc1",
+            SimpleVideoCodec::Vp9 => "vp9",
+            SimpleVideoCodec::Mp4v => "mp4v",
+            SimpleVideoCodec::Av1 => "av01",
+            SimpleVideoCodec::Unknown => "avc1",
+        }
+    }
+
+    fn acodec_name(&self) -> &'static str {
+        if self.has_embedded_or_paired_audio {
+            "mp4a.40.2"
+        } else {
+            "none"
+        }
+    }
+
+    fn to_ytdl_format_json(&self) -> Value {
+        let kbps = ((self.bitrate_bps.max(150_000) as f64) / 100.0).round() / 10.0;
+        let mut obj = serde_json::Map::new();
+        obj.insert("format_id".to_string(), json!(self.format_id));
+        obj.insert("vcodec".to_string(), json!(self.vcodec_name()));
+        obj.insert("acodec".to_string(), json!(self.acodec_name()));
+        obj.insert("width".to_string(), json!(self.width));
+        obj.insert("height".to_string(), json!(self.height));
+        obj.insert(
+            "resolution".to_string(),
+            json!(format!("{}x{}", self.width, self.height)),
+        );
+        obj.insert("fps".to_string(), json!(self.fps));
+        obj.insert("vbr".to_string(), json!(kbps));
+        obj.insert("tbr".to_string(), json!(kbps));
+        if let Some(sz) = self.filesize {
+            obj.insert("filesize".to_string(), json!(sz));
+        }
+        Value::Object(obj)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CatalogAudio {
+    format_id: String,
+    url: String,
+    bitrate_bps: u32,
+    sample_rate: u32,
+    filesize: Option<u64>,
+    codec: SimpleAudioCodec,
+    is_direct: bool,
+}
+
+impl CatalogAudio {
+    fn acodec_name(&self) -> &'static str {
+        match self.codec {
+            SimpleAudioCodec::Aac => "mp4a.40.2",
+            SimpleAudioCodec::Opus => "opus",
+            SimpleAudioCodec::Other => "mp4a",
+        }
+    }
+
+    fn to_ytdl_format_json(&self) -> Value {
+        let kbps = ((self.bitrate_bps.max(48_000) as f64) / 100.0).round() / 10.0;
+        let mut obj = serde_json::Map::new();
+        obj.insert("format_id".to_string(), json!(self.format_id));
+        obj.insert("vcodec".to_string(), json!("none"));
+        obj.insert("acodec".to_string(), json!(self.acodec_name()));
+        obj.insert("abr".to_string(), json!(kbps));
+        obj.insert("tbr".to_string(), json!(kbps));
+        obj.insert("asr".to_string(), json!(self.sample_rate));
+        if let Some(sz) = self.filesize {
+            obj.insert("filesize".to_string(), json!(sz));
+        }
+        Value::Object(obj)
+    }
+}
+
+fn pick_best_catalog_audio(streams: &[CatalogAudio]) -> Option<&CatalogAudio> {
+    streams.iter().max_by(|a, b| {
+        let codec_rank = |c: SimpleAudioCodec| match c {
+            SimpleAudioCodec::Aac => 3u8,
+            SimpleAudioCodec::Opus => 2u8,
+            SimpleAudioCodec::Other => 1u8,
+        };
+        let a_good = (96_000..=192_000).contains(&a.bitrate_bps);
+        let b_good = (96_000..=192_000).contains(&b.bitrate_bps);
+        a.is_direct
+            .cmp(&b.is_direct)
+            .then_with(|| a_good.cmp(&b_good))
+            .then_with(|| codec_rank(a.codec).cmp(&codec_rank(b.codec)))
+            .then_with(|| a.bitrate_bps.cmp(&b.bitrate_bps))
     })
 }
 
-fn select_direct_playback(pool: &CandidatePool, quality: Quality) -> Option<ResolvedPlayback> {
-    let ua = pool.user_agent.clone();
-    let referer = pool.referer.clone();
-    let duration_secs = pool.duration_secs;
+fn resolve_from_verified_entry(
+    entry: &VerifiedPoolEntry,
+    default_quality: Quality,
+    ytdl_format_override: Option<&str>,
+) -> Option<ResolvedPlayback> {
+    let pool = &entry.pool;
+    let (hls_audio_tracks, hls_variants) = entry
+        .hls_manifest
+        .as_deref()
+        .map(parse_hls_master_entries)
+        .unwrap_or_default();
 
-    if quality == Quality::AudioOnly {
-        if let Some(aud) = pick_best_audio(&pool.audio) {
-            return Some(ResolvedPlayback {
-                primary_url: aud.url.clone(),
-                audio_url: None,
-                user_agent: ua,
-                referer,
-                is_audio_only: true,
-                duration_secs,
-            });
-        }
-        if let Some(muxed) = pick_best_video(&pool.muxed, 360) {
-            return Some(ResolvedPlayback {
-                primary_url: muxed.url.clone(),
-                audio_url: None,
-                user_agent: ua,
-                referer,
-                is_audio_only: true,
-                duration_secs,
-            });
-        }
-        return None;
+    let mut audio_entries: Vec<CatalogAudio> = Vec::new();
+    let mut seen_audio_ids: HashSet<String> = HashSet::new();
+    for (idx, a) in pool.audio.iter().enumerate() {
+        let base_id = if a.itag > 0 {
+            format!("a{}", a.itag)
+        } else {
+            format!("a-{}", idx + 1)
+        };
+        let format_id = if seen_audio_ids.insert(base_id.clone()) {
+            base_id
+        } else {
+            let alt = format!("a{}-{}", a.itag, idx + 1);
+            seen_audio_ids.insert(alt.clone());
+            alt
+        };
+        audio_entries.push(CatalogAudio {
+            format_id,
+            url: a.url.clone(),
+            bitrate_bps: a.bitrate,
+            sample_rate: a.sample_rate,
+            filesize: a.filesize,
+            codec: a.codec,
+            is_direct: true,
+        });
     }
 
-    let target_h = quality.target_height().unwrap_or(360);
-
-    // For 360p: progressive muxed MP4 (single HTTP connection, H.264 + AAC) opens fastest on modest hardware!
-    if target_h <= 360 {
-        if let Some(muxed) = pick_best_video(&pool.muxed, 480) {
-            return Some(ResolvedPlayback {
-                primary_url: muxed.url.clone(),
-                audio_url: None,
-                user_agent: ua,
-                referer,
-                is_audio_only: false,
-                duration_secs,
+    if audio_entries.is_empty() {
+        if let Some(aud) = hls_audio_tracks
+            .iter()
+            .find(|a| a.is_default)
+            .or_else(|| hls_audio_tracks.first())
+        {
+            audio_entries.push(CatalogAudio {
+                format_id: "hls-audio".to_string(),
+                url: aud.uri.clone(),
+                bitrate_bps: 128_000,
+                sample_rate: 44_100,
+                filesize: None,
+                codec: SimpleAudioCodec::Aac,
+                is_direct: false,
             });
         }
     }
 
-    // Adaptive video + audio (720p / 1080p, or 360p when progressive muxed is absent)
-    if let (Some(vid), Some(aud)) = (
-        pick_best_video(&pool.adaptive_video, target_h),
-        pick_best_audio(&pool.audio),
-    ) {
-        let muxed_match = pick_best_video(&pool.muxed, target_h);
-        if let Some(m) = muxed_match {
-            if m.height >= vid.height && m.codec.hardware_rank() >= vid.codec.hardware_rank() {
-                return Some(ResolvedPlayback {
-                    primary_url: m.url.clone(),
-                    audio_url: None,
-                    user_agent: ua,
-                    referer,
-                    is_audio_only: false,
-                    duration_secs,
-                });
+    let has_direct_audio = audio_entries.iter().any(|a| a.is_direct);
+    let mut raw_videos: Vec<CatalogVideo> = Vec::new();
+
+    if has_direct_audio {
+        for v in &pool.adaptive_video {
+            if v.height == 0 {
+                continue;
+            }
+            let width = if v.width > 0 {
+                v.width
+            } else {
+                (v.height * 16 + 4) / 9
+            };
+            let format_id = if v.itag > 0 {
+                format!("v{}", v.itag)
+            } else {
+                format!("v-{}", v.height)
+            };
+            raw_videos.push(CatalogVideo {
+                format_id,
+                width,
+                height: v.height,
+                fps: v.fps.max(1),
+                bitrate_bps: v.bitrate as u64,
+                filesize: v.filesize,
+                hdr: v.hdr,
+                codec: v.codec,
+                has_embedded_or_paired_audio: false,
+                source: CatalogVideoSource::Adaptive { url: v.url.clone() },
+            });
+        }
+    }
+
+    for m in &pool.muxed {
+        if m.height == 0 {
+            continue;
+        }
+        let width = if m.width > 0 {
+            m.width
+        } else {
+            (m.height * 16 + 4) / 9
+        };
+        let format_id = if m.itag > 0 {
+            format!("m{}", m.itag)
+        } else {
+            format!("m-{}", m.height)
+        };
+        raw_videos.push(CatalogVideo {
+            format_id,
+            width,
+            height: m.height,
+            fps: m.fps.max(1),
+            bitrate_bps: m.bitrate as u64,
+            filesize: m.filesize,
+            hdr: m.hdr,
+            codec: m.codec,
+            has_embedded_or_paired_audio: true,
+            source: CatalogVideoSource::Muxed { url: m.url.clone() },
+        });
+    }
+
+    for hv in &hls_variants {
+        if hv.height == 0 {
+            continue;
+        }
+        let width = if hv.width > 0 {
+            hv.width
+        } else {
+            (hv.height * 16 + 4) / 9
+        };
+        let paired_audio = hv.audio_group.as_ref().and_then(|grp| {
+            hls_audio_tracks
+                .iter()
+                .filter(|a| &a.group_id == grp)
+                .find(|a| a.is_default)
+                .or_else(|| hls_audio_tracks.iter().find(|a| &a.group_id == grp))
+                .map(|a| a.uri.clone())
+        });
+        raw_videos.push(CatalogVideo {
+            format_id: format!("hls-{}", hv.height),
+            width,
+            height: hv.height,
+            fps: hv.fps.max(30),
+            bitrate_bps: hv.bandwidth,
+            filesize: None,
+            hdr: false,
+            codec: hv.codec,
+            has_embedded_or_paired_audio: true,
+            source: CatalogVideoSource::Hls {
+                uri: hv.uri.clone(),
+                paired_audio,
+            },
+        });
+    }
+
+    // Deduplicate to a single best hardware-decoded stream per height (excludes AV1 whenever
+    // H.264/VP9 exists at that height, matching Intel UHD 605 hardware decode & quality-menu.lua)
+    let mut distinct_heights: Vec<u32> = raw_videos.iter().map(|v| v.height).collect();
+    distinct_heights.sort_unstable_by(|a, b| b.cmp(a));
+    distinct_heights.dedup();
+
+    let mut video_entries: Vec<CatalogVideo> = Vec::with_capacity(distinct_heights.len());
+    let mut used_vid_ids: HashSet<String> = HashSet::new();
+
+    for h in distinct_heights {
+        let q_dim_sample = raw_videos
+            .iter()
+            .find(|v| v.height == h)
+            .map(|v| effective_quality_dim(v.width, v.height))
+            .unwrap_or(h);
+
+        let source_rank = |src: &CatalogVideoSource| -> u8 {
+            if q_dim_sample <= 360 {
+                match src {
+                    CatalogVideoSource::Muxed { .. } => 3,
+                    CatalogVideoSource::Adaptive { .. } => 2,
+                    CatalogVideoSource::Hls { .. } => 1,
+                }
+            } else {
+                match src {
+                    CatalogVideoSource::Adaptive { .. } => 3,
+                    CatalogVideoSource::Muxed { .. } => 2,
+                    CatalogVideoSource::Hls { .. } => 1,
+                }
+            }
+        };
+
+        if let Some(mut best) = raw_videos
+            .iter()
+            .filter(|v| v.height == h)
+            .max_by(|a, b| {
+                (!a.hdr)
+                    .cmp(&(!b.hdr))
+                    .then_with(|| {
+                        (a.codec != SimpleVideoCodec::Av1).cmp(&(b.codec != SimpleVideoCodec::Av1))
+                    })
+                    .then_with(|| source_rank(&a.source).cmp(&source_rank(&b.source)))
+                    .then_with(|| a.codec.hardware_rank().cmp(&b.codec.hardware_rank()))
+                    .then_with(|| (a.fps <= 60).cmp(&(b.fps <= 60)))
+                    .then_with(|| a.fps.cmp(&b.fps))
+                    .then_with(|| a.bitrate_bps.cmp(&b.bitrate_bps))
+            })
+            .cloned()
+        {
+            if !used_vid_ids.insert(best.format_id.clone()) {
+                best.format_id = format!("{}-{}p", best.format_id, best.height);
+                used_vid_ids.insert(best.format_id.clone());
+            }
+            video_entries.push(best);
+        }
+    }
+
+    let best_default_audio = pick_best_catalog_audio(&audio_entries);
+
+    let pick_default_video = |target_h: u32| -> Option<&CatalogVideo> {
+        if video_entries.is_empty() {
+            return None;
+        }
+        let has_within = video_entries
+            .iter()
+            .any(|v| effective_quality_dim(v.width, v.height) <= target_h);
+        video_entries.iter().max_by(|a, b| {
+            let aq = effective_quality_dim(a.width, a.height);
+            let bq = effective_quality_dim(b.width, b.height);
+            if has_within {
+                let a_ok = aq <= target_h;
+                let b_ok = bq <= target_h;
+                a_ok.cmp(&b_ok).then_with(|| aq.cmp(&bq))
+            } else {
+                bq.cmp(&aq)
+            }
+        })
+    };
+
+    let (chosen_video, chosen_audio) = if let Some(ovr) =
+        ytdl_format_override.map(str::trim).filter(|s| !s.is_empty())
+    {
+        let parts: Vec<&str> = ovr.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let vid_match = parts
+            .iter()
+            .find_map(|tok| video_entries.iter().find(|v| v.format_id == *tok));
+        let aud_match = parts
+            .iter()
+            .find_map(|tok| audio_entries.iter().find(|a| a.format_id == *tok));
+
+        if vid_match.is_some() || aud_match.is_some() {
+            (vid_match, aud_match)
+        } else if default_quality == Quality::AudioOnly {
+            (None, best_default_audio)
+        } else {
+            (
+                pick_default_video(default_quality.target_height().unwrap_or(360)),
+                best_default_audio,
+            )
+        }
+    } else if default_quality == Quality::AudioOnly {
+        (None, best_default_audio)
+    } else {
+        (
+            pick_default_video(default_quality.target_height().unwrap_or(360)),
+            best_default_audio,
+        )
+    };
+
+    let (primary_url, audio_url, is_audio_only) = match (chosen_video, chosen_audio) {
+        (Some(vid), aud_opt) => match &vid.source {
+            CatalogVideoSource::Adaptive { url } => {
+                let direct_aud = aud_opt.filter(|a| a.is_direct).or_else(|| {
+                    audio_entries
+                        .iter()
+                        .filter(|a| a.is_direct)
+                        .max_by_key(|a| a.bitrate_bps)
+                })?;
+                (url.clone(), Some(direct_aud.url.clone()), false)
+            }
+            CatalogVideoSource::Muxed { url } => (url.clone(), None, false),
+            CatalogVideoSource::Hls { uri, paired_audio } => {
+                (uri.clone(), paired_audio.clone(), false)
+            }
+        },
+        (None, Some(aud)) => (aud.url.clone(), None, true),
+        (None, None) => {
+            if let Some(lowest_vid) = video_entries.last() {
+                let url = match &lowest_vid.source {
+                    CatalogVideoSource::Adaptive { url } => url.clone(),
+                    CatalogVideoSource::Muxed { url } => url.clone(),
+                    CatalogVideoSource::Hls { uri, .. } => uri.clone(),
+                };
+                (url, None, default_quality == Quality::AudioOnly)
+            } else if let Some(ref master_hls) = pool.hls_url {
+                (
+                    master_hls.clone(),
+                    None,
+                    default_quality == Quality::AudioOnly,
+                )
+            } else {
+                return None;
             }
         }
-        return Some(ResolvedPlayback {
-            primary_url: vid.url.clone(),
-            audio_url: Some(aud.url.clone()),
-            user_agent: ua,
-            referer,
-            is_audio_only: false,
-            duration_secs,
-        });
+    };
+
+    let mut formats_json: Vec<Value> =
+        Vec::with_capacity(audio_entries.len() + video_entries.len());
+    for a in &audio_entries {
+        formats_json.push(a.to_ytdl_format_json());
+    }
+    for v in &video_entries {
+        formats_json.push(v.to_ytdl_format_json());
     }
 
-    // Fallback to progressive muxed
-    if let Some(muxed) = pick_best_video(&pool.muxed, target_h) {
-        return Some(ResolvedPlayback {
-            primary_url: muxed.url.clone(),
-            audio_url: None,
-            user_agent: ua,
-            referer,
-            is_audio_only: false,
-            duration_secs,
-        });
+    let mut requested_json: Vec<Value> = Vec::with_capacity(2);
+    if let Some(v) = chosen_video {
+        requested_json.push(v.to_ytdl_format_json());
+    }
+    if let Some(a) = chosen_audio {
+        requested_json.push(a.to_ytdl_format_json());
     }
 
-    None
+    let ytdl_json = serde_json::to_string(&json!({
+        "formats": formats_json,
+        "requested_formats": requested_json,
+    }))
+    .ok();
+
+    Some(ResolvedPlayback {
+        primary_url,
+        audio_url,
+        user_agent: pool.user_agent.clone(),
+        referer: pool.referer.clone(),
+        is_audio_only,
+        duration_secs: pool.duration_secs,
+        ytdl_json,
+    })
+}
+
+#[cfg(test)]
+fn select_direct_playback(pool: &CandidatePool, quality: Quality) -> Option<ResolvedPlayback> {
+    let entry = VerifiedPoolEntry {
+        video_id: "test".to_string(),
+        fetched_at: Instant::now(),
+        pool: pool.clone(),
+        hls_manifest: None,
+    };
+    resolve_from_verified_entry(&entry, quality, None)
 }
 
 #[derive(Clone, Debug)]
@@ -2798,7 +3344,9 @@ struct HlsAudioTrack {
 #[derive(Clone, Debug)]
 struct HlsVariant {
     uri: String,
+    width: u32,
     height: u32,
+    fps: u32,
     bandwidth: u64,
     codec: SimpleVideoCodec,
     audio_group: Option<String>,
@@ -2834,10 +3382,7 @@ fn extract_m3u8_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn parse_hls_master_playlist(
-    manifest: &str,
-    quality: Quality,
-) -> Option<(String, Option<String>)> {
+fn parse_hls_master_entries(manifest: &str) -> (Vec<HlsAudioTrack>, Vec<HlsVariant>) {
     let mut audio_tracks: Vec<HlsAudioTrack> = Vec::new();
     let mut variants: Vec<HlsVariant> = Vec::new();
     let mut pending_stream_inf: Option<&str> = None;
@@ -2876,10 +3421,20 @@ fn parse_hls_master_playlist(
         }
         if !line.starts_with('#') {
             if let Some(attrs) = pending_stream_inf.take() {
-                let height = extract_m3u8_attr(attrs, "RESOLUTION")
+                let (width, height) = extract_m3u8_attr(attrs, "RESOLUTION")
                     .and_then(|res| res.split_once('x'))
-                    .and_then(|(_, h)| h.parse::<u32>().ok())
-                    .unwrap_or(0);
+                    .map(|(w, h)| {
+                        (
+                            w.parse::<u32>().unwrap_or(0),
+                            h.parse::<u32>().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                let fps = extract_m3u8_attr(attrs, "FRAME-RATE")
+                    .and_then(|f| f.parse::<f64>().ok())
+                    .map(|f| f.round() as u32)
+                    .filter(|&f| f > 0)
+                    .unwrap_or(30);
                 let bandwidth = extract_m3u8_attr(attrs, "AVERAGE-BANDWIDTH")
                     .or_else(|| extract_m3u8_attr(attrs, "BANDWIDTH"))
                     .and_then(|b| b.parse::<u64>().ok())
@@ -2897,7 +3452,9 @@ fn parse_hls_master_playlist(
                 let audio_group = extract_m3u8_attr(attrs, "AUDIO").map(|s| s.to_string());
                 variants.push(HlsVariant {
                     uri: line.to_string(),
+                    width,
                     height,
+                    fps,
                     bandwidth,
                     codec,
                     audio_group,
@@ -2905,6 +3462,15 @@ fn parse_hls_master_playlist(
             }
         }
     }
+
+    (audio_tracks, variants)
+}
+
+fn parse_hls_master_playlist(
+    manifest: &str,
+    quality: Quality,
+) -> Option<(String, Option<String>)> {
+    let (audio_tracks, variants) = parse_hls_master_entries(manifest);
 
     if quality == Quality::AudioOnly {
         if let Some(aud) = audio_tracks
@@ -2925,20 +3491,24 @@ fn parse_hls_master_playlist(
     }
 
     let target_h = quality.target_height().unwrap_or(360);
-    let has_within_target = variants.iter().any(|v| v.height > 0 && v.height <= target_h);
+    let has_within_target = variants
+        .iter()
+        .any(|v| effective_quality_dim(v.width, v.height) > 0 && effective_quality_dim(v.width, v.height) <= target_h);
 
     let chosen = variants.iter().max_by(|a, b| {
+        let aq = effective_quality_dim(a.width, a.height);
+        let bq = effective_quality_dim(b.width, b.height);
         if has_within_target {
-            let a_ok = a.height > 0 && a.height <= target_h;
-            let b_ok = b.height > 0 && b.height <= target_h;
+            let a_ok = aq > 0 && aq <= target_h;
+            let b_ok = bq > 0 && bq <= target_h;
             if a_ok != b_ok {
                 return a_ok.cmp(&b_ok);
             }
-            if a.height != b.height {
-                return a.height.cmp(&b.height);
+            if aq != bq {
+                return aq.cmp(&bq);
             }
-        } else if a.height != b.height {
-            return b.height.cmp(&a.height);
+        } else if aq != bq {
+            return bq.cmp(&aq);
         }
 
         a.codec
@@ -4804,40 +5374,75 @@ mod tests {
     fn test_hardware_friendly_codec_selection() {
         let pool = CandidatePool {
             muxed: vec![RawVideoCandidate {
+                itag: 18,
                 url: "https://cdn.example/360_muxed.mp4".to_string(),
+                width: 640,
                 height: 360,
                 fps: 30,
                 bitrate: 500_000,
+                filesize: Some(11_250_000),
                 hdr: false,
                 is_mp4: true,
                 codec: SimpleVideoCodec::H264,
             }],
             adaptive_video: vec![
                 RawVideoCandidate {
+                    itag: 398,
                     url: "https://cdn.example/720_av1.mp4".to_string(),
+                    width: 1280,
                     height: 720,
                     fps: 30,
                     bitrate: 900_000,
+                    filesize: Some(20_000_000),
                     hdr: false,
                     is_mp4: true,
                     codec: SimpleVideoCodec::Av1,
                 },
                 RawVideoCandidate {
+                    itag: 136,
                     url: "https://cdn.example/720_h264.mp4".to_string(),
+                    width: 1280,
                     height: 720,
                     fps: 30,
                     bitrate: 1_200_000,
+                    filesize: Some(27_000_000),
                     hdr: false,
                     is_mp4: true,
                     codec: SimpleVideoCodec::H264,
                 },
+                RawVideoCandidate {
+                    itag: 401,
+                    url: "https://cdn.example/2160_av1_only.mp4".to_string(),
+                    width: 3840,
+                    height: 2160,
+                    fps: 60,
+                    bitrate: 12_000_000,
+                    filesize: None,
+                    hdr: false,
+                    is_mp4: true,
+                    codec: SimpleVideoCodec::Av1,
+                },
             ],
-            audio: vec![RawAudioCandidate {
-                url: "https://cdn.example/128k.m4a".to_string(),
-                bitrate: 128_000,
-                is_m4a: true,
-                codec: SimpleAudioCodec::Aac,
-            }],
+            audio: vec![
+                RawAudioCandidate {
+                    itag: 140,
+                    url: "https://cdn.example/128k.m4a".to_string(),
+                    bitrate: 128_000,
+                    sample_rate: 44_100,
+                    filesize: Some(2_880_000),
+                    is_m4a: true,
+                    codec: SimpleAudioCodec::Aac,
+                },
+                RawAudioCandidate {
+                    itag: 251,
+                    url: "https://cdn.example/160k.webm".to_string(),
+                    bitrate: 160_000,
+                    sample_rate: 48_000,
+                    filesize: Some(3_600_000),
+                    is_m4a: false,
+                    codec: SimpleAudioCodec::Opus,
+                },
+            ],
             hls_url: None,
             user_agent: "TestUA".to_string(),
             referer: String::new(),
@@ -4854,6 +5459,25 @@ mod tests {
         assert_eq!(p360.primary_url, "https://cdn.example/360_muxed.mp4");
         assert!(p360.audio_url.is_none());
 
+        // Verify quality-menu.lua JSON catalog & Kbps units
+        let ytdl: Value = serde_json::from_str(p360.ytdl_json.as_deref().unwrap()).unwrap();
+        let fmts = ytdl["formats"].as_array().unwrap();
+        // 2 audio + 3 deduplicated video heights (2160, 720, 360)
+        assert_eq!(fmts.len(), 5);
+        // At 720p, avc1 (v136) wins over av01 (v398)
+        let f720 = fmts.iter().find(|f| f["height"] == 720).unwrap();
+        assert_eq!(f720["format_id"], "v136");
+        assert_eq!(f720["vcodec"], "avc1");
+        assert_eq!(f720["resolution"], "1280x720");
+        assert_eq!(f720["tbr"], 1200.0);
+        // At 2160p, av01 is retained only because no H.264/VP9 exists at 2160p
+        let f2160 = fmts.iter().find(|f| f["height"] == 2160).unwrap();
+        assert_eq!(f2160["format_id"], "v401");
+        // Active requested_formats highlights m18 + a140
+        let req = ytdl["requested_formats"].as_array().unwrap();
+        assert_eq!(req[0]["format_id"], "m18");
+        assert_eq!(req[1]["format_id"], "a140");
+
         // 720p prefers H.264 over AV1 and pairs adaptive audio
         let p720 = select_direct_playback(&pool, Quality::P720).unwrap();
         assert_eq!(p720.primary_url, "https://cdn.example/720_h264.mp4");
@@ -4861,6 +5485,34 @@ mod tests {
             p720.audio_url.as_deref(),
             Some("https://cdn.example/128k.m4a")
         );
+
+        // Per-file ytdl-format override from quality-menu.lua (e.g. v136+a251)
+        let entry = VerifiedPoolEntry {
+            video_id: "vid1".to_string(),
+            fetched_at: Instant::now(),
+            pool: pool.clone(),
+            hls_manifest: Some(
+                "#EXTM3U\n#EXT-X-MEDIA:URI=\"https://manifest.example/a.m3u8\",TYPE=AUDIO,GROUP-ID=\"234\",DEFAULT=YES\n#EXT-X-STREAM-INF:BANDWIDTH=4200000,CODECS=\"mp4a.40.2,avc1.640028\",RESOLUTION=1920x1080,FRAME-RATE=60,AUDIO=\"234\"\nhttps://manifest.example/v1080.m3u8\n"
+                    .to_string(),
+            ),
+        };
+        let ovr_opus =
+            resolve_from_verified_entry(&entry, Quality::P360, Some("v136+a251")).unwrap();
+        assert_eq!(ovr_opus.primary_url, "https://cdn.example/720_h264.mp4");
+        assert_eq!(
+            ovr_opus.audio_url.as_deref(),
+            Some("https://cdn.example/160k.webm")
+        );
+        let ovr_hls =
+            resolve_from_verified_entry(&entry, Quality::P360, Some("hls-1080+a140")).unwrap();
+        assert_eq!(ovr_hls.primary_url, "https://manifest.example/v1080.m3u8");
+        assert_eq!(
+            ovr_hls.audio_url.as_deref(),
+            Some("https://manifest.example/a.m3u8")
+        );
+        let ovr_aud = resolve_from_verified_entry(&entry, Quality::P360, Some("a251")).unwrap();
+        assert!(ovr_aud.is_audio_only);
+        assert_eq!(ovr_aud.primary_url, "https://cdn.example/160k.webm");
 
         // AudioOnly picks direct audio stream
         let paud = select_direct_playback(&pool, Quality::AudioOnly).unwrap();

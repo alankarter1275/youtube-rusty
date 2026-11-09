@@ -474,21 +474,30 @@ impl PlayerCard {
         self.update_ui();
     }
 
-    pub fn append_items(self: &Rc<Self>, items: Vec<VideoSummary>) {
+    pub fn append_items(self: &Rc<Self>, items: Vec<VideoSummary>) -> Vec<VideoSummary> {
         if items.is_empty() {
-            return;
+            return Vec::new();
         }
+        let mut added = Vec::new();
         {
             let mut q = self.queue.borrow_mut();
             let mut seen: std::collections::HashSet<String> =
                 q.iter().map(|v| v.id.clone()).collect();
             for it in items {
                 if seen.insert(it.id.clone()) {
+                    added.push(it.clone());
                     q.push(it);
                 }
             }
         }
-        self.update_ui();
+        if !added.is_empty() {
+            self.update_ui();
+        }
+        added
+    }
+
+    pub fn all_items(&self) -> Vec<VideoSummary> {
+        self.queue.borrow().clone()
     }
 
     pub fn queue_len(&self) -> usize {

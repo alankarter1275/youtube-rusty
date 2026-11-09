@@ -6,6 +6,7 @@ use crate::backend::models::{
     PlaylistSearchSummary, UploadDateFilter, VideoSummary,
 };
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
+use crate::player::mpv::Quality;
 use crate::ui::details_sheet::{CardActions, DetailsSheet};
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::video_card::{ListCardLayout, PlaylistResultCard, VideoCard};
@@ -22,8 +23,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-pub type ShortsPlayHandler =
-    Rc<dyn Fn(Vec<VideoSummary>, usize, Option<(PageCursor, Option<ChannelDetails>)>)>;
+pub type ShortsPlayHandler = Rc<
+    dyn Fn(
+        Vec<VideoSummary>,
+        usize,
+        Option<Quality>,
+        Option<(PageCursor, Option<ChannelDetails>)>,
+    ),
+>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChannelTab {
@@ -480,7 +487,7 @@ impl ChannelPage {
                     (cp.actions.on_toast)("No Shorts available to play".to_string());
                 } else {
                     let cont = cp.shorts_continuation_payload();
-                    (cp.on_play_shorts_queue)(items, 0, cont);
+                    (cp.on_play_shorts_queue)(items, 0, None, cont);
                 }
             }
         });
@@ -1627,23 +1634,43 @@ impl ChannelPage {
                     &card.picture,
                 );
 
+                let short_id = short.id.clone();
+                let short_id_det = short.id.clone();
                 let cp_weak_play = Rc::downgrade(self);
                 let play_cb: Rc<dyn Fn()> = Rc::new(move || {
                     if let Some(cp) = cp_weak_play.upgrade() {
                         let current_all = cp.filtered_active_items();
                         if !current_all.is_empty() {
+                            let target_idx = current_all
+                                .iter()
+                                .position(|v| v.id == short_id)
+                                .unwrap_or(idx);
                             let cont = cp.shorts_continuation_payload();
-                            (cp.on_play_shorts_queue)(current_all, idx, cont);
+                            (cp.on_play_shorts_queue)(current_all, target_idx, None, cont);
                         }
                     }
                 });
 
                 let cp_weak_sel = Rc::downgrade(self);
+                let cp_weak_det = Rc::downgrade(self);
                 let play_for_enter = play_cb.clone();
                 let play_for_dbl = play_cb;
                 let parent_weak = self.parent_window.clone();
                 let sum_det = short.clone();
-                let act_det = self.actions.clone();
+                let mut act_det = self.actions.clone();
+                act_det.on_play = Rc::new(move |_summary, q| {
+                    if let Some(cp) = cp_weak_det.upgrade() {
+                        let current_all = cp.filtered_active_items();
+                        if !current_all.is_empty() {
+                            let target_idx = current_all
+                                .iter()
+                                .position(|v| v.id == short_id_det)
+                                .unwrap_or(idx);
+                            let cont = cp.shorts_continuation_payload();
+                            (cp.on_play_shorts_queue)(current_all, target_idx, Some(q), cont);
+                        }
+                    }
+                });
 
                 card.connect_card_interactions(
                     move |hl| {
