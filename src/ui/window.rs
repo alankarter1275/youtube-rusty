@@ -794,7 +794,7 @@ impl MainWindow {
         this.defocus_search_bar();
         this.load_trending();
 
-        // Warm YouTube session visitor_data + background idle MPV socket shortly after window paint
+        // Warm YouTube session visitor_data shortly after window paint (MPV spawns lazily on first play)
         let weak_warm = Rc::downgrade(&this);
         glib::timeout_add_local_once(Duration::from_millis(450), move || {
             if let Some(w) = weak_warm.upgrade() {
@@ -802,7 +802,6 @@ impl MainWindow {
                 w.runtime.spawn(async move {
                     eng.warm_startup().await;
                 });
-                let _ = w.ensure_mpv_session();
             }
         });
 
@@ -3212,6 +3211,12 @@ impl MainWindow {
             if self.settings_store.load().save_history {
                 self.history_store.add(cur.clone());
             }
+            // Resolve stream pool in parallel while MPV initializes its IPC socket
+            let eng = self.engine.clone();
+            let cur_id = cur.id.clone();
+            self.runtime.spawn(async move {
+                eng.prefetch_video_pool(&cur_id).await;
+            });
         }
 
         self.player_card.set_playing(true);

@@ -14,14 +14,14 @@ use rustypipe::model::{
 use rustypipe::param::search_filter::{ItemType, Length, Order, SearchFilter, UploadDate};
 use rustypipe::param::{ChannelOrder, ChannelVideoTab};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::task::JoinSet;
 
 const VISIONOS_APP_VERSION: &str = "1.04";
@@ -243,6 +243,7 @@ pub struct Engine {
     http: reqwest::Client,
     visitor_data: RwLock<Option<String>>,
     verified_pools: RwLock<Vec<VerifiedPoolEntry>>,
+    pool_inflight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     home_seed: AtomicU64,
     seen_home_ids: RwLock<Vec<String>>,
     category_seed: AtomicU64,
@@ -272,6 +273,7 @@ impl Engine {
             http,
             visitor_data: RwLock::new(None),
             verified_pools: RwLock::new(Vec::new()),
+            pool_inflight: Mutex::new(HashMap::new()),
             home_seed: AtomicU64::new(init_seed),
             seen_home_ids: RwLock::new(Vec::new()),
             category_seed: AtomicU64::new(init_seed.wrapping_add(3)),
@@ -360,6 +362,29 @@ impl Engine {
     }
 
     async fn fetch_or_get_verified_pool(&self, video_id: &str) -> Result<VerifiedPoolEntry, String> {
+        {
+            let guard = self.verified_pools.read().await;
+            if let Some(found) = guard
+                .iter()
+                .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL)
+            {
+                return Ok(found.clone());
+            }
+        }
+
+        // Coalesce concurrent requests for the same video_id (e.g. parallel startup prefetch + MPV hook)
+        let vid_lock = {
+            let mut inflight = self.pool_inflight.lock().await;
+            if inflight.len() > 16 {
+                inflight.retain(|_, v| Arc::strong_count(v) > 1);
+            }
+            inflight
+                .entry(video_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _vid_guard = vid_lock.lock().await;
+
         {
             let guard = self.verified_pools.read().await;
             if let Some(found) = guard

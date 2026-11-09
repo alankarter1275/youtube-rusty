@@ -437,9 +437,10 @@ impl MpvSession {
                 *guard = Some(child);
             }
 
-            // Wait up to 5 seconds for MPV's Unix IPC socket
+            // Wait up to 25 seconds for MPV's Unix IPC socket (accommodates cold HDD dynamic linking
+            // of FFmpeg/Vulkan/Lua shared libraries while still returning immediately on connect or early exit)
             let mut stream_opt = None;
-            for _ in 0..100 {
+            for _ in 0..500 {
                 if !running_for_task.load(Ordering::SeqCst) {
                     break;
                 }
