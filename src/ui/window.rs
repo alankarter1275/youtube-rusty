@@ -3867,8 +3867,17 @@ impl MainWindow {
                                 "Clear search",
                                 Rc::new(move || {
                                     if let Some(win) = weak_clear.upgrade() {
-                                        win.clear_search_bar_quietly();
-                                        win.restore_previous_non_search_view();
+                                        if win.nav_history.borrow().is_empty() {
+                                            let w2 = win.clone();
+                                            win.reset_nav_root(|| {
+                                                w2.clear_search_bar_quietly();
+                                                w2.set_active_nav(Some(RailTab::Home));
+                                                w2.highlight_chip(Some(&w2.chip_trending));
+                                                w2.load_trending();
+                                            });
+                                        } else {
+                                            win.go_back();
+                                        }
                                     }
                                 }),
                             )),
