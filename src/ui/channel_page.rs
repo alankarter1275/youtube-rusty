@@ -19,9 +19,16 @@ use gtk4::{
 };
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+
+const VIRTUAL_WINDOW_ROWS: usize = 8;
+const VIRTUAL_HYSTERESIS_ROWS: usize = 2;
+const DEFAULT_SHORTS_ROW_STRIDE: f64 = 366.0;
+const DEFAULT_VIDEOS_ROW_STRIDE: f64 = 264.0;
+const GRID_ROW_SPACING_PX: f64 = 24.0;
 
 pub type ShortsPlayHandler = Rc<
     dyn Fn(
@@ -67,7 +74,9 @@ pub struct ChannelPage {
     sort_btn: Button,
     refresh_btn: Button,
     scrolled: ScrolledWindow,
+    top_spacer: GtkBox,
     flow_box: FlowBox,
+    bottom_spacer: GtkBox,
     status_box: GtkBox,
     status_page: adw::StatusPage,
     active_tab: Cell<ChannelTab>,
@@ -77,6 +86,8 @@ pub struct ChannelPage {
     shorts_cols: Cell<u32>,
     is_loading: Cell<bool>,
     is_loading_more: Cell<bool>,
+    is_suspended: Cell<bool>,
+    in_window_sync: Cell<bool>,
     playlists_loaded: Cell<bool>,
     request_seq: Cell<u64>,
     reload_seq: Cell<u64>,
@@ -92,6 +103,13 @@ pub struct ChannelPage {
     shorts_cursor: RefCell<Option<PageCursor>>,
     playlists_cursor: RefCell<Option<PageCursor>>,
     search_results: RefCell<Option<Vec<VideoSummary>>>,
+    rendered_items: RefCell<Vec<VideoSummary>>,
+    win_start_idx: Cell<usize>,
+    win_end_idx: Cell<usize>,
+    shorts_row_stride: Cell<f64>,
+    videos_row_stride: Cell<f64>,
+    saved_scroll_y: Cell<f64>,
+    selected_item_id: RefCell<Option<String>>,
     selected_box: RefCell<Option<GtkBox>>,
     selected_play_cb: RefCell<Option<Rc<dyn Fn()>>>,
 }
@@ -250,6 +268,7 @@ impl ChannelPage {
         let body_box = GtkBox::new(Orientation::Vertical, 0);
         body_box.set_vexpand(true);
         body_box.set_hexpand(true);
+        body_box.set_margin_bottom(32);
 
         let status_page = adw::StatusPage::builder()
             .icon_name("system-search-symbolic")
@@ -263,6 +282,10 @@ impl ChannelPage {
         status_box.set_visible(false);
         status_box.append(&status_page);
 
+        let top_spacer = GtkBox::new(Orientation::Vertical, 0);
+        top_spacer.set_hexpand(true);
+        top_spacer.set_visible(false);
+
         let flow_box = FlowBox::new();
         flow_box.set_valign(Align::Start);
         flow_box.set_max_children_per_line(grid_cols);
@@ -273,10 +296,15 @@ impl ChannelPage {
         flow_box.set_homogeneous(true);
         flow_box.set_margin_start(28);
         flow_box.set_margin_end(28);
-        flow_box.set_margin_bottom(32);
+
+        let bottom_spacer = GtkBox::new(Orientation::Vertical, 0);
+        bottom_spacer.set_hexpand(true);
+        bottom_spacer.set_visible(false);
 
         body_box.append(&status_box);
+        body_box.append(&top_spacer);
         body_box.append(&flow_box);
+        body_box.append(&bottom_spacer);
 
         let scrolled = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -330,7 +358,9 @@ impl ChannelPage {
             sort_btn,
             refresh_btn,
             scrolled,
+            top_spacer,
             flow_box,
+            bottom_spacer,
             status_box,
             status_page,
             active_tab: Cell::new(ChannelTab::Videos),
@@ -340,6 +370,8 @@ impl ChannelPage {
             shorts_cols: Cell::new(shorts_cols),
             is_loading: Cell::new(true),
             is_loading_more: Cell::new(false),
+            is_suspended: Cell::new(false),
+            in_window_sync: Cell::new(false),
             playlists_loaded: Cell::new(false),
             request_seq: Cell::new(0),
             reload_seq: Cell::new(0),
@@ -355,6 +387,13 @@ impl ChannelPage {
             shorts_cursor: RefCell::new(None),
             playlists_cursor: RefCell::new(None),
             search_results: RefCell::new(None),
+            rendered_items: RefCell::new(Vec::new()),
+            win_start_idx: Cell::new(0),
+            win_end_idx: Cell::new(0),
+            shorts_row_stride: Cell::new(DEFAULT_SHORTS_ROW_STRIDE),
+            videos_row_stride: Cell::new(DEFAULT_VIDEOS_ROW_STRIDE),
+            saved_scroll_y: Cell::new(0.0),
+            selected_item_id: RefCell::new(None),
             selected_box: RefCell::new(None),
             selected_play_cb: RefCell::new(None),
         });
@@ -405,18 +444,20 @@ impl ChannelPage {
         });
         root_box.add_controller(key_ctrl);
 
-        // Infinite scroll: load next page only when scrolling near the bottom
+        // Sliding-window virtualization + near-bottom infinite scroll
         let weak_scroll = Rc::downgrade(self);
         self.scrolled
             .vadjustment()
             .connect_value_changed(move |adj| {
+                let Some(cp) = weak_scroll.upgrade() else {
+                    return;
+                };
+                cp.on_scroll_changed();
                 let val = adj.value();
                 let page = adj.page_size();
                 let upper = adj.upper();
-                if val > 0.0 && upper > page && val + page >= upper - 420.0 {
-                    if let Some(cp) = weak_scroll.upgrade() {
-                        cp.load_more_active_tab();
-                    }
+                if val > 0.0 && upper > page && val + page >= upper - 680.0 {
+                    cp.load_more_active_tab();
                 }
             });
 
@@ -592,13 +633,14 @@ impl ChannelPage {
         self.setup_sort_popover();
     }
 
-    fn select_card_box(&self, target: &GtkBox, play_cb: Rc<dyn Fn()>) {
+    fn select_card_box(&self, item_id: Option<&str>, target: &GtkBox, play_cb: Rc<dyn Fn()>) {
         if let Some(prev) = self.selected_box.borrow_mut().replace(target.clone()) {
             if prev != *target {
                 prev.remove_css_class("selected");
             }
         }
         target.add_css_class("selected");
+        *self.selected_item_id.borrow_mut() = item_id.map(str::to_string);
         *self.selected_play_cb.borrow_mut() = Some(play_cb);
     }
 
@@ -606,6 +648,7 @@ impl ChannelPage {
         if let Some(prev) = self.selected_box.borrow_mut().take() {
             prev.remove_css_class("selected");
         }
+        *self.selected_item_id.borrow_mut() = None;
         *self.selected_play_cb.borrow_mut() = None;
     }
 
@@ -1043,10 +1086,24 @@ impl ChannelPage {
                 };
                 cp.is_loading_more.set(false);
                 if let Ok(paged) = res {
-                    cp.playlists_list.borrow_mut().extend(paged.items.clone());
+                    let existing: HashSet<String> = cp
+                        .playlists_list
+                        .borrow()
+                        .iter()
+                        .map(|p| p.id.clone())
+                        .collect();
+                    let unique_pls: Vec<PlaylistSearchSummary> = paged
+                        .items
+                        .into_iter()
+                        .filter(|p| !existing.contains(&p.id))
+                        .collect();
+                    cp.playlists_list.borrow_mut().extend(unique_pls.clone());
                     *cp.playlists_cursor.borrow_mut() = paged.next;
-                    if cp.active_tab.get() == ChannelTab::Playlists {
-                        cp.append_playlists_to_flow(&paged.items);
+                    if cp.active_tab.get() == ChannelTab::Playlists
+                        && cp.search_results.borrow().is_none()
+                        && !cp.is_suspended.get()
+                    {
+                        cp.append_playlists_to_flow(&unique_pls);
                     }
                 }
             });
@@ -1086,28 +1143,81 @@ impl ChannelPage {
             cp.is_loading_more.set(false);
 
             match res {
-                Ok(paged) => {
+                Ok(mut paged) => {
+                    if let Some(ref details) = *cp.channel_details.borrow() {
+                        for item in &mut paged.items {
+                            if item.channel_id.is_empty() {
+                                item.channel_id = details.id.clone();
+                            }
+                            if item.channel_name.is_empty() {
+                                item.channel_name = details.name.clone();
+                            }
+                            if item.channel_avatar_url.is_empty() {
+                                item.channel_avatar_url = details.avatar_url.clone();
+                            }
+                        }
+                    }
+
                     let df = cp.date_filter.get();
                     let duf = cp.duration_filter.get();
-                    let visible_new: Vec<VideoSummary> = paged
-                        .items
-                        .iter()
-                        .filter(|v| matches_local_filters(v, df, duf))
-                        .cloned()
-                        .collect();
 
                     if is_shorts {
-                        let start_idx = cp.filtered_active_items().len();
-                        cp.shorts_list.borrow_mut().extend(paged.items);
+                        let existing: HashSet<String> = cp
+                            .shorts_list
+                            .borrow()
+                            .iter()
+                            .map(|v| v.id.clone())
+                            .collect();
+                        let mut seen = existing;
+                        let unique_items: Vec<VideoSummary> = paged
+                            .items
+                            .into_iter()
+                            .filter(|v| !v.id.is_empty() && seen.insert(v.id.clone()))
+                            .collect();
+                        let visible_new: Vec<VideoSummary> = unique_items
+                            .iter()
+                            .filter(|v| matches_local_filters(v, df, duf))
+                            .cloned()
+                            .collect();
+
+                        cp.shorts_list.borrow_mut().extend(unique_items);
                         *cp.shorts_cursor.borrow_mut() = paged.next;
-                        if cp.active_tab.get() == ChannelTab::Shorts {
-                            cp.append_items_to_flow(&visible_new, true, start_idx);
+                        if cp.active_tab.get() == ChannelTab::Shorts
+                            && cp.search_results.borrow().is_none()
+                        {
+                            cp.rendered_items.borrow_mut().extend(visible_new);
+                            if !cp.is_suspended.get() {
+                                cp.sync_virtual_window(false);
+                            }
                         }
                     } else {
-                        cp.videos_list.borrow_mut().extend(paged.items);
+                        let existing: HashSet<String> = cp
+                            .videos_list
+                            .borrow()
+                            .iter()
+                            .map(|v| v.id.clone())
+                            .collect();
+                        let mut seen = existing;
+                        let unique_items: Vec<VideoSummary> = paged
+                            .items
+                            .into_iter()
+                            .filter(|v| !v.id.is_empty() && seen.insert(v.id.clone()))
+                            .collect();
+                        let visible_new: Vec<VideoSummary> = unique_items
+                            .iter()
+                            .filter(|v| matches_local_filters(v, df, duf))
+                            .cloned()
+                            .collect();
+
+                        cp.videos_list.borrow_mut().extend(unique_items);
                         *cp.videos_cursor.borrow_mut() = paged.next;
-                        if cp.active_tab.get() == ChannelTab::Videos {
-                            cp.append_items_to_flow(&visible_new, false, 0);
+                        if cp.active_tab.get() == ChannelTab::Videos
+                            && cp.search_results.borrow().is_none()
+                        {
+                            cp.rendered_items.borrow_mut().extend(visible_new);
+                            if !cp.is_suspended.get() {
+                                cp.sync_virtual_window(false);
+                            }
                         }
                     }
                 }
@@ -1158,7 +1268,15 @@ impl ChannelPage {
         });
     }
 
-    pub fn set_layout(&self, narrow: bool, compact: bool, grid_cols: u32, shorts_cols: u32) {
+    pub fn set_layout(
+        self: &Rc<Self>,
+        narrow: bool,
+        compact: bool,
+        grid_cols: u32,
+        shorts_cols: u32,
+    ) {
+        let cols_changed =
+            self.grid_cols.get() != grid_cols || self.shorts_cols.get() != shorts_cols;
         self.is_narrow.set(narrow);
         self.is_compact.set(compact);
         self.grid_cols.set(grid_cols);
@@ -1184,6 +1302,14 @@ impl ChannelPage {
         self.flow_box.set_margin_start(side);
         self.flow_box.set_margin_end(side);
         self.update_grid_columns();
+
+        if cols_changed
+            && !self.is_loading.get()
+            && !self.is_suspended.get()
+            && !self.rendered_items.borrow().is_empty()
+        {
+            self.sync_virtual_window(true);
+        }
     }
 
     fn update_grid_columns(&self) {
@@ -1416,8 +1542,84 @@ impl ChannelPage {
         self.show_status("Failed to load channel", err);
     }
 
+    fn reset_spacers_and_window(&self) {
+        self.win_start_idx.set(0);
+        self.win_end_idx.set(0);
+        self.rendered_items.borrow_mut().clear();
+        if self.top_spacer.height_request() != 0 {
+            self.top_spacer.set_size_request(-1, 0);
+        }
+        self.top_spacer.set_visible(false);
+        if self.bottom_spacer.height_request() != 0 {
+            self.bottom_spacer.set_size_request(-1, 0);
+        }
+        self.bottom_spacer.set_visible(false);
+    }
+
+    pub fn suspend_textures(&self) {
+        if self.is_suspended.replace(true) {
+            return;
+        }
+        self.saved_scroll_y
+            .set(self.scrolled.vadjustment().value().max(0.0));
+
+        let total_items = self.rendered_items.borrow().len();
+        if total_items > 0 {
+            let is_shorts_tab = self.active_tab.get() == ChannelTab::Shorts
+                && self.search_results.borrow().is_none();
+            let cols = (if is_shorts_tab {
+                self.shorts_cols.get()
+            } else {
+                self.grid_cols.get()
+            })
+            .max(1) as usize;
+            let total_rows = total_items.div_ceil(cols);
+            let stride = if is_shorts_tab {
+                self.shorts_row_stride.get()
+            } else {
+                self.videos_row_stride.get()
+            };
+            let full_px =
+                ((total_rows as f64 * stride) - GRID_ROW_SPACING_PX).max(0.0).round() as i32;
+            self.top_spacer.set_size_request(-1, full_px);
+            self.top_spacer.set_visible(full_px > 0);
+            self.bottom_spacer.set_size_request(-1, 0);
+            self.bottom_spacer.set_visible(false);
+        }
+
+        if let Some(prev) = self.selected_box.borrow_mut().take() {
+            prev.remove_css_class("selected");
+        }
+        while let Some(child) = self.flow_box.first_child() {
+            self.flow_box.remove(&child);
+        }
+        self.win_start_idx.set(0);
+        self.win_end_idx.set(0);
+        self.actions.image_loader.schedule_heap_trim();
+    }
+
+    pub fn resume_textures(self: &Rc<Self>) {
+        if !self.is_suspended.replace(false) {
+            return;
+        }
+        if self.is_loading.get() {
+            return;
+        }
+        let target_y = self.saved_scroll_y.get();
+        if self.active_tab.get() == ChannelTab::Playlists && self.search_results.borrow().is_none()
+        {
+            self.render_active_tab();
+        } else if !self.rendered_items.borrow().is_empty() {
+            self.sync_virtual_window(true);
+        }
+        if target_y > 0.0 {
+            self.scrolled.vadjustment().set_value(target_y);
+        }
+    }
+
     fn show_skeletons(&self) {
         self.clear_selection();
+        self.reset_spacers_and_window();
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
         while let Some(child) = self.flow_box.first_child() {
@@ -1434,6 +1636,7 @@ impl ChannelPage {
 
     fn show_status(&self, title: &str, description: &str) {
         self.clear_selection();
+        self.reset_spacers_and_window();
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
@@ -1489,9 +1692,12 @@ impl ChannelPage {
         while let Some(child) = self.flow_box.first_child() {
             self.flow_box.remove(&child);
         }
+        self.win_start_idx.set(0);
+        self.win_end_idx.set(0);
 
         if self.active_tab.get() == ChannelTab::Playlists && self.search_results.borrow().is_none()
         {
+            self.reset_spacers_and_window();
             let pls = self.playlists_list.borrow().clone();
             if pls.is_empty() {
                 self.show_status("Nothing here yet", "This channel has no public playlists.");
@@ -1500,7 +1706,9 @@ impl ChannelPage {
             self.status_box.set_visible(false);
             self.flow_box.set_visible(true);
             self.update_grid_columns();
-            self.append_playlists_to_flow(&pls);
+            if !self.is_suspended.get() {
+                self.append_playlists_to_flow(&pls);
+            }
             return;
         }
 
@@ -1528,11 +1736,162 @@ impl ChannelPage {
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
         self.update_grid_columns();
+        *self.rendered_items.borrow_mut() = items;
+
+        if !self.is_suspended.get() {
+            self.sync_virtual_window(true);
+        }
+        self.actions.image_loader.schedule_heap_trim();
+    }
+
+    fn on_scroll_changed(self: &Rc<Self>) {
+        if self.is_loading.get() || self.is_suspended.get() || self.in_window_sync.get() {
+            return;
+        }
+        if self.active_tab.get() == ChannelTab::Playlists && self.search_results.borrow().is_none()
+        {
+            return;
+        }
+        if !self.rendered_items.borrow().is_empty() {
+            self.sync_virtual_window(false);
+        }
+    }
+
+    fn sync_virtual_window(self: &Rc<Self>, force_rebuild: bool) {
+        if self.in_window_sync.get() || self.is_loading.get() || self.is_suspended.get() {
+            return;
+        }
+        if self.active_tab.get() == ChannelTab::Playlists && self.search_results.borrow().is_none()
+        {
+            return;
+        }
+        let total_items = self.rendered_items.borrow().len();
+        if total_items == 0 {
+            return;
+        }
 
         let is_shorts_tab =
             self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none();
+        let cols = (if is_shorts_tab {
+            self.shorts_cols.get()
+        } else {
+            self.grid_cols.get()
+        })
+        .max(1) as usize;
 
-        self.append_items_to_flow(&items, is_shorts_tab, 0);
+        let cur_start = self.win_start_idx.get();
+        let cur_end = self.win_end_idx.get();
+        let cur_mounted_rows = if cur_end > cur_start {
+            (cur_end - cur_start).div_ceil(cols)
+        } else {
+            0
+        };
+
+        if !force_rebuild && cur_mounted_rows >= 2 {
+            let fb_h = self.flow_box.height();
+            if fb_h > 120 {
+                let measured = (fb_h as f64 + GRID_ROW_SPACING_PX) / (cur_mounted_rows as f64);
+                if (160.0..=620.0).contains(&measured) {
+                    let prev = if is_shorts_tab {
+                        self.shorts_row_stride.get()
+                    } else {
+                        self.videos_row_stride.get()
+                    };
+                    if (measured - prev).abs() >= 0.5 {
+                        if is_shorts_tab {
+                            self.shorts_row_stride.set(measured);
+                        } else {
+                            self.videos_row_stride.set(measured);
+                        }
+                    }
+                }
+            }
+        }
+
+        let stride = if is_shorts_tab {
+            self.shorts_row_stride.get()
+        } else {
+            self.videos_row_stride.get()
+        };
+
+        let scroll_y = self.scrolled.vadjustment().value().max(0.0);
+        let (new_start, new_end, top_px, bottom_px) = compute_virtual_slice(
+            total_items,
+            cols,
+            stride,
+            scroll_y,
+            cur_start,
+            cur_end,
+            force_rebuild,
+        );
+
+        self.in_window_sync.set(true);
+
+        let mut removed_any = false;
+        if force_rebuild || cur_end <= cur_start || new_end <= cur_start || new_start >= cur_end {
+            while let Some(child) = self.flow_box.first_child() {
+                self.flow_box.remove(&child);
+                removed_any = true;
+            }
+            let slice: Vec<VideoSummary> =
+                self.rendered_items.borrow()[new_start..new_end].to_vec();
+            for (off, item) in slice.iter().enumerate() {
+                let card = self.build_single_item_card(item, is_shorts_tab, new_start + off);
+                self.flow_box.append(&card.container);
+            }
+        } else if new_start != cur_start || new_end != cur_end {
+            if new_start > cur_start {
+                for _ in 0..(new_start - cur_start) {
+                    if let Some(child) = self.flow_box.first_child() {
+                        self.flow_box.remove(&child);
+                        removed_any = true;
+                    }
+                }
+            }
+            if new_end < cur_end {
+                for _ in 0..(cur_end - new_end) {
+                    if let Some(child) = self.flow_box.last_child() {
+                        self.flow_box.remove(&child);
+                        removed_any = true;
+                    }
+                }
+            }
+            if new_start < cur_start {
+                let prepend_slice: Vec<VideoSummary> =
+                    self.rendered_items.borrow()[new_start..cur_start].to_vec();
+                for (off, item) in prepend_slice.iter().enumerate().rev() {
+                    let card = self.build_single_item_card(item, is_shorts_tab, new_start + off);
+                    self.flow_box.prepend(&card.container);
+                }
+            }
+            if new_end > cur_end {
+                let append_slice: Vec<VideoSummary> =
+                    self.rendered_items.borrow()[cur_end..new_end].to_vec();
+                for (off, item) in append_slice.iter().enumerate() {
+                    let card = self.build_single_item_card(item, is_shorts_tab, cur_end + off);
+                    self.flow_box.append(&card.container);
+                }
+            }
+        }
+
+        self.win_start_idx.set(new_start);
+        self.win_end_idx.set(new_end);
+
+        if self.top_spacer.height_request() != top_px {
+            self.top_spacer.set_size_request(-1, top_px);
+        }
+        self.top_spacer.set_visible(top_px > 0);
+
+        if self.bottom_spacer.height_request() != bottom_px {
+            self.bottom_spacer.set_size_request(-1, bottom_px);
+        }
+        self.bottom_spacer.set_visible(bottom_px > 0);
+
+        self.in_window_sync.set(false);
+
+        if removed_any {
+            self.actions.image_loader.schedule_heap_trim();
+        }
     }
 
     fn append_playlists_to_flow(self: &Rc<Self>, pls: &[PlaylistSearchSummary]) {
@@ -1555,6 +1914,7 @@ impl ChannelPage {
             let open_action: Rc<dyn Fn()> = Rc::new(move || open_cb(pid_open.clone()));
 
             let cp_sel = Rc::downgrade(self);
+            let pl_id_sel = pl.id.clone();
             let enter_cb = open_action.clone();
             let open_dbl = open_action.clone();
 
@@ -1569,7 +1929,7 @@ impl ChannelPage {
                 initially_saved,
                 move |hl| {
                     if let Some(cp) = cp_sel.upgrade() {
-                        cp.select_card_box(hl, enter_cb.clone());
+                        cp.select_card_box(Some(&pl_id_sel), hl, enter_cb.clone());
                     }
                 },
                 move || open_dbl(),
@@ -1624,120 +1984,127 @@ impl ChannelPage {
         }
     }
 
-    fn append_items_to_flow(
+    fn build_single_item_card(
         self: &Rc<Self>,
-        items: &[VideoSummary],
+        item: &VideoSummary,
         is_shorts_tab: bool,
-        start_offset: usize,
-    ) {
+        idx: usize,
+    ) -> VideoCard {
         if is_shorts_tab {
-            for (i, short) in items.iter().enumerate() {
-                let idx = start_offset + i;
-                let card = VideoCard::new_short(short);
-                self.actions.image_loader.load_into_short_picture(
-                    &short.id,
-                    &short.thumbnail_url,
-                    &card.picture,
-                );
+            let card = VideoCard::new_short(item);
+            self.actions.image_loader.load_into_short_picture(
+                &item.id,
+                &item.thumbnail_url,
+                &card.picture,
+            );
 
-                let short_id = short.id.clone();
-                let short_id_det = short.id.clone();
-                let cp_weak_play = Rc::downgrade(self);
-                let play_cb: Rc<dyn Fn()> = Rc::new(move || {
-                    if let Some(cp) = cp_weak_play.upgrade() {
-                        let current_all = cp.filtered_active_items();
-                        if !current_all.is_empty() {
-                            let target_idx = current_all
-                                .iter()
-                                .position(|v| v.id == short_id)
-                                .unwrap_or(idx);
-                            let cont = cp.shorts_continuation_payload();
-                            (cp.on_play_shorts_queue)(current_all, target_idx, None, cont);
-                        }
+            let short_id = item.id.clone();
+            let short_id_sel = item.id.clone();
+            let short_id_det = item.id.clone();
+            let cp_weak_play = Rc::downgrade(self);
+            let play_cb: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(cp) = cp_weak_play.upgrade() {
+                    let current_all = cp.filtered_active_items();
+                    if !current_all.is_empty() {
+                        let target_idx = current_all
+                            .iter()
+                            .position(|v| v.id == short_id)
+                            .unwrap_or(idx);
+                        let cont = cp.shorts_continuation_payload();
+                        (cp.on_play_shorts_queue)(current_all, target_idx, None, cont);
                     }
-                });
+                }
+            });
 
-                let cp_weak_sel = Rc::downgrade(self);
-                let cp_weak_det = Rc::downgrade(self);
-                let play_for_enter = play_cb.clone();
-                let play_for_dbl = play_cb;
-                let parent_weak = self.parent_window.clone();
-                let sum_det = short.clone();
-                let mut act_det = self.actions.clone();
-                act_det.on_play = Rc::new(move |_summary, q| {
-                    if let Some(cp) = cp_weak_det.upgrade() {
-                        let current_all = cp.filtered_active_items();
-                        if !current_all.is_empty() {
-                            let target_idx = current_all
-                                .iter()
-                                .position(|v| v.id == short_id_det)
-                                .unwrap_or(idx);
-                            let cont = cp.shorts_continuation_payload();
-                            (cp.on_play_shorts_queue)(current_all, target_idx, Some(q), cont);
-                        }
+            let cp_weak_sel = Rc::downgrade(self);
+            let cp_weak_det = Rc::downgrade(self);
+            let play_for_enter = play_cb.clone();
+            let play_for_dbl = play_cb;
+            let parent_weak = self.parent_window.clone();
+            let sum_det = item.clone();
+            let mut act_det = self.actions.clone();
+            act_det.on_play = Rc::new(move |_summary, q| {
+                if let Some(cp) = cp_weak_det.upgrade() {
+                    let current_all = cp.filtered_active_items();
+                    if !current_all.is_empty() {
+                        let target_idx = current_all
+                            .iter()
+                            .position(|v| v.id == short_id_det)
+                            .unwrap_or(idx);
+                        let cont = cp.shorts_continuation_payload();
+                        (cp.on_play_shorts_queue)(current_all, target_idx, Some(q), cont);
                     }
-                });
+                }
+            });
 
-                card.connect_card_interactions(
-                    move |hl| {
-                        if let Some(cp) = cp_weak_sel.upgrade() {
-                            cp.select_card_box(hl, play_for_enter.clone());
-                        }
-                    },
-                    move || play_for_dbl(),
-                    move || {
-                        if let Some(win) = parent_weak.upgrade() {
-                            DetailsSheet::show(&win, &sum_det, &act_det);
-                        }
-                    },
-                );
-
-                self.flow_box.append(&card.container);
+            if self.selected_item_id.borrow().as_deref() == Some(item.id.as_str()) {
+                card.highlight_target.add_css_class("selected");
+                *self.selected_box.borrow_mut() = Some(card.highlight_target.clone());
             }
+
+            card.connect_card_interactions(
+                move |hl| {
+                    if let Some(cp) = cp_weak_sel.upgrade() {
+                        cp.select_card_box(Some(&short_id_sel), hl, play_for_enter.clone());
+                    }
+                },
+                move || play_for_dbl(),
+                move || {
+                    if let Some(win) = parent_weak.upgrade() {
+                        DetailsSheet::show(&win, &sum_det, &act_det);
+                    }
+                },
+            );
+
+            card
         } else {
-            for video in items {
-                let card = VideoCard::new_grid(video);
-                self.actions.image_loader.load_into_picture(
-                    &video.id,
-                    &video.thumbnail_url,
-                    &card.picture,
-                );
-                self.actions.image_loader.load_into_avatar(
-                    &video.channel_id,
-                    &video.channel_avatar_url,
-                    &card.avatar,
-                );
+            let card = VideoCard::new_grid(item);
+            self.actions.image_loader.load_into_picture(
+                &item.id,
+                &item.thumbnail_url,
+                &card.picture,
+            );
+            self.actions.image_loader.load_into_avatar(
+                &item.channel_id,
+                &item.channel_avatar_url,
+                &card.avatar,
+            );
 
-                let sum_play = video.clone();
-                let on_play = self.actions.on_play.clone();
-                let def_q = self.actions.default_quality.clone();
-                let play_cb: Rc<dyn Fn()> = Rc::new(move || {
-                    on_play(sum_play.clone(), def_q());
-                });
+            let sum_play = item.clone();
+            let vid_id_sel = item.id.clone();
+            let on_play = self.actions.on_play.clone();
+            let def_q = self.actions.default_quality.clone();
+            let play_cb: Rc<dyn Fn()> = Rc::new(move || {
+                on_play(sum_play.clone(), def_q());
+            });
 
-                let cp_weak_sel = Rc::downgrade(self);
-                let play_for_enter = play_cb.clone();
-                let play_for_dbl = play_cb;
-                let parent_weak = self.parent_window.clone();
-                let sum_det = video.clone();
-                let act_det = self.actions.clone();
+            let cp_weak_sel = Rc::downgrade(self);
+            let play_for_enter = play_cb.clone();
+            let play_for_dbl = play_cb;
+            let parent_weak = self.parent_window.clone();
+            let sum_det = item.clone();
+            let act_det = self.actions.clone();
 
-                card.connect_card_interactions(
-                    move |hl| {
-                        if let Some(cp) = cp_weak_sel.upgrade() {
-                            cp.select_card_box(hl, play_for_enter.clone());
-                        }
-                    },
-                    move || play_for_dbl(),
-                    move || {
-                        if let Some(win) = parent_weak.upgrade() {
-                            DetailsSheet::show(&win, &sum_det, &act_det);
-                        }
-                    },
-                );
-
-                self.flow_box.append(&card.container);
+            if self.selected_item_id.borrow().as_deref() == Some(item.id.as_str()) {
+                card.highlight_target.add_css_class("selected");
+                *self.selected_box.borrow_mut() = Some(card.highlight_target.clone());
             }
+
+            card.connect_card_interactions(
+                move |hl| {
+                    if let Some(cp) = cp_weak_sel.upgrade() {
+                        cp.select_card_box(Some(&vid_id_sel), hl, play_for_enter.clone());
+                    }
+                },
+                move || play_for_dbl(),
+                move || {
+                    if let Some(win) = parent_weak.upgrade() {
+                        DetailsSheet::show(&win, &sum_det, &act_det);
+                    }
+                },
+            );
+
+            card
         }
     }
 }
@@ -1770,3 +2137,93 @@ fn set_pop_item_text(btn: &Button, label: &str, selected: bool) {
         }
     }
 }
+
+fn compute_virtual_slice(
+    total_items: usize,
+    cols: usize,
+    stride: f64,
+    scroll_y: f64,
+    cur_start: usize,
+    cur_end: usize,
+    force_rebuild: bool,
+) -> (usize, usize, i32, i32) {
+    let cols = cols.max(1);
+    if total_items == 0 {
+        return (0, 0, 0, 0);
+    }
+    let total_rows = total_items.div_ceil(cols);
+    let approx_first_row = (scroll_y.max(0.0) / stride.max(1.0)).floor() as usize;
+    let max_start_row = total_rows.saturating_sub(VIRTUAL_WINDOW_ROWS);
+    let ideal_start_row = approx_first_row.saturating_sub(2).min(max_start_row);
+
+    let cur_start_row = cur_start / cols;
+    let target_start_row = if force_rebuild || cur_end <= cur_start {
+        ideal_start_row
+    } else if ideal_start_row == 0 || ideal_start_row == max_start_row {
+        ideal_start_row
+    } else if ideal_start_row.abs_diff(cur_start_row) >= VIRTUAL_HYSTERESIS_ROWS {
+        ideal_start_row
+    } else {
+        cur_start_row.min(max_start_row)
+    };
+
+    let new_start = (target_start_row * cols).min(total_items);
+    let new_end = ((target_start_row + VIRTUAL_WINDOW_ROWS) * cols).min(total_items);
+
+    let new_start_row = new_start / cols;
+    let new_end_row = new_end.div_ceil(cols);
+    let rem_rows = total_rows.saturating_sub(new_end_row);
+    let top_px = (new_start_row as f64 * stride).round() as i32;
+    let bottom_px = (rem_rows as f64 * stride).round() as i32;
+
+    (new_start, new_end, top_px, bottom_px)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_virtual_slice_bounds_live_widgets_and_preserves_total_height() {
+        // 600 Shorts across 6 columns = 100 rows, stride = 366px (342px card + 24px gap)
+        let total_items = 600;
+        let cols = 6;
+        let stride = 366.0;
+        let expected_total_h = (100 * 366) - 24;
+
+        let mut cur_start = 0;
+        let mut cur_end = 0;
+
+        for row in 0..95 {
+            let scroll_y = row as f64 * stride;
+            let (s, e, top_px, bottom_px) = compute_virtual_slice(
+                total_items,
+                cols,
+                stride,
+                scroll_y,
+                cur_start,
+                cur_end,
+                cur_end == 0,
+            );
+            cur_start = s;
+            cur_end = e;
+
+            // Never mounts more than 8 rows (48 Short cards) at once
+            assert!(e - s <= VIRTUAL_WINDOW_ROWS * cols);
+            assert_eq!(s % cols, 0);
+
+            // Exact pixel height invariant: top_spacer + flow_box + bottom_spacer == total_height
+            let mounted_rows = (e - s).div_ceil(cols) as i32;
+            let flow_px = mounted_rows * 366 - 24;
+            assert_eq!(top_px + flow_px + bottom_px, expected_total_h);
+        }
+
+        // Scrolling back to y = 0 snaps cleanly to index 0 with 0px top spacer
+        let (s0, e0, top0, _) =
+            compute_virtual_slice(total_items, cols, stride, 0.0, cur_start, cur_end, false);
+        assert_eq!(s0, 0);
+        assert_eq!(e0, 48);
+        assert_eq!(top0, 0);
+    }
+}
+

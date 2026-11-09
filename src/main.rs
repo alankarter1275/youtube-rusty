@@ -10,7 +10,29 @@ use ui::window::MainWindow;
 
 const APP_ID: &str = "com.kunal.YouTubeRusty";
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn configure_low_memory_allocator() {
+    extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    const M_ARENA_MAX: i32 = -8;
+    // Cap glibc arenas to 2 and pin mmap/trim thresholds at 128 KiB so decoded
+    // RGBA buffers and large JSON payloads are returned to the OS immediately.
+    unsafe {
+        let _ = mallopt(M_ARENA_MAX, 2);
+        let _ = mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        let _ = mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn configure_low_memory_allocator() {}
+
 fn main() {
+    configure_low_memory_allocator();
+
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     // Hold a single main-window handle tied to the application's lifetime

@@ -890,8 +890,35 @@ impl PlayerCard {
             return;
         }
 
-        let items_snapshot = self.queue.borrow().clone();
-        for (i, item) in items_snapshot.iter().enumerate() {
+        const MAX_VISIBLE_QUEUE_ROWS: usize = 36;
+        let win_start = if count <= MAX_VISIBLE_QUEUE_ROWS {
+            0
+        } else {
+            cur_idx
+                .saturating_sub(8)
+                .min(count - MAX_VISIBLE_QUEUE_ROWS)
+        };
+        let win_end = (win_start + MAX_VISIBLE_QUEUE_ROWS).min(count);
+
+        if win_start > 0 {
+            let earlier_lbl = Label::new(Some(&format!("… {win_start} earlier in queue")));
+            earlier_lbl.add_css_class("yr-meta");
+            earlier_lbl.set_halign(Align::Center);
+            earlier_lbl.set_margin_top(4);
+            earlier_lbl.set_margin_bottom(4);
+            self.queue_list.append(&earlier_lbl);
+        }
+
+        let slice_snapshot: Vec<(usize, VideoSummary)> = {
+            let q = self.queue.borrow();
+            q[win_start..win_end]
+                .iter()
+                .enumerate()
+                .map(|(off, v)| (win_start + off, v.clone()))
+                .collect()
+        };
+
+        for (i, item) in slice_snapshot {
             let row = GtkBox::new(Orientation::Horizontal, 8);
             row.add_css_class("yr-queue-row");
             if i == cur_idx {
@@ -1030,6 +1057,15 @@ impl PlayerCard {
             row.add_controller(drop_target);
 
             self.queue_list.append(&row);
+        }
+
+        if win_end < count {
+            let more_lbl = Label::new(Some(&format!("… {} more in queue", count - win_end)));
+            more_lbl.add_css_class("yr-meta");
+            more_lbl.set_halign(Align::Center);
+            more_lbl.set_margin_top(4);
+            more_lbl.set_margin_bottom(4);
+            self.queue_list.append(&more_lbl);
         }
     }
 }

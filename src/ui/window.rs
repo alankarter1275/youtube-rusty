@@ -185,6 +185,10 @@ pub struct MainWindow {
     selected_box: RefCell<Option<GtkBox>>,
     selected_action_cb: RefCell<Option<Rc<dyn Fn()>>>,
     open_channels: RefCell<Vec<Rc<ChannelPage>>>,
+    home_pictures: RefCell<Vec<(String, String, glib::WeakRef<gtk4::Picture>)>>,
+    home_avatars: RefCell<Vec<(String, String, glib::WeakRef<adw::Avatar>)>>,
+    home_textures_suspended: Cell<bool>,
+    last_home_cull_y: Cell<f64>,
     theme_provider: CssProvider,
     pub image_loader: Rc<ImageLoader>,
     pub history_store: Arc<HistoryStore>,
@@ -757,6 +761,10 @@ impl MainWindow {
             selected_box: RefCell::new(None),
             selected_action_cb: RefCell::new(None),
             open_channels: RefCell::new(Vec::new()),
+            home_pictures: RefCell::new(Vec::new()),
+            home_avatars: RefCell::new(Vec::new()),
+            home_textures_suspended: Cell::new(false),
+            last_home_cull_y: Cell::new(0.0),
             theme_provider,
             image_loader,
             history_store,
@@ -1893,18 +1901,20 @@ impl MainWindow {
             glib::Propagation::Proceed
         });
 
-        // Near-bottom smart infinite scroll (zero extra bandwidth when staying near top)
+        // Off-screen texture culling + near-bottom smart infinite scroll
         let weak_scroll = Rc::downgrade(self);
         self.content_scrolled
             .vadjustment()
             .connect_value_changed(move |adj| {
+                let Some(w) = weak_scroll.upgrade() else {
+                    return;
+                };
+                w.maybe_cull_home_textures();
                 let val = adj.value();
                 let page = adj.page_size();
                 let upper = adj.upper();
                 if val > 0.0 && upper > page && val + page >= upper - 420.0 {
-                    if let Some(w) = weak_scroll.upgrade() {
-                        w.load_more_current_feed();
-                    }
+                    w.load_more_current_feed();
                 }
             });
 
@@ -2018,8 +2028,12 @@ impl MainWindow {
 
             if is_home {
                 w.open_channels.borrow_mut().clear();
+                w.image_loader.schedule_heap_trim();
                 if *w.active_view.borrow() == ActiveView::Subscriptions {
+                    w.home_textures_suspended.set(false);
                     w.load_subscriptions();
+                } else {
+                    w.resume_home_textures();
                 }
             }
         });
@@ -2031,6 +2045,11 @@ impl MainWindow {
                 w.open_channels
                     .borrow_mut()
                     .retain(|cp| &cp.page != popped_page);
+                let top_cp = w.open_channels.borrow().last().cloned();
+                if let Some(cp) = top_cp {
+                    cp.resume_textures();
+                }
+                w.image_loader.schedule_heap_trim();
             }
         });
 
@@ -3202,9 +3221,22 @@ impl MainWindow {
     }
 
     fn pump_queue_continuation(self: &Rc<Self>) {
-        const EAGER_QUEUE_TARGET: usize = 500;
-        const LAZY_REFILL_THRESHOLD: usize = 100;
+        const REFILL_AHEAD_THRESHOLD: usize = 20;
+        const ROLLING_AHEAD_TARGET: usize = 48;
 
+        if self.queue_cont_fetching.get() || self.player_card.is_empty() {
+            return;
+        }
+        let cur_idx = self.player_card.current_idx();
+        let q_len = self.player_card.queue_len();
+        let remaining_ahead = q_len.saturating_sub(cur_idx + 1);
+        if remaining_ahead >= REFILL_AHEAD_THRESHOLD {
+            return;
+        }
+        self.pump_queue_continuation_until(ROLLING_AHEAD_TARGET);
+    }
+
+    fn pump_queue_continuation_until(self: &Rc<Self>, target_ahead: usize) {
         if self.queue_cont_fetching.get() || self.player_card.is_empty() {
             return;
         }
@@ -3215,7 +3247,7 @@ impl MainWindow {
         let cur_idx = self.player_card.current_idx();
         let q_len = self.player_card.queue_len();
         let remaining_ahead = q_len.saturating_sub(cur_idx + 1);
-        if q_len >= EAGER_QUEUE_TARGET && remaining_ahead >= LAZY_REFILL_THRESHOLD {
+        if remaining_ahead >= target_ahead {
             return;
         }
 
@@ -3274,7 +3306,7 @@ impl MainWindow {
                             }
                         }
                         w.prefetch_next_track_pool();
-                        w.pump_queue_continuation();
+                        w.pump_queue_continuation_until(target_ahead);
                     }
                 }
                 Err(_) => {
@@ -3471,6 +3503,195 @@ impl MainWindow {
         session
     }
 
+    fn bind_home_picture(&self, key: &str, url: &str, picture: &gtk4::Picture) {
+        if url.is_empty() {
+            return;
+        }
+        self.home_pictures
+            .borrow_mut()
+            .push((key.to_string(), url.to_string(), picture.downgrade()));
+        if !self.home_textures_suspended.get() {
+            self.image_loader.load_into_picture(key, url, picture);
+        }
+    }
+
+    fn bind_home_avatar(&self, key: &str, url: &str, avatar: &adw::Avatar) {
+        if url.is_empty() {
+            return;
+        }
+        self.home_avatars
+            .borrow_mut()
+            .push((key.to_string(), url.to_string(), avatar.downgrade()));
+        if !self.home_textures_suspended.get() {
+            self.image_loader.load_into_avatar(key, url, avatar);
+        }
+    }
+
+    fn clear_home_flow_box(&self) {
+        self.home_pictures.borrow_mut().clear();
+        self.home_avatars.borrow_mut().clear();
+        self.last_home_cull_y.set(0.0);
+        let had_children = self.flow_box.first_child().is_some();
+        while let Some(child) = self.flow_box.first_child() {
+            self.flow_box.remove(&child);
+        }
+        if had_children {
+            self.image_loader.schedule_heap_trim();
+        }
+    }
+
+    fn suspend_home_textures(&self) {
+        if self.home_textures_suspended.replace(true) {
+            return;
+        }
+        for (_, _, wref) in self.home_pictures.borrow().iter() {
+            if let Some(pic) = wref.upgrade() {
+                pic.set_paintable(gdk::Paintable::NONE);
+            }
+        }
+        for (_, _, wref) in self.home_avatars.borrow().iter() {
+            if let Some(av) = wref.upgrade() {
+                av.set_custom_image(gdk::Paintable::NONE);
+            }
+        }
+        self.image_loader.shrink_textures(8);
+        self.image_loader.schedule_heap_trim();
+    }
+
+    fn resume_home_textures(&self) {
+        if !self.home_textures_suspended.replace(false) {
+            return;
+        }
+        let view_h = self.content_scrolled.height();
+        let can_cull = view_h > 0 && self.home_pictures.borrow().len() > 28;
+        let max_y = view_h as f32 + 950.0;
+
+        let pics: Vec<(String, String, glib::WeakRef<gtk4::Picture>)> = self
+            .home_pictures
+            .borrow()
+            .iter()
+            .filter(|(_, _, w)| w.upgrade().is_some())
+            .cloned()
+            .collect();
+        *self.home_pictures.borrow_mut() = pics.clone();
+
+        for (key, url, wref) in &pics {
+            if let Some(pic) = wref.upgrade() {
+                let should_load = if can_cull {
+                    pic.compute_bounds(&self.content_scrolled)
+                        .map(|b| b.y() + b.height() >= -950.0 && b.y() <= max_y)
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+                if should_load && pic.paintable().is_none() {
+                    self.image_loader.load_into_picture(key, url, &pic);
+                }
+            }
+        }
+
+        let avs: Vec<(String, String, glib::WeakRef<adw::Avatar>)> = self
+            .home_avatars
+            .borrow()
+            .iter()
+            .filter(|(_, _, w)| w.upgrade().is_some())
+            .cloned()
+            .collect();
+        *self.home_avatars.borrow_mut() = avs.clone();
+
+        for (key, url, wref) in &avs {
+            if let Some(av) = wref.upgrade() {
+                let should_load = if can_cull {
+                    av.compute_bounds(&self.content_scrolled)
+                        .map(|b| b.y() + b.height() >= -950.0 && b.y() <= max_y)
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+                if should_load && av.custom_image().is_none() {
+                    self.image_loader.load_into_avatar(key, url, &av);
+                }
+            }
+        }
+    }
+
+    fn maybe_cull_home_textures(&self) {
+        if self.home_textures_suspended.get() {
+            return;
+        }
+        let is_home = self
+            .nav_view
+            .visible_page()
+            .and_then(|p| p.tag())
+            .map(|t| t.as_str() == "home")
+            .unwrap_or(true);
+        if !is_home {
+            return;
+        }
+        let pic_count = self.home_pictures.borrow().len();
+        if pic_count <= 28 {
+            return;
+        }
+        let view_h = self.content_scrolled.height();
+        if view_h <= 0 {
+            return;
+        }
+
+        let scroll_y = self.content_scrolled.vadjustment().value();
+        if scroll_y > 10.0 && (scroll_y - self.last_home_cull_y.get()).abs() < 260.0 {
+            return;
+        }
+        self.last_home_cull_y.set(scroll_y);
+
+        let min_y: f32 = -950.0;
+        let max_y: f32 = view_h as f32 + 950.0;
+        let mut culled_any = false;
+
+        let pics: Vec<(String, String, glib::WeakRef<gtk4::Picture>)> =
+            self.home_pictures.borrow().clone();
+        for (key, url, wref) in &pics {
+            let Some(pic) = wref.upgrade() else {
+                continue;
+            };
+            let Some(bounds) = pic.compute_bounds(&self.content_scrolled) else {
+                continue;
+            };
+            let in_band = bounds.y() + bounds.height() >= min_y && bounds.y() <= max_y;
+            if in_band {
+                if pic.paintable().is_none() {
+                    self.image_loader.load_into_picture(key, url, &pic);
+                }
+            } else if pic.paintable().is_some() {
+                pic.set_paintable(gdk::Paintable::NONE);
+                culled_any = true;
+            }
+        }
+
+        let avs: Vec<(String, String, glib::WeakRef<adw::Avatar>)> =
+            self.home_avatars.borrow().clone();
+        for (key, url, wref) in &avs {
+            let Some(av) = wref.upgrade() else {
+                continue;
+            };
+            let Some(bounds) = av.compute_bounds(&self.content_scrolled) else {
+                continue;
+            };
+            let in_band = bounds.y() + bounds.height() >= min_y && bounds.y() <= max_y;
+            if in_band {
+                if av.custom_image().is_none() {
+                    self.image_loader.load_into_avatar(key, url, &av);
+                }
+            } else if av.custom_image().is_some() {
+                av.set_custom_image(gdk::Paintable::NONE);
+                culled_any = true;
+            }
+        }
+
+        if culled_any {
+            self.image_loader.schedule_heap_trim();
+        }
+    }
+
     pub fn open_channel(
         self: &Rc<Self>,
         channel_id: &str,
@@ -3480,6 +3701,10 @@ impl MainWindow {
             return None;
         }
         self.defocus_search_bar();
+        self.suspend_home_textures();
+        for existing_cp in self.open_channels.borrow().iter() {
+            existing_cp.suspend_textures();
+        }
 
         let actions = self.make_card_actions();
         let weak_shorts = Rc::downgrade(self);
@@ -3593,6 +3818,9 @@ impl MainWindow {
             None
         };
 
+        self.home_pictures.borrow_mut().clear();
+        self.home_avatars.borrow_mut().clear();
+        self.home_textures_suspended.set(false);
         self.nav_view.pop_to_page(&self.home_page);
         self.clear_card_selection();
 
@@ -3851,9 +4079,7 @@ impl MainWindow {
         self.clear_card_selection();
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
         self.view_mode.set(ViewMode::SearchList);
         self.update_flow_columns();
         *self.current_search_items.borrow_mut() = Vec::new();
@@ -3927,8 +4153,7 @@ impl MainWindow {
                     );
 
                     if !ch.avatar_url.is_empty() {
-                        self.image_loader
-                            .load_into_avatar(&ch.id, &ch.avatar_url, &card.avatar);
+                        self.bind_home_avatar(&ch.id, &ch.avatar_url, &card.avatar);
                     }
                     self.flow_box.append(&card.container);
                 }
@@ -3971,7 +4196,7 @@ impl MainWindow {
                     );
 
                     if !pl.thumbnail_url.is_empty() {
-                        self.image_loader.load_into_picture(
+                        self.bind_home_picture(
                             &format!("pl_{}", pl.id),
                             &pl.thumbnail_url,
                             &card.picture,
@@ -4035,9 +4260,7 @@ impl MainWindow {
             Some("Playlists"),
         );
 
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
 
         if playlists.is_empty() {
             self.show_status_state(
@@ -4098,7 +4321,7 @@ impl MainWindow {
 
             if let Some(first_vid) = pl.videos.first() {
                 if !first_vid.thumbnail_url.is_empty() {
-                    self.image_loader.load_into_picture(
+                    self.bind_home_picture(
                         &first_vid.id,
                         &first_vid.thumbnail_url,
                         &card.picture,
@@ -4142,9 +4365,7 @@ impl MainWindow {
         self.playlist_rename_btn.set_visible(true);
         self.playlist_delete_btn.set_visible(true);
 
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
 
         *self.current_videos.borrow_mut() = pl.videos.clone();
 
@@ -4289,9 +4510,7 @@ impl MainWindow {
         };
         self.playlist_meta_lbl.set_text(&meta);
 
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
         *self.current_videos.borrow_mut() = Vec::new();
@@ -4319,8 +4538,7 @@ impl MainWindow {
         idx: usize,
         actions: &CardActions,
     ) {
-        self.image_loader
-            .load_into_picture(&vid.id, &vid.thumbnail_url, &card.picture);
+        self.bind_home_picture(&vid.id, &vid.thumbnail_url, &card.picture);
 
         let vid_id = vid.id.clone();
         let vid_id_det = vid.id.clone();
@@ -4826,9 +5044,7 @@ impl MainWindow {
             None,
         );
 
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
 
         let entries = self.history_store.load_all();
         if entries.is_empty() {
@@ -4854,7 +5070,7 @@ impl MainWindow {
                 }
             });
 
-            self.image_loader.load_into_picture(
+            self.bind_home_picture(
                 &entry.video.id,
                 &entry.video.thumbnail_url,
                 &card.picture,
@@ -5031,9 +5247,7 @@ impl MainWindow {
         self.flow_box.set_visible(true);
         self.current_videos.borrow_mut().clear();
         self.current_search_items.borrow_mut().clear();
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
         self.view_mode.set(ViewMode::Grid);
         self.update_flow_columns();
         for _ in 0..count {
@@ -5047,9 +5261,7 @@ impl MainWindow {
         self.flow_box.set_visible(true);
         self.current_videos.borrow_mut().clear();
         self.current_search_items.borrow_mut().clear();
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
         self.view_mode.set(ViewMode::SearchList);
         self.update_flow_columns();
         let layout = self.list_card_layout();
@@ -5066,9 +5278,7 @@ impl MainWindow {
         action: Option<(&str, Rc<dyn Fn()>)>,
     ) {
         self.clear_card_selection();
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
         self.current_videos.borrow_mut().clear();
         self.current_search_items.borrow_mut().clear();
         self.flow_box.set_visible(false);
@@ -5096,10 +5306,7 @@ impl MainWindow {
         self.clear_card_selection();
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
-
-        while let Some(child) = self.flow_box.first_child() {
-            self.flow_box.remove(&child);
-        }
+        self.clear_home_flow_box();
 
         self.view_mode.set(mode);
         self.update_flow_columns();
@@ -5169,10 +5376,9 @@ impl MainWindow {
             });
         }
 
-        self.image_loader
-            .load_into_picture(&summary.id, &summary.thumbnail_url, &card.picture);
+        self.bind_home_picture(&summary.id, &summary.thumbnail_url, &card.picture);
         if !summary.channel_avatar_url.is_empty() {
-            self.image_loader.load_into_avatar(
+            self.bind_home_avatar(
                 &summary.channel_id,
                 &summary.channel_avatar_url,
                 &card.avatar,
