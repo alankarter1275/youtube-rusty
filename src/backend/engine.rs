@@ -1176,11 +1176,13 @@ impl Engine {
 
         match tab {
             SearchTab::All => {
-                if is_default_filters {
-                    if let Ok(direct_all) = self.search_direct(query, Some("8AEB"), false).await {
-                        if !direct_all.items.is_empty() {
-                            return Ok(direct_all);
-                        }
+                let direct_params = encode_direct_search_params(sort, date, duration, None);
+                if let Ok(direct_all) = self
+                    .search_direct(query, Some(&direct_params), DirectSearchMode::All)
+                    .await
+                {
+                    if !direct_all.items.is_empty() {
+                        return Ok(direct_all);
                     }
                 }
                 let paginator = if is_default_filters {
@@ -1217,6 +1219,61 @@ impl Engine {
                     next: paged.next,
                 })
             }
+            SearchTab::Shorts => {
+                let shorts_params =
+                    encode_direct_search_params(sort, date, DurationFilter::AnyLength, Some(9));
+                if let Ok(direct_shorts) = self
+                    .search_direct(query, Some(&shorts_params), DirectSearchMode::ShortsOnly)
+                    .await
+                {
+                    if !direct_shorts.items.is_empty() {
+                        return Ok(direct_shorts);
+                    }
+                }
+
+                // Fallback 1: inspect YouTube's "Shorts" refinement chip in the search header
+                if let Ok(raw_all) = self.fetch_search_json(Some(query), Some("8AEB"), None).await {
+                    if let Some((chip_ctok, chip_params)) =
+                        extract_search_header_shorts_chip(&raw_all)
+                    {
+                        if let Some(tok) = chip_ctok {
+                            if let Ok(cont_page) = self
+                                .continue_search_direct(&tok, DirectSearchMode::ShortsOnly)
+                                .await
+                            {
+                                if !cont_page.items.is_empty() {
+                                    return Ok(cont_page);
+                                }
+                            }
+                        }
+                        if let Some(p) = chip_params {
+                            if let Ok(param_page) = self
+                                .search_direct(query, Some(&p), DirectSearchMode::ShortsOnly)
+                                .await
+                            {
+                                if !param_page.items.is_empty() {
+                                    return Ok(param_page);
+                                }
+                            }
+                        }
+                    }
+                    let extracted = parse_direct_search_response(&raw_all, DirectSearchMode::ShortsOnly);
+                    if !extracted.items.is_empty() {
+                        return Ok(extracted);
+                    }
+                }
+
+                // Fallback 2: "#shorts" tagged search
+                let tagged_q = format!("{query} #shorts");
+                let fallback_params =
+                    encode_direct_search_params(sort, date, DurationFilter::Under4Min, Some(1));
+                self.search_direct(
+                    &tagged_q,
+                    Some(&fallback_params),
+                    DirectSearchMode::ShortsOnly,
+                )
+                .await
+            }
             SearchTab::Channels => {
                 let filter = SearchFilter::new()
                     .item_type(ItemType::Channel)
@@ -1237,12 +1294,10 @@ impl Engine {
                 Ok(PagedSearchItems { items, next })
             }
             SearchTab::Playlists => {
-                let pl_params = match sort {
-                    SearchSortOrder::Relevance => "EgIQA_ABAQ%3D%3D",
-                    SearchSortOrder::UploadDate => "CAISAhAD8AEB",
-                    SearchSortOrder::ViewCount => "CAMSAhAD8AEB",
-                };
-                self.search_direct(query, Some(pl_params), true).await
+                let pl_params =
+                    encode_direct_search_params(sort, date, DurationFilter::AnyLength, Some(3));
+                self.search_direct(query, Some(&pl_params), DirectSearchMode::PlaylistsOnly)
+                    .await
             }
         }
     }
@@ -1253,9 +1308,12 @@ impl Engine {
         tab: SearchTab,
     ) -> Result<PagedSearchItems, String> {
         if cursor.kind == CursorKind::DirectSearch {
-            return self
-                .continue_search_direct(&cursor.ctoken, tab == SearchTab::Playlists)
-                .await;
+            let mode = match tab {
+                SearchTab::Shorts => DirectSearchMode::ShortsOnly,
+                SearchTab::Playlists => DirectSearchMode::PlaylistsOnly,
+                _ => DirectSearchMode::All,
+            };
+            return self.continue_search_direct(&cursor.ctoken, mode).await;
         }
 
         match tab {
@@ -1278,8 +1336,9 @@ impl Engine {
                     .collect();
                 Ok(PagedSearchItems { items, next })
             }
-            SearchTab::Videos => {
-                let paged = self.load_more(cursor, None, false, false).await?;
+            SearchTab::Videos | SearchTab::Shorts => {
+                let is_shorts = tab == SearchTab::Shorts;
+                let paged = self.load_more(cursor, None, is_shorts, false).await?;
                 Ok(PagedSearchItems {
                     items: paged.items.into_iter().map(SearchItem::Video).collect(),
                     next: paged.next,
@@ -1496,19 +1555,19 @@ impl Engine {
         &self,
         query: &str,
         params: Option<&str>,
-        playlists_only: bool,
+        mode: DirectSearchMode,
     ) -> Result<PagedSearchItems, String> {
         let val = self.fetch_search_json(Some(query), params, None).await?;
-        Ok(parse_direct_search_response(&val, playlists_only))
+        Ok(parse_direct_search_response(&val, mode))
     }
 
     async fn continue_search_direct(
         &self,
         ctoken: &str,
-        playlists_only: bool,
+        mode: DirectSearchMode,
     ) -> Result<PagedSearchItems, String> {
         let val = self.fetch_search_json(None, None, Some(ctoken)).await?;
-        Ok(parse_direct_search_response(&val, playlists_only))
+        Ok(parse_direct_search_response(&val, mode))
     }
 
     async fn fetch_search_json(
@@ -1869,6 +1928,38 @@ impl Engine {
                     }
                 }
                 return Ok(page);
+            }
+            CursorKind::DirectSearch => {
+                let mode = if force_short {
+                    DirectSearchMode::ShortsOnly
+                } else {
+                    DirectSearchMode::All
+                };
+                let page = self.continue_search_direct(&cursor.ctoken, mode).await?;
+                let items = page
+                    .items
+                    .into_iter()
+                    .filter_map(|it| match it {
+                        SearchItem::Video(mut v) => {
+                            if force_short {
+                                v.is_short = true;
+                                if v.duration_text.is_empty() {
+                                    v.duration_text = "SHORTS".to_string();
+                                }
+                            }
+                            if filter_out_shorts && v.is_short {
+                                None
+                            } else {
+                                Some(v)
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                return Ok(PagedVideos {
+                    items,
+                    next: page.next,
+                });
             }
             _ => {}
         }
@@ -3760,7 +3851,23 @@ fn parse_short_lockup_item(
     )
     .or_else(|| {
         pick_json_sources_url(
+            lockup
+                .pointer("/thumbnailViewModel/image/sources")
+                .and_then(|v| v.as_array()),
+            216,
+        )
+    })
+    .or_else(|| {
+        pick_json_sources_url(
             lockup.pointer("/thumbnail/sources").and_then(|v| v.as_array()),
+            216,
+        )
+    })
+    .or_else(|| {
+        pick_json_sources_url(
+            lockup
+                .pointer("/thumbnail/thumbnails")
+                .and_then(|v| v.as_array()),
             216,
         )
     })
@@ -4219,6 +4326,9 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
             }
         }
     }
+    if duration_text.eq_ignore_ascii_case("SHORTS") {
+        is_short = true;
+    }
     let duration_seconds = parse_mmss_to_seconds(&duration_text);
     let view_count_text = extract_yt_text(vr.get("shortViewCountText"))
         .or_else(|| extract_yt_text(vr.get("viewCountText")))
@@ -4231,12 +4341,28 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
         .or_else(|| extract_yt_text(vr.get("descriptionSnippet")))
         .unwrap_or_default();
 
-    let thumbnail_url = pick_json_sources_url(
-        vr.pointer("/thumbnail/thumbnails")
-            .and_then(|v| v.as_array()),
-        320,
-    )
-    .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+    let thumbnail_url = if is_short {
+        pick_json_sources_url(
+            vr.pointer("/navigationEndpoint/reelWatchEndpoint/thumbnail/thumbnails")
+                .and_then(|v| v.as_array()),
+            216,
+        )
+        .or_else(|| {
+            pick_json_sources_url(
+                vr.pointer("/thumbnail/thumbnails")
+                    .and_then(|v| v.as_array()),
+                216,
+            )
+        })
+        .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"))
+    } else {
+        pick_json_sources_url(
+            vr.pointer("/thumbnail/thumbnails")
+                .and_then(|v| v.as_array()),
+            320,
+        )
+        .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"))
+    };
 
     Some(VideoSummary {
         id: vid.to_string(),
@@ -5117,9 +5243,131 @@ fn parse_channel_playlists_browse_response(
     PagedPlaylists { items, next }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectSearchMode {
+    All,
+    ShortsOnly,
+    PlaylistsOnly,
+}
+
+fn push_proto_varint_field(out: &mut Vec<u8>, field_number: u64, val: u64) {
+    push_proto_varint(out, field_number << 3);
+    push_proto_varint(out, val);
+}
+
+fn encode_direct_search_params(
+    sort: SearchSortOrder,
+    date: UploadDateFilter,
+    duration: DurationFilter,
+    search_type: Option<u64>,
+) -> String {
+    let mut filters = Vec::with_capacity(8);
+    if let Some(d) = match date {
+        UploadDateFilter::AnyTime => None,
+        UploadDateFilter::Today => Some(2),
+        UploadDateFilter::ThisWeek => Some(3),
+        UploadDateFilter::ThisMonth => Some(4),
+        UploadDateFilter::ThisYear => Some(5),
+    } {
+        push_proto_varint_field(&mut filters, 1, d);
+    }
+    if let Some(st) = search_type {
+        push_proto_varint_field(&mut filters, 2, st);
+    }
+    if let Some(dur) = match duration {
+        DurationFilter::AnyLength => None,
+        DurationFilter::Under4Min => Some(1),
+        DurationFilter::FourTo20Min => Some(3),
+        DurationFilter::Over20Min => Some(2),
+    } {
+        push_proto_varint_field(&mut filters, 3, dur);
+    }
+
+    let mut outer = Vec::with_capacity(16);
+    if let Some(s) = match sort {
+        SearchSortOrder::Relevance => None,
+        SearchSortOrder::UploadDate => Some(2),
+        SearchSortOrder::ViewCount => Some(3),
+    } {
+        push_proto_varint_field(&mut outer, 1, s);
+    }
+    if !filters.is_empty() {
+        push_proto_bytes_field(&mut outer, 2, &filters);
+    }
+    // Disable sensitive-topic blocking so legitimate queries never return an empty promo screen
+    push_proto_varint_field(&mut outer, 30, 1);
+
+    encode_base64_url_safe_pct(&outer)
+}
+
+fn extract_search_header_shorts_chip(val: &Value) -> Option<(Option<String>, Option<String>)> {
+    let mut chip_arrays: Vec<&Vec<Value>> = Vec::new();
+    if let Some(arr) = val
+        .pointer("/header/searchHeaderRenderer/chipBar/chipCloudRenderer/chips")
+        .and_then(|v| v.as_array())
+    {
+        chip_arrays.push(arr);
+    }
+    if let Some(cmds) = val.get("onResponseReceivedCommands").and_then(|v| v.as_array()) {
+        for cmd in cmds {
+            if let Some(arr) = cmd
+                .pointer("/reloadContinuationItemsCommand/continuationItems")
+                .and_then(|v| v.as_array())
+            {
+                for item in arr {
+                    if let Some(chips) = item
+                        .pointer("/searchHeaderRenderer/chipBar/chipCloudRenderer/chips")
+                        .and_then(|v| v.as_array())
+                    {
+                        chip_arrays.push(chips);
+                    }
+                }
+            }
+        }
+    }
+
+    for chips in chip_arrays {
+        for entry in chips {
+            if let Some(chip) = entry.get("chipCloudChipRenderer") {
+                let label = extract_yt_text(chip.get("text")).unwrap_or_default();
+                if label.trim().eq_ignore_ascii_case("shorts") {
+                    let ctok = chip
+                        .pointer("/navigationEndpoint/continuationCommand/token")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let params = chip
+                        .pointer("/navigationEndpoint/searchEndpoint/params")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    if ctok.is_some() || params.is_some() {
+                        return Some((ctok, params));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn push_short_summary_if_unseen(
+    mut v: VideoSummary,
+    out_items: &mut Vec<SearchItem>,
+    seen_keys: &mut HashSet<String>,
+) {
+    v.is_short = true;
+    if v.duration_text.is_empty() {
+        v.duration_text = "SHORTS".to_string();
+    }
+    if seen_keys.insert(format!("vid:{}", v.id)) {
+        out_items.push(SearchItem::Video(v));
+    }
+}
+
 fn collect_search_entries_from_array(
     arr: &[Value],
-    playlists_only: bool,
+    mode: DirectSearchMode,
     out_items: &mut Vec<SearchItem>,
     seen_keys: &mut HashSet<String>,
     out_ctoken: &mut Option<String>,
@@ -5127,15 +5375,10 @@ fn collect_search_entries_from_array(
     for entry in arr {
         if let Some(sub) = entry
             .pointer("/itemSectionRenderer/contents")
+            .or_else(|| entry.pointer("/sectionListRenderer/contents"))
             .and_then(|v| v.as_array())
         {
-            collect_search_entries_from_array(
-                sub,
-                playlists_only,
-                out_items,
-                seen_keys,
-                out_ctoken,
-            );
+            collect_search_entries_from_array(sub, mode, out_items, seen_keys, out_ctoken);
             continue;
         }
         if let Some(cont) = entry.get("continuationItemRenderer") {
@@ -5149,16 +5392,61 @@ fn collect_search_entries_from_array(
             .pointer("/richItemRenderer/content")
             .unwrap_or(entry);
 
-        if let Some(lockup) = inner.get("lockupViewModel") {
-            if let Some(pl) = parse_playlist_lockup_json(lockup, "") {
-                if seen_keys.insert(format!("pl:{}", pl.id)) {
-                    out_items.push(SearchItem::Playlist(pl));
+        // Unpack Shorts shelves (reelShelfRenderer & gridShelfViewModel) and standalone Short items
+        if mode != DirectSearchMode::PlaylistsOnly {
+            if let Some(sl) = inner.get("shortsLockupViewModel") {
+                if let Some(v) = parse_short_lockup_item(sl, "", None) {
+                    push_short_summary_if_unseen(v, out_items, seen_keys);
                 }
                 continue;
             }
-            if !playlists_only {
-                if let Some(v) = parse_video_lockup_json(lockup) {
-                    if seen_keys.insert(format!("vid:{}", v.id)) {
+            if let Some(reel) = inner.get("reelItemRenderer") {
+                if let Some(v) = parse_reel_item(reel, "", None) {
+                    push_short_summary_if_unseen(v, out_items, seen_keys);
+                }
+                continue;
+            }
+            if let Some(reel_items) = inner
+                .pointer("/reelShelfRenderer/items")
+                .and_then(|v| v.as_array())
+            {
+                collect_search_entries_from_array(
+                    reel_items, mode, out_items, seen_keys, out_ctoken,
+                );
+                continue;
+            }
+            if let Some(grid_items) = inner
+                .pointer("/gridShelfViewModel/contents")
+                .and_then(|v| v.as_array())
+            {
+                collect_search_entries_from_array(
+                    grid_items, mode, out_items, seen_keys, out_ctoken,
+                );
+                continue;
+            }
+        }
+
+        if let Some(lockup) = inner.get("lockupViewModel") {
+            if mode != DirectSearchMode::ShortsOnly {
+                if let Some(pl) = parse_playlist_lockup_json(lockup, "") {
+                    if seen_keys.insert(format!("pl:{}", pl.id)) {
+                        out_items.push(SearchItem::Playlist(pl));
+                    }
+                    continue;
+                }
+            }
+            if mode != DirectSearchMode::PlaylistsOnly {
+                if let Some(mut v) = parse_video_lockup_json(lockup) {
+                    if mode == DirectSearchMode::ShortsOnly {
+                        let short_like = v.is_short
+                            || v.duration_seconds.map(|d| d > 0 && d <= 180).unwrap_or(false);
+                        if short_like {
+                            push_short_summary_if_unseen(v, out_items, seen_keys);
+                        }
+                    } else if seen_keys.insert(format!("vid:{}", v.id)) {
+                        if v.is_short && v.duration_text.is_empty() {
+                            v.duration_text = "SHORTS".to_string();
+                        }
                         out_items.push(SearchItem::Video(v));
                     }
                     continue;
@@ -5166,50 +5454,60 @@ fn collect_search_entries_from_array(
             }
         }
 
-        if let Some(pr) = inner
-            .get("playlistRenderer")
-            .or_else(|| inner.get("compactPlaylistRenderer"))
-        {
-            if let Some(pl) = parse_playlist_renderer_json(pr, "") {
-                if seen_keys.insert(format!("pl:{}", pl.id)) {
-                    out_items.push(SearchItem::Playlist(pl));
+        if mode != DirectSearchMode::ShortsOnly {
+            if let Some(pr) = inner
+                .get("playlistRenderer")
+                .or_else(|| inner.get("compactPlaylistRenderer"))
+            {
+                if let Some(pl) = parse_playlist_renderer_json(pr, "") {
+                    if seen_keys.insert(format!("pl:{}", pl.id)) {
+                        out_items.push(SearchItem::Playlist(pl));
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
-        if playlists_only {
+        if mode == DirectSearchMode::PlaylistsOnly {
             continue;
         }
 
         if let Some(vr) = inner.get("videoRenderer") {
-            if let Some(v) = parse_video_renderer_json(vr) {
-                if seen_keys.insert(format!("vid:{}", v.id)) {
+            if let Some(mut v) = parse_video_renderer_json(vr) {
+                if mode == DirectSearchMode::ShortsOnly {
+                    let short_like = v.is_short
+                        || v.duration_seconds.map(|d| d > 0 && d <= 180).unwrap_or(false);
+                    if short_like {
+                        push_short_summary_if_unseen(v, out_items, seen_keys);
+                    }
+                } else if seen_keys.insert(format!("vid:{}", v.id)) {
+                    if v.is_short && v.duration_text.is_empty() {
+                        v.duration_text = "SHORTS".to_string();
+                    }
                     out_items.push(SearchItem::Video(v));
                 }
             }
-        } else if let Some(cr) = inner.get("channelRenderer") {
-            if let Some(c) = parse_channel_renderer_json(cr) {
-                if seen_keys.insert(format!("ch:{}", c.id)) {
-                    out_items.push(SearchItem::Channel(c));
+        } else if mode == DirectSearchMode::All {
+            if let Some(cr) = inner.get("channelRenderer") {
+                if let Some(c) = parse_channel_renderer_json(cr) {
+                    if seen_keys.insert(format!("ch:{}", c.id)) {
+                        out_items.push(SearchItem::Channel(c));
+                    }
                 }
             }
-        } else if let Some(shelf_items) = inner
+        }
+
+        if let Some(shelf_items) = inner
             .pointer("/shelfRenderer/content/verticalListRenderer/items")
+            .or_else(|| inner.pointer("/shelfRenderer/content/horizontalListRenderer/items"))
             .and_then(|v| v.as_array())
         {
-            collect_search_entries_from_array(
-                shelf_items,
-                playlists_only,
-                out_items,
-                seen_keys,
-                out_ctoken,
-            );
+            collect_search_entries_from_array(shelf_items, mode, out_items, seen_keys, out_ctoken);
         }
     }
 }
 
-fn parse_direct_search_response(val: &Value, playlists_only: bool) -> PagedSearchItems {
+fn parse_direct_search_response(val: &Value, mode: DirectSearchMode) -> PagedSearchItems {
     let mut items = Vec::new();
     let mut seen = HashSet::new();
     let mut ctoken = None;
@@ -5218,13 +5516,7 @@ fn parse_direct_search_response(val: &Value, playlists_only: bool) -> PagedSearc
         .pointer("/contents/twoColumnSearchResultsRenderer/primaryContents/sectionListRenderer/contents")
         .and_then(|v| v.as_array())
     {
-        collect_search_entries_from_array(
-            sections,
-            playlists_only,
-            &mut items,
-            &mut seen,
-            &mut ctoken,
-        );
+        collect_search_entries_from_array(sections, mode, &mut items, &mut seen, &mut ctoken);
     }
 
     for key in ["onResponseReceivedCommands", "onResponseReceivedActions"] {
@@ -5235,12 +5527,25 @@ fn parse_direct_search_response(val: &Value, playlists_only: bool) -> PagedSearc
                     .and_then(|v| v.as_array())
                 {
                     collect_search_entries_from_array(
-                        arr,
-                        playlists_only,
-                        &mut items,
-                        &mut seen,
-                        &mut ctoken,
+                        arr, mode, &mut items, &mut seen, &mut ctoken,
                     );
+                }
+                if let Some(reload) = cmd.get("reloadContinuationItemsCommand") {
+                    let is_header = reload
+                        .get("slot")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("HEADER"))
+                        .unwrap_or(false);
+                    if !is_header {
+                        if let Some(arr) = reload
+                            .get("continuationItems")
+                            .and_then(|v| v.as_array())
+                        {
+                            collect_search_entries_from_array(
+                                arr, mode, &mut items, &mut seen, &mut ctoken,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -5976,5 +6281,211 @@ https://manifest.example/v1080_video.m3u8
             parsed.next.as_ref().map(|c| c.ctoken.as_str()),
             Some("PODCAST_PAGE_2")
         );
+    }
+
+    #[test]
+    fn test_shorts_search_params_and_parsing() {
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::Relevance,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                None
+            ),
+            "8AEB"
+        );
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::Relevance,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                Some(3)
+            ),
+            "EgIQA_ABAQ%3D%3D"
+        );
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::UploadDate,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                Some(3)
+            ),
+            "CAISAhAD8AEB"
+        );
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::ViewCount,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                Some(3)
+            ),
+            "CAMSAhAD8AEB"
+        );
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::Relevance,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                Some(9)
+            ),
+            "EgIQCfABAQ%3D%3D"
+        );
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::UploadDate,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                Some(9)
+            ),
+            "CAISAhAJ8AEB"
+        );
+        assert_eq!(
+            encode_direct_search_params(
+                SearchSortOrder::ViewCount,
+                UploadDateFilter::AnyTime,
+                DurationFilter::AnyLength,
+                Some(9)
+            ),
+            "CAMSAhAJ8AEB"
+        );
+
+        let search_payload = json!({
+            "header": {
+                "searchHeaderRenderer": {
+                    "chipBar": {
+                        "chipCloudRenderer": {
+                            "chips": [
+                                {
+                                    "chipCloudChipRenderer": {
+                                        "text": { "simpleText": "Shorts" },
+                                        "navigationEndpoint": {
+                                            "continuationCommand": { "token": "SHORTS_CHIP_CTOK" }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "contents": {
+                "twoColumnSearchResultsRenderer": {
+                    "primaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "itemSectionRenderer": {
+                                        "contents": [
+                                            {
+                                                "gridShelfViewModel": {
+                                                    "contents": [
+                                                        {
+                                                            "shortsLockupViewModel": {
+                                                                "entityId": "shorts-shelf-item-shortVid001",
+                                                                "overlayMetadata": {
+                                                                    "primaryText": { "content": "Rust GTK4 Tip #1" },
+                                                                    "secondaryText": { "content": "84K views" }
+                                                                },
+                                                                "thumbnailViewModel": {
+                                                                    "image": {
+                                                                        "sources": [
+                                                                            { "url": "https://i.ytimg.com/vi/shortVid001/oar2.jpg", "width": 405, "height": 720 }
+                                                                        ]
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                            {
+                                                "reelShelfRenderer": {
+                                                    "items": [
+                                                        {
+                                                            "reelItemRenderer": {
+                                                                "videoId": "shortVid002",
+                                                                "headline": { "simpleText": "Quick Linux Trick" },
+                                                                "viewCountText": { "simpleText": "120K views" },
+                                                                "thumbnail": {
+                                                                    "thumbnails": [
+                                                                        { "url": "https://i.ytimg.com/vi/shortVid002/hq720_2.jpg", "width": 405, "height": 720 }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                            {
+                                                "videoRenderer": {
+                                                    "videoId": "longVid9999",
+                                                    "title": { "runs": [{ "text": "Full 45 Minute Deep Dive" }] },
+                                                    "lengthText": { "simpleText": "45:00" },
+                                                    "ownerText": { "runs": [{ "text": "Rust Channel" }] }
+                                                }
+                                            },
+                                            {
+                                                "videoRenderer": {
+                                                    "videoId": "shortVid003",
+                                                    "title": { "runs": [{ "text": "Direct Short Renderer" }] },
+                                                    "lengthText": { "simpleText": "0:42" },
+                                                    "navigationEndpoint": {
+                                                        "reelWatchEndpoint": {
+                                                            "videoId": "shortVid003",
+                                                            "thumbnail": {
+                                                                "thumbnails": [
+                                                                    { "url": "https://i.ytimg.com/vi/shortVid003/oar2.jpg", "width": 405, "height": 720 }
+                                                                ]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "continuationItemRenderer": {
+                                        "continuationEndpoint": {
+                                            "continuationCommand": {
+                                                "token": "NEXT_SHORTS_PAGE"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_search_header_shorts_chip(&search_payload),
+            Some((Some("SHORTS_CHIP_CTOK".to_string()), None))
+        );
+
+        let all_res = parse_direct_search_response(&search_payload, DirectSearchMode::All);
+        assert_eq!(all_res.items.len(), 4);
+        assert_eq!(
+            all_res.next.as_ref().map(|c| c.ctoken.as_str()),
+            Some("NEXT_SHORTS_PAGE")
+        );
+
+        let shorts_only =
+            parse_direct_search_response(&search_payload, DirectSearchMode::ShortsOnly);
+        assert_eq!(shorts_only.items.len(), 3);
+        let ids: Vec<&str> = shorts_only
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                SearchItem::Video(v) => {
+                    assert!(v.is_short);
+                    Some(v.id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["shortVid001", "shortVid002", "shortVid003"]);
     }
 }

@@ -199,7 +199,18 @@ impl VideoCard {
         root_box.add_css_class("search-card");
         set_pointer(&root_box);
 
-        let (picture, overlay) = make_thumb_overlay(&summary.duration_text);
+        let badge_text = if summary.is_short {
+            if !summary.duration_text.is_empty()
+                && !summary.duration_text.eq_ignore_ascii_case("SHORTS")
+            {
+                format!("SHORTS · {}", summary.duration_text)
+            } else {
+                "SHORTS".to_string()
+            }
+        } else {
+            summary.duration_text.clone()
+        };
+        let (picture, overlay) = make_thumb_overlay(&badge_text);
         overlay.set_size_request(thumb_w, thumb_h);
         let thumb_clamped = clamp_fixed_size(&overlay, thumb_w, thumb_h);
 
@@ -604,6 +615,32 @@ impl VideoCard {
 
         root_box.append(&thumb_v_clamp);
         root_box.append(&title_label);
+
+        let channel_target = if !summary.channel_name.is_empty() && !summary.channel_id.is_empty() {
+            let ch_box = GtkBox::new(Orientation::Horizontal, 4);
+            ch_box.set_halign(Align::Start);
+            set_pointer(&ch_box);
+            let ch_label = Label::new(Some(&summary.channel_name));
+            ch_label.set_halign(Align::Start);
+            ch_label.set_xalign(0.0);
+            ch_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            ch_label.add_css_class("yr-meta");
+            ch_label.add_css_class("yr-channel-link");
+            ch_box.append(&ch_label);
+            root_box.append(&ch_box);
+            Some(ch_box)
+        } else if !summary.channel_name.is_empty() {
+            let ch_label = Label::new(Some(&summary.channel_name));
+            ch_label.set_halign(Align::Start);
+            ch_label.set_xalign(0.0);
+            ch_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            ch_label.add_css_class("yr-meta");
+            root_box.append(&ch_label);
+            None
+        } else {
+            None
+        };
+
         if !summary.view_count_text.is_empty() {
             root_box.append(&views_label);
         }
@@ -619,10 +656,55 @@ impl VideoCard {
             container,
             highlight_target: root_box.clone(),
             click_target: root_box,
-            channel_target: None,
+            channel_target,
             picture,
             avatar,
         }
+    }
+
+    pub fn new_short_skeleton() -> gtk4::FlowBoxChild {
+        let root_box = GtkBox::new(Orientation::Vertical, 8);
+        root_box.set_width_request(96);
+        root_box.set_hexpand(true);
+        root_box.set_valign(Align::Start);
+        root_box.add_css_class("yr-card");
+
+        let thumb_box = GtkBox::new(Orientation::Vertical, 0);
+        thumb_box.set_hexpand(true);
+        thumb_box.set_height_request(280);
+        thumb_box.add_css_class("yr-thumb");
+        thumb_box.add_css_class("yr-skeleton");
+
+        let thumb_v_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Vertical)
+            .maximum_size(280)
+            .tightening_threshold(280)
+            .hexpand(true)
+            .child(&thumb_box)
+            .build();
+
+        let line1 = GtkBox::new(Orientation::Vertical, 0);
+        line1.set_height_request(14);
+        line1.set_hexpand(true);
+        line1.add_css_class("yr-skeleton");
+        line1.add_css_class("yr-skeleton-line");
+
+        let line2 = GtkBox::new(Orientation::Vertical, 0);
+        line2.set_height_request(12);
+        line2.set_width_request(76);
+        line2.set_halign(Align::Start);
+        line2.add_css_class("yr-skeleton");
+        line2.add_css_class("yr-skeleton-line");
+
+        root_box.append(&thumb_v_clamp);
+        root_box.append(&line1);
+        root_box.append(&line2);
+
+        let container = gtk4::FlowBoxChild::new();
+        container.set_focusable(false);
+        container.set_hexpand(true);
+        container.set_child(Some(&root_box));
+        container
     }
 
     /// Unified mouse interaction model:

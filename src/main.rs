@@ -30,8 +30,45 @@ fn configure_low_memory_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn configure_low_memory_allocator() {}
 
+/// Silences a known benign GTK 4.18–4.20 Wayland frame-clock false-positive warning
+/// (`Duplicate call to gdk_frame_timings_presented() ...`) emitted when an external window
+/// such as MPV covers and uncovers the app surface (upstream GNOME/gtk MR !10242).
+fn configure_glib_log_filter() {
+    gtk4::glib::log_set_writer_func(|level, fields| {
+        if level == gtk4::glib::LogLevel::Warning {
+            let mut is_gdk = false;
+            let mut is_benign_frame_timing = false;
+            for f in fields {
+                match f.key() {
+                    "GLIB_DOMAIN" => {
+                        if f.value_str() == Some("Gdk") {
+                            is_gdk = true;
+                        }
+                    }
+                    "MESSAGE" => {
+                        if f.value_str()
+                            .map(|m| {
+                                m.starts_with("Duplicate call to gdk_frame_timings_presented()")
+                            })
+                            .unwrap_or(false)
+                        {
+                            is_benign_frame_timing = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if is_gdk && is_benign_frame_timing {
+                return gtk4::glib::LogWriterOutput::Handled;
+            }
+        }
+        gtk4::glib::log_writer_default(level, fields)
+    });
+}
+
 fn main() {
     configure_low_memory_allocator();
+    configure_glib_log_filter();
 
     let app = adw::Application::builder().application_id(APP_ID).build();
 

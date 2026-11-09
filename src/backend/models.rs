@@ -64,6 +64,7 @@ pub enum SearchTab {
     #[default]
     All,
     Videos,
+    Shorts,
     Channels,
     Playlists,
 }

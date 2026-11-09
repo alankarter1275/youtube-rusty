@@ -45,6 +45,7 @@ static PLAYLIST_SHUFFLE_SEED: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Grid,
+    ShortsGrid,
     SearchList,
 }
 
@@ -129,6 +130,7 @@ pub struct MainWindow {
     search_tabs_box: GtkBox,
     stab_all: Button,
     stab_videos: Button,
+    stab_shorts: Button,
     stab_channels: Button,
     stab_playlists: Button,
     playlist_header_box: GtkBox,
@@ -185,7 +187,7 @@ pub struct MainWindow {
     selected_box: RefCell<Option<GtkBox>>,
     selected_action_cb: RefCell<Option<Rc<dyn Fn()>>>,
     open_channels: RefCell<Vec<Rc<ChannelPage>>>,
-    home_pictures: RefCell<Vec<(String, String, glib::WeakRef<gtk4::Picture>)>>,
+    home_pictures: RefCell<Vec<(String, String, bool, glib::WeakRef<gtk4::Picture>)>>,
     home_avatars: RefCell<Vec<(String, String, glib::WeakRef<adw::Avatar>)>>,
     home_textures_suspended: Cell<bool>,
     last_home_cull_y: Cell<f64>,
@@ -443,11 +445,13 @@ impl MainWindow {
 
         let stab_all = create_chip("All", true);
         let stab_videos = create_chip("Videos", false);
+        let stab_shorts = create_chip("Shorts", false);
         let stab_channels = create_chip("Channels", false);
         let stab_playlists = create_chip("Playlists", false);
 
         search_tabs_box.append(&stab_all);
         search_tabs_box.append(&stab_videos);
+        search_tabs_box.append(&stab_shorts);
         search_tabs_box.append(&stab_channels);
         search_tabs_box.append(&stab_playlists);
 
@@ -705,6 +709,7 @@ impl MainWindow {
             search_tabs_box,
             stab_all,
             stab_videos,
+            stab_shorts,
             stab_channels,
             stab_playlists,
             playlist_header_box,
@@ -1005,7 +1010,10 @@ impl MainWindow {
         let this = self.clone();
         self.with_suppressed_nav_push(|| match av {
             ActiveView::Search(_) => {
-                if this.flow_box.is_visible() && !this.current_search_items.borrow().is_empty() {
+                if this.search_tab.get() != SearchTab::Shorts
+                    && this.flow_box.is_visible()
+                    && !this.current_search_items.borrow().is_empty()
+                {
                     let items = this.current_search_items.borrow().clone();
                     this.populate_search_items(items);
                 }
@@ -1070,6 +1078,7 @@ impl MainWindow {
         for (t, btn) in [
             (SearchTab::All, &self.stab_all),
             (SearchTab::Videos, &self.stab_videos),
+            (SearchTab::Shorts, &self.stab_shorts),
             (SearchTab::Channels, &self.stab_channels),
             (SearchTab::Playlists, &self.stab_playlists),
         ] {
@@ -1285,6 +1294,14 @@ impl MainWindow {
                 self.flow_box.set_min_children_per_line(cols);
                 self.flow_box.set_max_children_per_line(cols);
                 self.flow_box.set_column_spacing(20);
+                self.flow_box.set_row_spacing(24);
+            }
+            ViewMode::ShortsGrid => {
+                let scols = self.shorts_cols.get();
+                self.flow_box.set_homogeneous(true);
+                self.flow_box.set_min_children_per_line(scols);
+                self.flow_box.set_max_children_per_line(scols);
+                self.flow_box.set_column_spacing(14);
                 self.flow_box.set_row_spacing(24);
             }
             ViewMode::SearchList => {
@@ -2097,10 +2114,11 @@ impl MainWindow {
             }
         });
 
-        // Search result type tab pills (All / Videos / Channels / Playlists)
+        // Search result type tab pills (All / Videos / Shorts / Channels / Playlists)
         for (tab, btn) in [
             (SearchTab::All, &self.stab_all),
             (SearchTab::Videos, &self.stab_videos),
+            (SearchTab::Shorts, &self.stab_shorts),
             (SearchTab::Channels, &self.stab_channels),
             (SearchTab::Playlists, &self.stab_playlists),
         ] {
@@ -3507,11 +3525,29 @@ impl MainWindow {
         if url.is_empty() {
             return;
         }
-        self.home_pictures
-            .borrow_mut()
-            .push((key.to_string(), url.to_string(), picture.downgrade()));
+        self.home_pictures.borrow_mut().push((
+            key.to_string(),
+            url.to_string(),
+            false,
+            picture.downgrade(),
+        ));
         if !self.home_textures_suspended.get() {
             self.image_loader.load_into_picture(key, url, picture);
+        }
+    }
+
+    fn bind_home_short_picture(&self, key: &str, url: &str, picture: &gtk4::Picture) {
+        if url.is_empty() {
+            return;
+        }
+        self.home_pictures.borrow_mut().push((
+            key.to_string(),
+            url.to_string(),
+            true,
+            picture.downgrade(),
+        ));
+        if !self.home_textures_suspended.get() {
+            self.image_loader.load_into_short_picture(key, url, picture);
         }
     }
 
@@ -3544,7 +3580,7 @@ impl MainWindow {
         if self.home_textures_suspended.replace(true) {
             return;
         }
-        for (_, _, wref) in self.home_pictures.borrow().iter() {
+        for (_, _, _, wref) in self.home_pictures.borrow().iter() {
             if let Some(pic) = wref.upgrade() {
                 pic.set_paintable(gdk::Paintable::NONE);
             }
@@ -3566,16 +3602,16 @@ impl MainWindow {
         let can_cull = view_h > 0 && self.home_pictures.borrow().len() > 28;
         let max_y = view_h as f32 + 950.0;
 
-        let pics: Vec<(String, String, glib::WeakRef<gtk4::Picture>)> = self
+        let pics: Vec<(String, String, bool, glib::WeakRef<gtk4::Picture>)> = self
             .home_pictures
             .borrow()
             .iter()
-            .filter(|(_, _, w)| w.upgrade().is_some())
+            .filter(|(_, _, _, w)| w.upgrade().is_some())
             .cloned()
             .collect();
         *self.home_pictures.borrow_mut() = pics.clone();
 
-        for (key, url, wref) in &pics {
+        for (key, url, is_short_pic, wref) in &pics {
             if let Some(pic) = wref.upgrade() {
                 let should_load = if can_cull {
                     pic.compute_bounds(&self.content_scrolled)
@@ -3585,7 +3621,11 @@ impl MainWindow {
                     true
                 };
                 if should_load && pic.paintable().is_none() {
-                    self.image_loader.load_into_picture(key, url, &pic);
+                    if *is_short_pic {
+                        self.image_loader.load_into_short_picture(key, url, &pic);
+                    } else {
+                        self.image_loader.load_into_picture(key, url, &pic);
+                    }
                 }
             }
         }
@@ -3647,9 +3687,9 @@ impl MainWindow {
         let max_y: f32 = view_h as f32 + 950.0;
         let mut culled_any = false;
 
-        let pics: Vec<(String, String, glib::WeakRef<gtk4::Picture>)> =
+        let pics: Vec<(String, String, bool, glib::WeakRef<gtk4::Picture>)> =
             self.home_pictures.borrow().clone();
-        for (key, url, wref) in &pics {
+        for (key, url, is_short_pic, wref) in &pics {
             let Some(pic) = wref.upgrade() else {
                 continue;
             };
@@ -3659,7 +3699,11 @@ impl MainWindow {
             let in_band = bounds.y() + bounds.height() >= min_y && bounds.y() <= max_y;
             if in_band {
                 if pic.paintable().is_none() {
-                    self.image_loader.load_into_picture(key, url, &pic);
+                    if *is_short_pic {
+                        self.image_loader.load_into_short_picture(key, url, &pic);
+                    } else {
+                        self.image_loader.load_into_picture(key, url, &pic);
+                    }
                 }
             } else if pic.paintable().is_some() {
                 pic.set_paintable(gdk::Paintable::NONE);
@@ -3963,7 +4007,11 @@ impl MainWindow {
                 Ok(ResolvedUrl::Video(summary)) => {
                     w.clear_search_bar_quietly();
                     let def_q = Quality::from_setting(&w.settings_store.load().default_quality);
-                    w.play_video(summary, def_q);
+                    if summary.is_short {
+                        w.play_shorts_queue(vec![summary], 0, Some(def_q), None);
+                    } else {
+                        w.play_video(summary, def_q);
+                    }
                 }
                 Ok(ResolvedUrl::Channel { id, name }) => {
                     w.clear_search_bar_quietly();
@@ -3985,16 +4033,25 @@ impl MainWindow {
         self.set_active_nav(None);
         let tab = self.search_tab.get();
         self.highlight_search_tab(tab);
+        let search_view_mode = if tab == SearchTab::Shorts {
+            ViewMode::ShortsGrid
+        } else {
+            ViewMode::SearchList
+        };
 
         self.prepare_view_shell(
             ActiveView::Search(query.to_string()),
-            ViewMode::SearchList,
+            search_view_mode,
             false,
             false,
             false,
             Some(&format!("Results for “{query}”")),
         );
-        self.show_skeletons_search(6);
+        if tab == SearchTab::Shorts {
+            self.show_skeletons_shorts(12);
+        } else {
+            self.show_skeletons_search(6);
+        }
 
         let (sender, receiver) = async_channel::bounded::<Result<PagedSearchItems, String>>(1);
         let engine = self.engine.clone();
@@ -4080,7 +4137,12 @@ impl MainWindow {
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
         self.clear_home_flow_box();
-        self.view_mode.set(ViewMode::SearchList);
+        let mode = if self.search_tab.get() == SearchTab::Shorts {
+            ViewMode::ShortsGrid
+        } else {
+            ViewMode::SearchList
+        };
+        self.view_mode.set(mode);
         self.update_flow_columns();
         *self.current_search_items.borrow_mut() = Vec::new();
         *self.current_videos.borrow_mut() = Vec::new();
@@ -4088,13 +4150,52 @@ impl MainWindow {
     }
 
     fn append_search_items(self: &Rc<Self>, items: Vec<SearchItem>) {
-        let actions = self.make_card_actions();
+        let mut actions = self.make_card_actions();
+        let weak_play = Rc::downgrade(self);
+        actions.on_play = Rc::new(move |sum, q| {
+            let Some(w) = weak_play.upgrade() else {
+                return;
+            };
+            let is_shorts_tab = w.search_tab.get() == SearchTab::Shorts;
+            if sum.is_short || is_shorts_tab {
+                let mut shorts: Vec<VideoSummary> = w
+                    .current_search_items
+                    .borrow()
+                    .iter()
+                    .filter_map(|it| match it {
+                        SearchItem::Video(v) if v.is_short || is_shorts_tab => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let idx = shorts
+                    .iter()
+                    .position(|v| v.id == sum.id)
+                    .unwrap_or_else(|| {
+                        shorts.insert(0, sum);
+                        0
+                    });
+                let cont = if is_shorts_tab {
+                    w.feed_cursor.borrow().clone().map(|c| (c, None))
+                } else {
+                    None
+                };
+                w.play_shorts_queue(shorts, idx, Some(q), cont);
+            } else {
+                w.play_video(sum, q);
+            }
+        });
+
+        let mode = if self.search_tab.get() == SearchTab::Shorts {
+            ViewMode::ShortsGrid
+        } else {
+            ViewMode::SearchList
+        };
         let layout = self.list_card_layout();
 
         for item in items {
             match &item {
                 SearchItem::Video(summary) => {
-                    self.append_single_video_card(summary, ViewMode::SearchList, layout, &actions);
+                    self.append_single_video_card(summary, mode, layout, &actions);
                     self.current_videos.borrow_mut().push(summary.clone());
                 }
                 SearchItem::Channel(ch) => {
@@ -5270,6 +5371,20 @@ impl MainWindow {
         }
     }
 
+    fn show_skeletons_shorts(self: &Rc<Self>, count: usize) {
+        self.clear_card_selection();
+        self.status_box.set_visible(false);
+        self.flow_box.set_visible(true);
+        self.current_videos.borrow_mut().clear();
+        self.current_search_items.borrow_mut().clear();
+        self.clear_home_flow_box();
+        self.view_mode.set(ViewMode::ShortsGrid);
+        self.update_flow_columns();
+        for _ in 0..count {
+            self.flow_box.append(&VideoCard::new_short_skeleton());
+        }
+    }
+
     fn show_status_state(
         &self,
         icon_name: &str,
@@ -5333,6 +5448,7 @@ impl MainWindow {
     ) {
         let card = match mode {
             ViewMode::Grid => VideoCard::new_grid(summary),
+            ViewMode::ShortsGrid => VideoCard::new_short(summary),
             ViewMode::SearchList => VideoCard::new_search(summary, layout),
         };
 
@@ -5376,13 +5492,17 @@ impl MainWindow {
             });
         }
 
-        self.bind_home_picture(&summary.id, &summary.thumbnail_url, &card.picture);
-        if !summary.channel_avatar_url.is_empty() {
-            self.bind_home_avatar(
-                &summary.channel_id,
-                &summary.channel_avatar_url,
-                &card.avatar,
-            );
+        if mode == ViewMode::ShortsGrid {
+            self.bind_home_short_picture(&summary.id, &summary.thumbnail_url, &card.picture);
+        } else {
+            self.bind_home_picture(&summary.id, &summary.thumbnail_url, &card.picture);
+            if !summary.channel_avatar_url.is_empty() {
+                self.bind_home_avatar(
+                    &summary.channel_id,
+                    &summary.channel_avatar_url,
+                    &card.avatar,
+                );
+            }
         }
 
         self.flow_box.append(&card.container);
