@@ -998,26 +998,28 @@ impl MainWindow {
 
     fn refresh_responsive_list_cards(self: &Rc<Self>) {
         let av = self.active_view.borrow().clone();
-        match av {
+        let this = self.clone();
+        self.with_suppressed_nav_push(|| match av {
             ActiveView::Search(_) => {
-                if self.flow_box.is_visible() && !self.current_search_items.borrow().is_empty() {
-                    let items = self.current_search_items.borrow().clone();
-                    self.populate_search_items(items);
+                if this.flow_box.is_visible() && !this.current_search_items.borrow().is_empty() {
+                    let items = this.current_search_items.borrow().clone();
+                    this.populate_search_items(items);
                 }
             }
             ActiveView::History => {
-                self.load_history();
+                this.load_history();
             }
             ActiveView::SavedPlaylistDetail(pid) => {
-                self.open_saved_playlist(&pid);
+                this.open_saved_playlist(&pid);
             }
             ActiveView::RemotePlaylist(_) => {
-                if let Some(pl) = self.remote_playlist_data.borrow().clone() {
-                    self.render_remote_playlist_view(&pl);
+                let pl_opt = this.remote_playlist_data.borrow().clone();
+                if let Some(pl) = pl_opt {
+                    this.render_remote_playlist_view(&pl);
                 }
             }
             _ => {}
-        }
+        });
     }
 
     fn notify_channels_layout(&self, narrow: bool, compact: bool, grid_cols: u32, shorts_cols: u32) {
@@ -1175,7 +1177,8 @@ impl MainWindow {
             let single_channel = self.open_channels.borrow().len() <= 1;
             self.nav_view.pop();
             if single_channel && self.channel_over_transient_home.replace(false) {
-                if let Some(entry) = self.nav_history.borrow_mut().pop() {
+                let entry_opt = self.nav_history.borrow_mut().pop();
+                if let Some(entry) = entry_opt {
                     self.restore_nav_entry(entry);
                 }
             }
@@ -1184,7 +1187,8 @@ impl MainWindow {
             return;
         }
 
-        if let Some(entry) = self.nav_history.borrow_mut().pop() {
+        let entry_opt = self.nav_history.borrow_mut().pop();
+        if let Some(entry) = entry_opt {
             self.restore_nav_entry(entry);
         }
         self.update_back_button_visibility();
@@ -3099,7 +3103,8 @@ impl MainWindow {
         let base = self.mpv_base_index.get();
         let pushed_end = self.mpv_pushed_end.get();
         if pushed_end > base && target_idx >= base && target_idx < pushed_end {
-            if let Some(session) = self.mpv_session.borrow().as_ref() {
+            let session_opt = self.mpv_session.borrow().clone();
+            if let Some(session) = session_opt {
                 if session.is_alive() {
                     let mpv_slot = target_idx - base;
                     self.mpv_pos.set(0.0);
