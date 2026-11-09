@@ -374,8 +374,10 @@ impl ChannelPage {
             }
         });
 
-        // Enter key plays currently selected card
+        // Enter key plays currently selected card (Capture phase so focused toolbar buttons
+        // like "Play all" or tab chips cannot consume Enter when a card is highlighted)
         let key_ctrl = EventControllerKey::new();
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let weak_key = Rc::downgrade(self);
         key_ctrl.connect_key_pressed(move |_, key, _, _| {
             if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
@@ -384,8 +386,12 @@ impl ChannelPage {
                 };
                 if let Some(win) = cp.parent_window.upgrade() {
                     if let Some(root) = win.root() {
-                        if root.focus().map(|f| f.is::<Editable>()).unwrap_or(false) {
-                            return glib::Propagation::Proceed;
+                        if let Some(focused) = root.focus() {
+                            if focused.is::<Editable>()
+                                || focused.ancestor(Editable::static_type()).is_some()
+                            {
+                                return glib::Propagation::Proceed;
+                            }
                         }
                     }
                 }

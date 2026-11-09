@@ -15,9 +15,11 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const YR_BRIDGE_LUA: &str = r#"local utils = require 'mp.utils'
 
+local core_ready = false
 local req_counter = 0
 local active_req_id = nil
 local pending_hooks = {}
+local title_by_url = {}
 
 local function read_and_remove_json(path)
     if not path or path == '' then return nil end
@@ -37,8 +39,20 @@ local function is_youtube_url(path)
         or path:find('youtube%.com/shorts/') ~= nil
 end
 
+local function mark_ready()
+    if not core_ready then
+        core_ready = true
+        mp.commandv('script-message', 'yr-bridge-ready')
+    end
+end
+
+mp.register_event('idle', mark_ready)
+mp.add_timeout(0.35, mark_ready)
+
 mp.register_script_message('ping', function()
-    mp.commandv('script-message', 'yr-bridge-ready')
+    if core_ready then
+        mp.commandv('script-message', 'yr-bridge-ready')
+    end
 end)
 
 mp.register_script_message('load-queue', function(json_path)
@@ -49,26 +63,26 @@ mp.register_script_message('load-queue', function(json_path)
     if start_idx < 0 then start_idx = 0 end
     if start_idx >= #items then start_idx = #items - 1 end
 
+    title_by_url = {}
+    for i = 1, #items do
+        local it = items[i]
+        if it.url and it.title and it.title ~= '' then
+            title_by_url[it.url] = it.title
+        end
+    end
+
     mp.set_property('force-window', payload.audio_only and 'no' or 'yes')
     mp.set_property_bool('pause', false)
 
-    local start_item = items[start_idx + 1]
-    mp.commandv('loadfile', start_item.url, 'replace')
-
-    for k = 0, start_idx - 1 do
-        mp.commandv('loadfile', items[k + 1].url, 'append')
-        mp.commandv('playlist-move', tostring(k + 1), tostring(k))
+    if payload.m3u_path and payload.m3u_path ~= '' then
+        mp.set_property('playlist-start', tostring(start_idx))
+        mp.commandv('loadlist', payload.m3u_path, 'replace')
+        os.remove(payload.m3u_path)
     end
 
-    for k = start_idx + 1, #items - 1 do
-        mp.commandv('loadfile', items[k + 1].url, 'append')
-    end
-
-    for i = 0, #items - 1 do
-        local t = items[i + 1].title
-        if t and t ~= '' then
-            mp.set_property('playlist/' .. tostring(i) .. '/title', t)
-        end
+    local cur_pos = mp.get_property_number('playlist-pos', -1)
+    if cur_pos ~= start_idx then
+        mp.set_property_number('playlist-pos', start_idx)
     end
 
     if payload.sync_gen then
@@ -80,14 +94,18 @@ mp.register_script_message('append-queue', function(json_path)
     local payload = read_and_remove_json(json_path)
     if not payload or not payload.items or #payload.items == 0 then return end
     local items = payload.items
-    local base_idx = mp.get_property_number('playlist-count', 0)
 
     for i = 1, #items do
         local it = items[i]
-        mp.commandv('loadfile', it.url, 'append')
-        if it.title and it.title ~= '' then
-            mp.set_property('playlist/' .. tostring(base_idx + i - 1) .. '/title', it.title)
+        if it.url and it.title and it.title ~= '' then
+            title_by_url[it.url] = it.title
         end
+    end
+
+    if payload.m3u_path and payload.m3u_path ~= '' then
+        mp.set_property('playlist-start', 'auto')
+        mp.commandv('loadlist', payload.m3u_path, 'append')
+        os.remove(payload.m3u_path)
     end
 end)
 
@@ -95,26 +113,33 @@ mp.register_script_message('sync-queue', function(json_path)
     local payload = read_and_remove_json(json_path)
     if not payload or not payload.items or #payload.items == 0 then return end
     local items = payload.items
-    local cur_idx = tonumber(payload.current_index) or 0
-    if cur_idx < 0 then cur_idx = 0 end
-    if cur_idx >= #items then cur_idx = #items - 1 end
 
+    title_by_url = {}
+    for i = 1, #items do
+        local it = items[i]
+        if it.url and it.title and it.title ~= '' then
+            title_by_url[it.url] = it.title
+        end
+    end
+
+    mp.set_property('playlist-start', 'auto')
     mp.command('playlist-clear')
 
-    for k = 0, cur_idx - 1 do
-        mp.commandv('loadfile', items[k + 1].url, 'append')
-        mp.commandv('playlist-move', tostring(k + 1), tostring(k))
-    end
-
-    for k = cur_idx + 1, #items - 1 do
-        mp.commandv('loadfile', items[k + 1].url, 'append')
-    end
-
-    for i = 0, #items - 1 do
-        local t = items[i + 1].title
-        if t and t ~= '' then
-            mp.set_property('playlist/' .. tostring(i) .. '/title', t)
+    if payload.before_m3u_path and payload.before_m3u_path ~= '' then
+        local ok = mp.commandv('loadlist', payload.before_m3u_path, 'insert-at', '0')
+        if not ok then
+            local before_cnt = tonumber(payload.before_count) or 0
+            mp.commandv('loadlist', payload.before_m3u_path, 'append')
+            if before_cnt > 0 then
+                mp.commandv('playlist-move', '0', tostring(before_cnt + 1))
+            end
         end
+        os.remove(payload.before_m3u_path)
+    end
+
+    if payload.after_m3u_path and payload.after_m3u_path ~= '' then
+        mp.commandv('loadlist', payload.after_m3u_path, 'append')
+        os.remove(payload.after_m3u_path)
     end
 
     if payload.sync_gen then
@@ -134,8 +159,14 @@ mp.register_script_message('resolved', function(req_id, json_path)
                 local pl_title = cur_pos >= 0
                     and mp.get_property('playlist/' .. tostring(cur_pos) .. '/title')
                     or nil
-                local media_title = (pl_title and pl_title ~= '') and pl_title or data.title
+                local cur_path = mp.get_property('path', '')
+                local media_title = (pl_title and pl_title ~= '') and pl_title
+                    or (cur_path ~= '' and title_by_url[cur_path])
+                    or data.title
                 if media_title and media_title ~= '' then
+                    if cur_path ~= '' and not title_by_url[cur_path] then
+                        title_by_url[cur_path] = media_title
+                    end
                     mp.set_property('file-local-options/force-media-title', media_title)
                 end
                 if data.user_agent and data.user_agent ~= '' then
@@ -164,8 +195,18 @@ mp.register_script_message('resolved', function(req_id, json_path)
 end)
 
 mp.add_hook('on_load', 10, function(hook)
+    mp.set_property('playlist-start', 'auto')
     local path = mp.get_property('stream-open-filename', '')
     if not is_youtube_url(path) then return end
+
+    local cur_pos = mp.get_property_number('playlist-pos', -1)
+    local pl_title = cur_pos >= 0
+        and mp.get_property('playlist/' .. tostring(cur_pos) .. '/title')
+        or nil
+    local known_title = (pl_title and pl_title ~= '') and pl_title or title_by_url[path]
+    if known_title and known_title ~= '' then
+        mp.set_property('file-local-options/force-media-title', known_title)
+    end
 
     local ytdl_fmt = mp.get_property('file-local-options/ytdl-format', '')
     req_counter = req_counter + 1
@@ -179,8 +220,6 @@ end)
 mp.add_hook('on_after_end_file', 50, function()
     mp.del_property('user-data/mpv/ytdl/json-subprocess-result')
 end)
-
-mp.commandv('script-message', 'yr-bridge-ready')
 "#;
 
 #[derive(Debug, Clone)]
@@ -244,6 +283,58 @@ fn extract_youtube_id(url: &str) -> Option<String> {
     None
 }
 
+fn sanitize_m3u_title(raw: &str, fallback_id: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len());
+    let mut prev_space = false;
+    for ch in raw.chars() {
+        let mapped = if ch.is_control() { ' ' } else { ch };
+        if mapped == ' ' {
+            if !prev_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+            }
+            prev_space = true;
+        } else {
+            cleaned.push(mapped);
+            prev_space = false;
+        }
+    }
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        if fallback_id.trim().is_empty() {
+            "YouTube Video".to_string()
+        } else {
+            format!("YouTube ({})", fallback_id.trim())
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn build_m3u8_playlist(items: &[MpvQueueItem]) -> String {
+    let mut out = String::with_capacity(16 + items.len() * 96);
+    out.push_str("#EXTM3U\n");
+    for it in items {
+        let clean_title = sanitize_m3u_title(&it.title, &it.video_id);
+        let url = youtube_watch_url(&it.video_id);
+        out.push_str("#EXTINF:-1,");
+        out.push_str(&clean_title);
+        out.push('\n');
+        out.push_str(&url);
+        out.push('\n');
+    }
+    out
+}
+
+fn write_m3u8_file(ipc_dir: &Path, filename: &str, items: &[MpvQueueItem]) -> Option<PathBuf> {
+    if items.is_empty() {
+        return None;
+    }
+    let path = ipc_dir.join(filename);
+    let content = build_m3u8_playlist(items);
+    std::fs::write(&path, content.as_bytes()).ok()?;
+    Some(path)
+}
+
 fn write_payload_json(ipc_dir: &Path, filename: &str, value: &serde_json::Value) -> Option<PathBuf> {
     let path = ipc_dir.join(filename);
     let bytes = serde_json::to_vec(value).ok()?;
@@ -255,7 +346,8 @@ impl MpvSession {
     /// Spawns a persistent `mpv` IPC process (`--ytdl=no`, zero Python / `yt-dlp`) paired with
     /// our lightweight `yr_bridge.lua` hook script so:
     /// 1. Every playlist entry keeps `https://www.youtube.com/watch?v=<id>` (enabling SponsorBlock
-    ///    & `quality-menu.lua`) while displaying its real human title via `M_PROPERTY_SET`.
+    ///    & `quality-menu.lua`) while populating real human titles natively via `#EXTM3U` /
+    ///    `#EXTINF` `loadlist` AND `file-local-options/force-media-title` across all MPV versions.
     /// 2. Streams are resolved on-demand in pure Rust during MPV's `on_load` hook.
     pub fn spawn(
         runtime: &Runtime,
@@ -420,7 +512,7 @@ impl MpvSession {
                 let ping_cmd =
                     json!({"command": ["script-message-to", "yr_bridge", "ping"]}).to_string();
                 let mut wait_ticks = 0u32;
-                while !ready_for_write.load(Ordering::SeqCst) && wait_ticks < 80 {
+                while !ready_for_write.load(Ordering::SeqCst) && wait_ticks < 160 {
                     if !running_write.load(Ordering::SeqCst) {
                         return;
                     }
@@ -575,8 +667,14 @@ impl MpvSession {
                                                         .send(MpvEvent::Duration(d as f64))
                                                         .await;
                                                 }
+                                                let clean_title = if resolved.title.trim().is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    sanitize_m3u_title(&resolved.title, &vid_id)
+                                                };
                                                 let resp_val = json!({
                                                     "ok": true,
+                                                    "title": clean_title,
                                                     "load_url": resolved.to_loadfile_url(),
                                                     "user_agent": resolved.user_agent,
                                                     "referer": resolved.referer,
@@ -738,14 +836,25 @@ impl MpvSession {
         let _ = self.cmd_sender.send(value.to_string());
     }
 
-    fn next_payload_filename(&self, prefix: &str) -> String {
-        let n = self.payload_seq.fetch_add(1, Ordering::Relaxed);
-        format!("{prefix}-{n}.json")
+    fn next_payload_seq(&self) -> u64 {
+        self.payload_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Replaces MPV's playlist with the full `items` list (`0 .. items.len() - 1`),
-    /// preserving all items before `start_index` via `playlist-move`, setting human titles
-    /// on every playlist entry, and starting playback immediately at `start_index`.
+    fn build_title_entries(items: &[MpvQueueItem]) -> Vec<serde_json::Value> {
+        items
+            .iter()
+            .map(|it| {
+                json!({
+                    "url": youtube_watch_url(&it.video_id),
+                    "title": sanitize_m3u_title(&it.title, &it.video_id),
+                })
+            })
+            .collect()
+    }
+
+    /// Replaces MPV's playlist atomically via `#EXTM3U` / `#EXTINF` `loadlist` (`0 .. items.len() - 1`),
+    /// setting human titles on every playlist entry across all MPV versions and starting playback
+    /// directly at `start_index` via `playlist-start`.
     pub fn load_queue(
         &self,
         items: &[MpvQueueItem],
@@ -756,23 +865,20 @@ impl MpvSession {
         if items.is_empty() {
             return;
         }
-        let entries: Vec<serde_json::Value> = items
-            .iter()
-            .map(|it| {
-                json!({
-                    "url": youtube_watch_url(&it.video_id),
-                    "title": it.title,
-                })
-            })
-            .collect();
+        let n = self.next_payload_seq();
+        let Some(m3u_path) = write_m3u8_file(&self.ipc_dir, &format!("load-queue-{n}.m3u8"), items)
+        else {
+            return;
+        };
+        let entries = Self::build_title_entries(items);
         let payload = json!({
             "items": entries,
+            "m3u_path": m3u_path.to_string_lossy(),
             "start_index": start_index.min(items.len() - 1),
             "audio_only": audio_only,
             "sync_gen": sync_gen,
         });
-        let fname = self.next_payload_filename("load-queue");
-        if let Some(path) = write_payload_json(&self.ipc_dir, &fname, &payload) {
+        if let Some(path) = write_payload_json(&self.ipc_dir, &format!("load-queue-{n}.json"), &payload) {
             self.send_json(json!({
                 "command": [
                     "script-message-to",
@@ -781,27 +887,31 @@ impl MpvSession {
                     path.to_string_lossy()
                 ]
             }));
+        } else {
+            let _ = std::fs::remove_file(&m3u_path);
         }
     }
 
     /// Appends newly loaded items (e.g. background Shorts/playlist continuations or "Add to queue")
-    /// to MPV's playlist with real human titles without disturbing active playback.
+    /// to MPV's playlist with real `#EXTINF` human titles without disturbing active playback.
     pub fn append_queue(&self, items: &[MpvQueueItem]) {
         if items.is_empty() {
             return;
         }
-        let entries: Vec<serde_json::Value> = items
-            .iter()
-            .map(|it| {
-                json!({
-                    "url": youtube_watch_url(&it.video_id),
-                    "title": it.title,
-                })
-            })
-            .collect();
-        let payload = json!({ "items": entries });
-        let fname = self.next_payload_filename("append-queue");
-        if let Some(path) = write_payload_json(&self.ipc_dir, &fname, &payload) {
+        let n = self.next_payload_seq();
+        let Some(m3u_path) =
+            write_m3u8_file(&self.ipc_dir, &format!("append-queue-{n}.m3u8"), items)
+        else {
+            return;
+        };
+        let entries = Self::build_title_entries(items);
+        let payload = json!({
+            "items": entries,
+            "m3u_path": m3u_path.to_string_lossy(),
+        });
+        if let Some(path) =
+            write_payload_json(&self.ipc_dir, &format!("append-queue-{n}.json"), &payload)
+        {
             self.send_json(json!({
                 "command": [
                     "script-message-to",
@@ -810,31 +920,38 @@ impl MpvSession {
                     path.to_string_lossy()
                 ]
             }));
+        } else {
+            let _ = std::fs::remove_file(&m3u_path);
         }
     }
 
     /// Re-synchronizes MPV's playlist around the currently playing item (after reorder, shuffle,
-    /// or removal in `PlayerCard`) without interrupting playback.
+    /// or removal in `PlayerCard`) with real `#EXTINF` human titles without interrupting playback.
     pub fn sync_queue(&self, items: &[MpvQueueItem], current_index: usize, sync_gen: u64) {
         if items.is_empty() {
             return;
         }
-        let entries: Vec<serde_json::Value> = items
-            .iter()
-            .map(|it| {
-                json!({
-                    "url": youtube_watch_url(&it.video_id),
-                    "title": it.title,
-                })
-            })
-            .collect();
+        let cur_idx = current_index.min(items.len() - 1);
+        let n = self.next_payload_seq();
+        let before_slice = &items[..cur_idx];
+        let after_slice = &items[cur_idx + 1..];
+
+        let before_m3u =
+            write_m3u8_file(&self.ipc_dir, &format!("sync-before-{n}.m3u8"), before_slice);
+        let after_m3u =
+            write_m3u8_file(&self.ipc_dir, &format!("sync-after-{n}.m3u8"), after_slice);
+
+        let entries = Self::build_title_entries(items);
         let payload = json!({
             "items": entries,
-            "current_index": current_index.min(items.len() - 1),
+            "before_m3u_path": before_m3u.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "before_count": before_slice.len(),
+            "after_m3u_path": after_m3u.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "sync_gen": sync_gen,
         });
-        let fname = self.next_payload_filename("sync-queue");
-        if let Some(path) = write_payload_json(&self.ipc_dir, &fname, &payload) {
+        if let Some(path) =
+            write_payload_json(&self.ipc_dir, &format!("sync-queue-{n}.json"), &payload)
+        {
             self.send_json(json!({
                 "command": [
                     "script-message-to",
@@ -843,6 +960,13 @@ impl MpvSession {
                     path.to_string_lossy()
                 ]
             }));
+        } else {
+            if let Some(p) = before_m3u {
+                let _ = std::fs::remove_file(p);
+            }
+            if let Some(p) = after_m3u {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
 
@@ -867,6 +991,7 @@ impl MpvSession {
     /// Stops playback, clears MPV's playlist, and hides the MPV window (`force-window=no`)
     /// while keeping the warm `mpv` process alive in the background for instant next playback.
     pub fn stop(&self) {
+        self.send_json(json!({ "command": ["set_property", "playlist-start", "auto"] }));
         self.send_json(json!({ "command": ["set_property", "force-window", "no"] }));
         self.send_json(json!({ "command": ["stop"] }));
         self.send_json(json!({ "command": ["playlist-clear"] }));
@@ -916,5 +1041,40 @@ mod tests {
             Some("shortId_123")
         );
         assert!(extract_youtube_id("/home/user/Videos/movie.mkv").is_none());
+    }
+
+    #[test]
+    fn test_m3u8_playlist_titles_and_sanitization() {
+        assert_eq!(
+            sanitize_m3u_title("Rust, GTK4, and MPV!\r\nPart 2\t🔥", "vid1"),
+            "Rust, GTK4, and MPV! Part 2 🔥"
+        );
+        assert_eq!(sanitize_m3u_title("   \n\t  ", "abc123"), "YouTube (abc123)");
+
+        let queue = vec![
+            MpvQueueItem {
+                video_id: "short_01".to_string(),
+                title: "First Short, With Comma!".to_string(),
+            },
+            MpvQueueItem {
+                video_id: "short_02".to_string(),
+                title: "Second\nShort\r\nTitle".to_string(),
+            },
+            MpvQueueItem {
+                video_id: "short_03".to_string(),
+                title: String::new(),
+            },
+        ];
+        let m3u = build_m3u8_playlist(&queue);
+        let expected = concat!(
+            "#EXTM3U\n",
+            "#EXTINF:-1,First Short, With Comma!\n",
+            "https://www.youtube.com/watch?v=short_01\n",
+            "#EXTINF:-1,Second Short Title\n",
+            "https://www.youtube.com/watch?v=short_02\n",
+            "#EXTINF:-1,YouTube (short_03)\n",
+            "https://www.youtube.com/watch?v=short_03\n",
+        );
+        assert_eq!(m3u, expected);
     }
 }

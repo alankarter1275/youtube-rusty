@@ -648,6 +648,7 @@ impl Engine {
                 referer: pool.referer.clone(),
                 is_audio_only: quality == Quality::AudioOnly,
                 duration_secs: pool.duration_secs,
+                title: pool.title.clone().unwrap_or_default(),
                 ytdl_json: None,
             });
         }
@@ -659,6 +660,7 @@ impl Engine {
             referer: pool.referer.clone(),
             is_audio_only: quality == Quality::AudioOnly,
             duration_secs: pool.duration_secs,
+            title: pool.title.clone().unwrap_or_default(),
             ytdl_json: None,
         })
     }
@@ -3296,7 +3298,9 @@ fn resolve_from_verified_entry(
         requested_json.push(a.to_ytdl_format_json());
     }
 
+    let resolved_title = pool.title.clone().unwrap_or_default();
     let ytdl_json = serde_json::to_string(&json!({
+        "title": resolved_title,
         "formats": formats_json,
         "requested_formats": requested_json,
     }))
@@ -3309,6 +3313,7 @@ fn resolve_from_verified_entry(
         referer: pool.referer.clone(),
         is_audio_only,
         duration_secs: pool.duration_secs,
+        title: resolved_title,
         ytdl_json,
     })
 }
@@ -5437,7 +5442,7 @@ mod tests {
             user_agent: "TestUA".to_string(),
             referer: String::new(),
             duration_secs: Some(180),
-            title: None,
+            title: Some("Rust & GTK4 Demo".to_string()),
             channel_id: String::new(),
             channel_name: String::new(),
             thumbnail_url: String::new(),
@@ -5448,9 +5453,11 @@ mod tests {
         let p360 = select_direct_playback(&pool, Quality::P360).unwrap();
         assert_eq!(p360.primary_url, "https://cdn.example/360_muxed.mp4");
         assert!(p360.audio_url.is_none());
+        assert_eq!(p360.title, "Rust & GTK4 Demo");
 
         // Verify quality-menu.lua JSON catalog & Kbps units
         let ytdl: Value = serde_json::from_str(p360.ytdl_json.as_deref().unwrap()).unwrap();
+        assert_eq!(ytdl["title"], "Rust & GTK4 Demo");
         let fmts = ytdl["formats"].as_array().unwrap();
         // 2 audio + 3 deduplicated video heights (2160, 720, 360)
         assert_eq!(fmts.len(), 5);

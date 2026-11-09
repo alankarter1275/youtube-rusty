@@ -53,6 +53,7 @@ pub struct ResolvedPlayback {
     pub referer: String,
     pub is_audio_only: bool,
     pub duration_secs: Option<u64>,
+    pub title: String,
     pub ytdl_json: Option<String>,
 }
 
@@ -101,6 +102,7 @@ mod tests {
             referer: String::new(),
             is_audio_only: false,
             duration_secs: Some(60),
+            title: "Sample Video".to_string(),
             ytdl_json: None,
         };
         assert_eq!(muxed.to_loadfile_url(), "https://example.com/v.mp4");
@@ -112,6 +114,7 @@ mod tests {
             referer: String::new(),
             is_audio_only: false,
             duration_secs: Some(60),
+            title: "Sample Adaptive".to_string(),
             ytdl_json: None,
         };
         assert_eq!(

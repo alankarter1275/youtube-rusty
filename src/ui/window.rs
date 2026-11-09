@@ -1917,6 +1917,7 @@ impl MainWindow {
 
         // Window keyboard shortcuts: '/', 'Ctrl+F', 'Ctrl+R'/'F5', 'Alt+Left', 'Esc', 'Enter' on selected card
         let key_ctrl = EventControllerKey::new();
+        key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let weak = Rc::downgrade(self);
         key_ctrl.connect_key_pressed(move |_, key, _, mods| {
             let Some(w) = weak.upgrade() else {
@@ -1946,7 +1947,7 @@ impl MainWindow {
             }
 
             let in_editable = gtk4::prelude::GtkWindowExt::focus(&w.window)
-                .map(|f| f.is::<Editable>())
+                .map(|f| f.is::<Editable>() || f.ancestor(Editable::static_type()).is_some())
                 .unwrap_or(false);
 
             if key == gdk::Key::slash
