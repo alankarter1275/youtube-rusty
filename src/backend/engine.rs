@@ -336,18 +336,8 @@ impl Engine {
     }
 
     /// Resolves direct YouTube media stream URLs in pure Rust without `yt-dlp` or Python,
-    /// verifying HTTP reachability (`200`/`206`) before handing the URL to MPV so 403/POT-gated
-    /// streams are transparently skipped in favor of working streams or HLS variants.
-    pub async fn resolve_playback(
-        &self,
-        video_id: &str,
-        quality: Quality,
-    ) -> Result<ResolvedPlayback, String> {
-        self.resolve_playback_for_mpv(video_id, quality, None).await
-    }
-
-    /// Resolves playback for MPV, populating a `quality-menu.lua`-compatible `ytdl_json` format
-    /// catalog and honoring optional per-file `ytdl-format` selections (e.g. `v247+a251`, `hls-720`).
+    /// populating a `quality-menu.lua`-compatible `ytdl_json` format catalog and honoring
+    /// optional per-file `ytdl-format` selections (e.g. `v247+a251`, `hls-720`).
     /// Verified stream pools are cached in memory for 12 minutes so mid-video resolution switches
     /// and 1-ahead track transitions complete in 0ms without re-querying Innertube.
     pub async fn resolve_playback_for_mpv(
