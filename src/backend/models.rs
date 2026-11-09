@@ -214,7 +214,8 @@ pub fn matches_local_filters(
 fn matches_published_text_heuristic(text: &str, filter: UploadDateFilter) -> bool {
     let lower = text.to_lowercase();
     if lower.is_empty() {
-        return true;
+        // A restricted date filter must not silently admit items whose age is unknown.
+        return false;
     }
     let is_today = lower.contains("second")
         || lower.contains("minute")
@@ -266,6 +267,36 @@ mod tests {
         assert_eq!(format_queue_total_duration(0), "");
         assert_eq!(format_queue_total_duration(45), "45 sec");
         assert_eq!(format_queue_total_duration(6120), "1 h 42 min");
+    }
+
+    #[test]
+    fn test_channel_filters_exclude_unknown_dates_and_match_duration() {
+        let video = VideoSummary {
+            id: "test".to_string(),
+            title: "test".to_string(),
+            channel_id: String::new(),
+            channel_name: String::new(),
+            channel_avatar_url: String::new(),
+            duration_seconds: Some(180),
+            duration_text: "3:00".to_string(),
+            view_count_text: String::new(),
+            view_count: None,
+            published_text: String::new(),
+            published_unix: None,
+            is_short: false,
+            thumbnail_url: String::new(),
+            description_snippet: String::new(),
+        };
+        assert!(matches_local_filters(
+            &video,
+            UploadDateFilter::AnyTime,
+            DurationFilter::Under4Min
+        ));
+        assert!(!matches_local_filters(
+            &video,
+            UploadDateFilter::Today,
+            DurationFilter::AnyLength
+        ));
     }
 
     #[test]

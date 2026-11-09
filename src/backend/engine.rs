@@ -1,6 +1,6 @@
 use super::models::{
-    format_count, format_duration, ChannelDetails, ChannelSearchSummary, ChannelSortOrder,
-    DurationFilter, PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab,
+    format_count, format_duration, ChannelDetails, ChannelSearchSummary, ChannelSortOrder, DurationFilter,
+    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab,
     UploadDateFilter, VideoSummary,
 };
 use super::subscriptions::SubscribedChannel;
@@ -2312,12 +2312,28 @@ impl Engine {
         };
 
         let next = cursor_from_paginator(&ch.content);
-        let items = ch
+        let mut items: Vec<VideoSummary> = ch
             .content
             .items
             .into_iter()
             .map(|it| map_video_item(it, Some(&fallback), false))
             .collect();
+
+        // RustyPipe's channel mapper can omit duration metadata for newer renderer variants.
+        // Only on that partial-data path, consult the WEB browse response's lengthText overlay.
+        if items
+            .iter()
+            .any(|item| !item.is_short && (item.duration_seconds.is_none() || item.duration_text.is_empty()))
+        {
+            if let Ok(raw) = self
+                .fetch_channel_browse_json(channel_id, Some("EgZ2aWRlb3PyBgQKAjoA"), None)
+                .await
+            {
+                let direct_page = parse_home_feed_response(&raw);
+                fill_missing_video_durations(&mut items, &direct_page.items);
+            }
+        }
+
         Ok((details, PagedVideos { items, next }))
     }
 
@@ -2451,25 +2467,9 @@ impl Engine {
         if order == ChannelSortOrder::Newest {
             if is_shorts {
                 return self.channel_shorts(channel_id, fallback_details).await;
-            } else {
-                let (_, paged) = self.channel_videos(channel_id).await?;
-                return Ok(paged);
             }
-        }
-
-        if is_shorts {
-            let val = self
-                .fetch_channel_browse_json(
-                    channel_id,
-                    Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
-                    None,
-                )
-                .await?;
-            if let Some(chip_token) = extract_shorts_sort_chip_token(&val, order) {
-                return self
-                    .continue_channel_shorts_direct(&chip_token, fallback_details)
-                    .await;
-            }
+            let (_, paged) = self.channel_videos(channel_id).await?;
+            return Ok(paged);
         }
 
         let tab = if is_shorts {
@@ -2482,23 +2482,23 @@ impl Engine {
             ChannelSortOrder::Oldest => ChannelOrder::Oldest,
             ChannelSortOrder::Popular => ChannelOrder::Popular,
         };
-
-        let paginator = self.rp_query().await
+        let paginator = self
+            .rp_query()
+            .await
             .channel_videos_tab_order(channel_id, tab, rp_order)
             .await
             .map_err(|e| format!("Channel sort error: {e}"))?;
 
-        let fallback = fallback_details.map(|d| ChannelFallback {
-            id: &d.id,
-            name: &d.name,
-            avatar_url: &d.avatar_url,
+        let fallback = fallback_details.map(|details| ChannelFallback {
+            id: &details.id,
+            name: &details.name,
+            avatar_url: &details.avatar_url,
         });
-
         let next = cursor_from_paginator(&paginator);
         let items = paginator
             .items
             .into_iter()
-            .map(|it| map_video_item(it, fallback.as_ref(), is_shorts))
+            .map(|item| map_video_item(item, fallback.as_ref(), is_shorts))
             .collect();
         Ok(PagedVideos { items, next })
     }
@@ -4084,69 +4084,6 @@ fn select_shorts_tab_renderer(val: &Value) -> Option<&Value> {
         })
 }
 
-fn extract_shorts_sort_chip_token(val: &Value, order: ChannelSortOrder) -> Option<String> {
-    let target_word = match order {
-        ChannelSortOrder::Newest => "latest",
-        ChannelSortOrder::Popular => "popular",
-        ChannelSortOrder::Oldest => "oldest",
-    };
-
-    let tab = select_shorts_tab_renderer(val)?;
-    let chips = tab
-        .pointer("/content/richGridRenderer/header/feedFilterChipBarRenderer/contents")
-        .and_then(|v| v.as_array())?;
-
-    for chip_entry in chips {
-        if let Some(chip) = chip_entry.get("chipCloudChipRenderer") {
-            let label = chip
-                .pointer("/text/simpleText")
-                .or_else(|| chip.pointer("/text/runs/0/text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if label.contains(target_word) {
-                if let Some(tok) = chip
-                    .pointer("/navigationEndpoint/continuationCommand/token")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(tok.to_string());
-                }
-                if let Some(cmds) = chip
-                    .pointer("/navigationEndpoint/commandExecutorCommand/commands")
-                    .and_then(|v| v.as_array())
-                {
-                    for cmd in cmds {
-                        if let Some(tok) = cmd
-                            .pointer("/continuationCommand/token")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                        {
-                            return Some(tok.to_string());
-                        }
-                    }
-                }
-            }
-        } else if let Some(cvm) = chip_entry.get("chipViewModel") {
-            let label = cvm
-                .pointer("/text/content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if label.contains(target_word) {
-                if let Some(tok) = cvm
-                    .pointer("/tapCommand/innertubeCommand/continuationCommand/token")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(tok.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 fn parse_shorts_browse_response(
     val: &Value,
     channel_id: &str,
@@ -4918,6 +4855,34 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
         thumbnail_url,
         description_snippet: String::new(),
     })
+}
+
+fn fill_missing_video_durations(target: &mut [VideoSummary], source: &[VideoSummary]) {
+    let by_id: HashMap<&str, &VideoSummary> = source
+        .iter()
+        .map(|video| (video.id.as_str(), video))
+        .collect();
+    for video in target {
+        if video.duration_seconds.is_some() && !video.duration_text.is_empty() {
+            continue;
+        }
+        let Some(details) = by_id.get(video.id.as_str()) else {
+            continue;
+        };
+        if video.duration_seconds.is_none() {
+            video.duration_seconds = details.duration_seconds;
+        }
+        if video.duration_text.is_empty() {
+            video.duration_text = if !details.duration_text.is_empty() {
+                details.duration_text.clone()
+            } else {
+                video
+                    .duration_seconds
+                    .map(format_duration)
+                    .unwrap_or_default()
+            };
+        }
+    }
 }
 
 fn parse_home_feed_response(val: &Value) -> PagedVideos {
@@ -5733,6 +5698,54 @@ fn map_video_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn duration_test_video(id: &str, seconds: Option<u64>, text: &str) -> VideoSummary {
+        VideoSummary {
+            id: id.to_string(),
+            title: "test".to_string(),
+            channel_id: String::new(),
+            channel_name: String::new(),
+            channel_avatar_url: String::new(),
+            duration_seconds: seconds,
+            duration_text: text.to_string(),
+            view_count_text: String::new(),
+            view_count: None,
+            published_text: String::new(),
+            published_unix: None,
+            is_short: false,
+            thumbnail_url: String::new(),
+            description_snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_channel_renderer_parses_duration_badge() {
+        let renderer = json!({
+            "videoId": "video123",
+            "title": { "simpleText": "Channel upload" },
+            "lengthText": { "simpleText": "12:34" }
+        });
+        let parsed = parse_video_renderer_json(&renderer).unwrap();
+        assert_eq!(parsed.duration_seconds, Some(754));
+        assert_eq!(parsed.duration_text, "12:34");
+    }
+
+    #[test]
+    fn test_channel_duration_fallback_fills_only_missing_metadata() {
+        let mut from_rustypipe = vec![
+            duration_test_video("missing", None, ""),
+            duration_test_video("known", Some(60), "1:00"),
+        ];
+        let direct = vec![
+            duration_test_video("missing", Some(754), "12:34"),
+            duration_test_video("known", Some(99), "1:39"),
+        ];
+        fill_missing_video_durations(&mut from_rustypipe, &direct);
+        assert_eq!(from_rustypipe[0].duration_seconds, Some(754));
+        assert_eq!(from_rustypipe[0].duration_text, "12:34");
+        assert_eq!(from_rustypipe[1].duration_seconds, Some(60));
+        assert_eq!(from_rustypipe[1].duration_text, "1:00");
+    }
 
     #[test]
     fn test_hardware_friendly_codec_selection() {

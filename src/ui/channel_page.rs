@@ -941,27 +941,30 @@ impl ChannelPage {
     }
 
     fn reload_sorted_tab(self: &Rc<Self>) {
+        if self.search_results.borrow().is_some() {
+            self.render_active_tab();
+            return;
+        }
         let req_id = self.next_request_id();
         self.is_loading.set(true);
         self.show_skeletons();
 
         let is_shorts = self.active_tab.get() == ChannelTab::Shorts;
         let order = self.sort_order.get();
-        let cid = self.channel_id.clone();
+        let channel_id = self.channel_id.clone();
         let fallback = self.channel_details.borrow().clone();
         let engine = self.engine.clone();
         let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
-
         self.runtime.spawn(async move {
-            let res = engine
-                .channel_tab_ordered(&cid, is_shorts, order, fallback.as_ref())
+            let result = engine
+                .channel_tab_ordered(&channel_id, is_shorts, order, fallback.as_ref())
                 .await;
-            let _ = tx.send(res).await;
+            let _ = tx.send(result).await;
         });
 
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let Ok(res) = rx.recv().await else {
+            let Ok(result) = rx.recv().await else {
                 return;
             };
             let Some(cp) = weak.upgrade() else {
@@ -971,7 +974,7 @@ impl ChannelPage {
                 return;
             }
             cp.is_loading.set(false);
-            match res {
+            match result {
                 Ok(paged) => {
                     if is_shorts {
                         *cp.shorts_list.borrow_mut() = paged.items;
@@ -980,12 +983,13 @@ impl ChannelPage {
                         *cp.videos_list.borrow_mut() = paged.items;
                         *cp.videos_cursor.borrow_mut() = paged.next;
                     }
-                    cp.render_active_tab();
                 }
-                Err(err) => {
-                    cp.show_status("Could not sort channel videos", &err);
+                Err(_) => {
+                    // Keep the current list and apply the selected order locally rather than
+                    // replacing the channel page with an error state.
                 }
             }
+            cp.render_active_tab();
         });
     }
 
@@ -1158,9 +1162,6 @@ impl ChannelPage {
                         }
                     }
 
-                    let df = cp.date_filter.get();
-                    let duf = cp.duration_filter.get();
-
                     if is_shorts {
                         let existing: HashSet<String> = cp
                             .shorts_list
@@ -1174,21 +1175,13 @@ impl ChannelPage {
                             .into_iter()
                             .filter(|v| !v.id.is_empty() && seen.insert(v.id.clone()))
                             .collect();
-                        let visible_new: Vec<VideoSummary> = unique_items
-                            .iter()
-                            .filter(|v| matches_local_filters(v, df, duf))
-                            .cloned()
-                            .collect();
-
                         cp.shorts_list.borrow_mut().extend(unique_items);
                         *cp.shorts_cursor.borrow_mut() = paged.next;
                         if cp.active_tab.get() == ChannelTab::Shorts
                             && cp.search_results.borrow().is_none()
+                            && !cp.is_suspended.get()
                         {
-                            cp.rendered_items.borrow_mut().extend(visible_new);
-                            if !cp.is_suspended.get() {
-                                cp.sync_virtual_window(false);
-                            }
+                            cp.render_active_tab();
                         }
                     } else {
                         let existing: HashSet<String> = cp
@@ -1203,21 +1196,13 @@ impl ChannelPage {
                             .into_iter()
                             .filter(|v| !v.id.is_empty() && seen.insert(v.id.clone()))
                             .collect();
-                        let visible_new: Vec<VideoSummary> = unique_items
-                            .iter()
-                            .filter(|v| matches_local_filters(v, df, duf))
-                            .cloned()
-                            .collect();
-
                         cp.videos_list.borrow_mut().extend(unique_items);
                         *cp.videos_cursor.borrow_mut() = paged.next;
                         if cp.active_tab.get() == ChannelTab::Videos
                             && cp.search_results.borrow().is_none()
+                            && !cp.is_suspended.get()
                         {
-                            cp.rendered_items.borrow_mut().extend(visible_new);
-                            if !cp.is_suspended.get() {
-                                cp.sync_virtual_window(false);
-                            }
+                            cp.render_active_tab();
                         }
                     }
                 }
@@ -1647,28 +1632,8 @@ impl ChannelPage {
     }
 
     fn filtered_active_items(&self) -> Vec<VideoSummary> {
-        let base: Vec<VideoSummary> = if let Some(ref sr) = *self.search_results.borrow() {
-            let mut v = sr.clone();
-            match self.sort_order.get() {
-                ChannelSortOrder::Newest => {
-                    v.sort_by(|a, b| {
-                        b.published_unix
-                            .unwrap_or(0)
-                            .cmp(&a.published_unix.unwrap_or(0))
-                    });
-                }
-                ChannelSortOrder::Oldest => {
-                    v.sort_by(|a, b| {
-                        a.published_unix
-                            .unwrap_or(i64::MAX)
-                            .cmp(&b.published_unix.unwrap_or(i64::MAX))
-                    });
-                }
-                ChannelSortOrder::Popular => {
-                    v.sort_by(|a, b| b.view_count.unwrap_or(0).cmp(&a.view_count.unwrap_or(0)));
-                }
-            }
-            v
+        let mut base: Vec<VideoSummary> = if let Some(ref search_results) = *self.search_results.borrow() {
+            search_results.clone()
         } else {
             match self.active_tab.get() {
                 ChannelTab::Videos | ChannelTab::Playlists => self.videos_list.borrow().clone(),
@@ -1676,10 +1641,29 @@ impl ChannelPage {
             }
         };
 
+        // Sort the loaded channel items locally. YouTube's channel-order continuation endpoint
+        // is intermittently rejected; local sorting keeps the controls functional without an
+        // error or an extra request, and newly loaded pages are re-sorted together.
+        match self.sort_order.get() {
+            ChannelSortOrder::Newest => base.sort_by(|a, b| {
+                b.published_unix
+                    .unwrap_or(i64::MIN)
+                    .cmp(&a.published_unix.unwrap_or(i64::MIN))
+            }),
+            ChannelSortOrder::Oldest => base.sort_by(|a, b| {
+                a.published_unix
+                    .unwrap_or(i64::MAX)
+                    .cmp(&b.published_unix.unwrap_or(i64::MAX))
+            }),
+            ChannelSortOrder::Popular => {
+                base.sort_by(|a, b| b.view_count.unwrap_or(0).cmp(&a.view_count.unwrap_or(0)))
+            }
+        }
+
         let df = self.date_filter.get();
         let duf = self.duration_filter.get();
         base.into_iter()
-            .filter(|v| matches_local_filters(v, df, duf))
+            .filter(|video| matches_local_filters(video, df, duf))
             .collect()
     }
 
