@@ -5,7 +5,7 @@ use super::models::{
 };
 use super::subscriptions::SubscribedChannel;
 use crate::player::mpv::{Quality, ResolvedPlayback};
-use rustypipe::client::{ClientType, RustyPipe};
+use rustypipe::client::{ClientType, RustyPipe, RustyPipeQuery};
 use rustypipe::model::paginator::{ContinuationEndpoint, Paginator};
 use rustypipe::model::{
     AudioCodec, ChannelItem, PlaylistItem, Thumbnail, UrlTarget, VideoCodec, VideoItem,
@@ -238,10 +238,28 @@ fn cursor_from_paginator<T>(p: &Paginator<T>) -> Option<PageCursor> {
     })
 }
 
+const VISITOR_DATA_TTL: Duration = Duration::from_secs(45 * 60);
+
+/// Synthesizes a valid YouTube protobuf `visitorData` token (`field 1 = 11-char visitor id`,
+/// `field 5 = unix timestamp`) so `RustyPipe` never falls back to its internal `VisitorDataCache`
+/// (`rustypipe 0.11.4` has an upstream `.unwrap()` on `https://music.youtube.com/`).
+fn synthesize_visitor_data() -> String {
+    let id = random_innertube_token(11);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_730_000_000);
+    let mut proto = Vec::with_capacity(24);
+    push_proto_bytes_field(&mut proto, 1, id.as_bytes());
+    push_proto_varint_field(&mut proto, 5, now_secs);
+    encode_base64_url_safe_pct(&proto)
+}
+
 pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
-    visitor_data: RwLock<Option<String>>,
+    visitor_data: RwLock<Option<(String, Instant)>>,
+    visitor_fetch_lock: Mutex<()>,
     verified_pools: RwLock<Vec<VerifiedPoolEntry>>,
     pool_inflight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     home_seed: AtomicU64,
@@ -253,10 +271,22 @@ pub struct Engine {
 impl Engine {
     pub fn new(storage_dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(storage_dir);
+        let boot_vd = synthesize_visitor_data();
         let rp = RustyPipe::builder()
             .storage_dir(storage_dir)
+            .no_botguard()
+            .no_reporter()
+            .visitor_data(boot_vd)
             .build()
-            .unwrap_or_else(|_| RustyPipe::new());
+            .unwrap_or_else(|_| {
+                RustyPipe::builder()
+                    .no_storage()
+                    .no_botguard()
+                    .no_reporter()
+                    .visitor_data(synthesize_visitor_data())
+                    .build()
+                    .expect("RustyPipe client init")
+            });
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(10))
@@ -272,6 +302,7 @@ impl Engine {
             rp,
             http,
             visitor_data: RwLock::new(None),
+            visitor_fetch_lock: Mutex::new(()),
             verified_pools: RwLock::new(Vec::new()),
             pool_inflight: Mutex::new(HashMap::new()),
             home_seed: AtomicU64::new(init_seed),
@@ -289,9 +320,35 @@ impl Engine {
         let _ = self.ensure_visitor_data().await;
     }
 
+    /// Returns a `RustyPipeQuery` guaranteed to carry an explicit `visitor_data` token so
+    /// `rustypipe 0.11.4` never enters its internal `VisitorDataCache::new_visitor_data()`
+    /// (which panics on `.unwrap()` if `https://music.youtube.com/` fails).
+    async fn rp_query(&self) -> RustyPipeQuery {
+        let vd = self
+            .ensure_visitor_data()
+            .await
+            .unwrap_or_else(synthesize_visitor_data);
+        self.rp.query().visitor_data(vd)
+    }
+
     async fn ensure_visitor_data(&self) -> Option<String> {
-        if let Some(cached) = self.visitor_data.read().await.clone() {
-            return Some(cached);
+        {
+            let guard = self.visitor_data.read().await;
+            if let Some((ref vd, fetched_at)) = *guard {
+                if fetched_at.elapsed() < VISITOR_DATA_TTL {
+                    return Some(vd.clone());
+                }
+            }
+        }
+
+        let _fetch_guard = self.visitor_fetch_lock.lock().await;
+        {
+            let guard = self.visitor_data.read().await;
+            if let Some((ref vd, fetched_at)) = *guard {
+                if fetched_at.elapsed() < VISITOR_DATA_TTL {
+                    return Some(vd.clone());
+                }
+            }
         }
 
         let body = json!({
@@ -312,7 +369,7 @@ impl Engine {
             }
         });
 
-        let fetched = self
+        let fetched = match self
             .http
             .post("https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
             .timeout(Duration::from_secs(5))
@@ -322,19 +379,31 @@ impl Engine {
             .json(&body)
             .send()
             .await
-            .ok()?
-            .json::<Value>()
-            .await
-            .ok()?
-            .pointer("/responseContext/visitorData")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        {
+            Ok(resp) => resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/responseContext/visitorData")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                }),
+            Err(_) => None,
+        };
 
         if let Some(ref vd) = fetched {
-            *self.visitor_data.write().await = Some(vd.clone());
+            *self.visitor_data.write().await = Some((vd.clone(), Instant::now()));
+            return Some(vd.clone());
         }
-        fetched
+
+        // Fall back to stale cached visitor_data if YouTube had a transient network blip
+        self.visitor_data
+            .read()
+            .await
+            .as_ref()
+            .map(|(vd, _)| vd.clone())
     }
 
     /// Resolves direct YouTube media stream URLs in pure Rust without `yt-dlp` or Python,
@@ -439,7 +508,7 @@ impl Engine {
             (ClientType::Tv, RP_TV_UA),
             (ClientType::Desktop, RP_DESKTOP_UA),
         ] {
-            match self.rp.query().player_from_clients(video_id, &[ctype]).await {
+            match self.rp_query().await.player_from_clients(video_id, &[ctype]).await {
                 Ok(player) => {
                     let pool = pool_from_rustypipe(player, ua, YT_WEB_REFERER);
                     if pool.has_playable_streams() {
@@ -574,7 +643,7 @@ impl Engine {
             (ClientType::Tv, RP_TV_UA),
             (ClientType::Desktop, RP_DESKTOP_UA),
         ] {
-            match self.rp.query().player_from_clients(video_id, &[ctype]).await {
+            match self.rp_query().await.player_from_clients(video_id, &[ctype]).await {
                 Ok(player) => {
                     let pool = pool_from_rustypipe(player, ua, YT_WEB_REFERER);
                     if pool.has_playable_streams() && self.pool_has_reachable_media(&pool).await {
@@ -1162,8 +1231,7 @@ impl Engine {
         if q.is_empty() {
             return Ok(Vec::new());
         }
-        self.rp
-            .query()
+        self.rp_query().await
             .search_suggestion(q)
             .await
             .map_err(|e| format!("Suggestion error: {e}"))
@@ -1211,8 +1279,7 @@ impl Engine {
                     }
                 }
                 let paginator = if is_default_filters {
-                    self.rp
-                        .query()
+                    self.rp_query().await
                         .search::<YouTubeItem, _>(query)
                         .await
                         .map_err(|e| format!("Search error: {e}"))?
@@ -1222,8 +1289,7 @@ impl Engine {
                         .date_opt(rp_date)
                         .length_opt(rp_len)
                         .sort_opt(rp_sort);
-                    self.rp
-                        .query()
+                    self.rp_query().await
                         .search_filter::<YouTubeItem, _>(query, &filter)
                         .await
                         .map_err(|e| format!("Search error: {e}"))?
@@ -1303,9 +1369,7 @@ impl Engine {
                 let filter = SearchFilter::new()
                     .item_type(ItemType::Channel)
                     .sort_opt(rp_sort);
-                let paginator = self
-                    .rp
-                    .query()
+                let paginator = self.rp_query().await
                     .search_filter::<ChannelItem, _>(query, &filter)
                     .await
                     .map_err(|e| format!("Channel search error: {e}"))?
@@ -1343,9 +1407,7 @@ impl Engine {
 
         match tab {
             SearchTab::All => {
-                let paginator = self
-                    .rp
-                    .query()
+                let paginator = self.rp_query().await
                     .continuation::<YouTubeItem, _>(
                         &cursor.ctoken,
                         cursor.endpoint,
@@ -1370,9 +1432,7 @@ impl Engine {
                 })
             }
             SearchTab::Channels => {
-                let paginator = self
-                    .rp
-                    .query()
+                let paginator = self.rp_query().await
                     .continuation::<ChannelItem, _>(
                         &cursor.ctoken,
                         cursor.endpoint,
@@ -1389,9 +1449,7 @@ impl Engine {
                 Ok(PagedSearchItems { items, next })
             }
             SearchTab::Playlists => {
-                let paginator = self
-                    .rp
-                    .query()
+                let paginator = self.rp_query().await
                     .continuation::<PlaylistItem, _>(
                         &cursor.ctoken,
                         cursor.endpoint,
@@ -1507,7 +1565,7 @@ impl Engine {
             }
         }
 
-        match self.rp.query().playlist(clean_id).await {
+        match self.rp_query().await.playlist(clean_id).await {
             Ok(pl) => {
                 let channel_name = pl.channel.map(|c| c.name).unwrap_or_default();
                 let video_count_text = if pl.video_count > 0 {
@@ -1672,9 +1730,7 @@ impl Engine {
             }
         }
 
-        let target = self
-            .rp
-            .query()
+        let target = self.rp_query().await
             .resolve_url(&normalized, false)
             .await
             .map_err(|e| format!("Could not open link: {e}"))?;
@@ -1728,9 +1784,7 @@ impl Engine {
             }
         }
 
-        let details = self
-            .rp
-            .query()
+        let details = self.rp_query().await
             .video_details(video_id)
             .await
             .map_err(|e| format!("Could not fetch video info: {e}"))?;
@@ -1768,8 +1822,7 @@ impl Engine {
             && sort == SearchSortOrder::Relevance;
 
         let paginator = if is_default {
-            self.rp
-                .query()
+            self.rp_query().await
                 .search::<VideoItem, _>(query)
                 .await
                 .map_err(|e| format!("Search error: {e}"))?
@@ -1800,8 +1853,7 @@ impl Engine {
                 .length_opt(rp_len)
                 .sort_opt(rp_sort);
 
-            self.rp
-                .query()
+            self.rp_query().await
                 .search_filter::<VideoItem, _>(query, &filter)
                 .await
                 .map_err(|e| format!("Search error: {e}"))?
@@ -1872,16 +1924,13 @@ impl Engine {
             .item_type(ItemType::Video)
             .date(date_window);
 
-        let paginator = match self
-            .rp
-            .query()
+        let paginator = match self.rp_query().await
             .search_filter::<VideoItem, _>(chosen_query, &filter)
             .await
         {
             Ok(res) if !res.items.items.is_empty() => res.items,
             _ => {
-                self.rp
-                    .query()
+                self.rp_query().await
                     .search::<VideoItem, _>(chosen_query)
                     .await
                     .map_err(|e| format!("Category error: {e}"))?
@@ -1989,9 +2038,7 @@ impl Engine {
             _ => {}
         }
 
-        let paginator = self
-            .rp
-            .query()
+        let paginator = self.rp_query().await
             .continuation::<VideoItem, _>(
                 &cursor.ctoken,
                 cursor.endpoint,
@@ -2054,10 +2101,11 @@ impl Engine {
         ];
 
         let date_mode = step % 3;
+        let base_query = self.rp_query().await;
         let mut join_set = JoinSet::new();
 
         for (idx, topic) in chosen_topics.into_iter().enumerate() {
-            let rp = self.rp.clone();
+            let rp_q = base_query.clone();
             let upload_date = match (date_mode + idx as u64) % 3 {
                 0 => UploadDate::Week,
                 1 => UploadDate::Day,
@@ -2067,8 +2115,7 @@ impl Engine {
                 let filter = SearchFilter::new()
                     .item_type(ItemType::Video)
                     .date(upload_date);
-                let res = rp
-                    .query()
+                let res = rp_q
                     .search_filter::<VideoItem, _>(topic, &filter)
                     .await
                     .map(|r| r.items)
@@ -2163,9 +2210,7 @@ impl Engine {
             });
         }
 
-        let fallback = self
-            .rp
-            .query()
+        let fallback = self.rp_query().await
             .search::<VideoItem, _>("popular videos")
             .await
             .map_err(|e| {
@@ -2236,9 +2281,7 @@ impl Engine {
         &self,
         channel_id: &str,
     ) -> Result<(ChannelDetails, PagedVideos), String> {
-        let ch = self
-            .rp
-            .query()
+        let ch = self.rp_query().await
             .channel_videos(channel_id)
             .await
             .map_err(|e| format!("Channel error: {e}"))?;
@@ -2440,9 +2483,7 @@ impl Engine {
             ChannelSortOrder::Popular => ChannelOrder::Popular,
         };
 
-        let paginator = self
-            .rp
-            .query()
+        let paginator = self.rp_query().await
             .channel_videos_tab_order(channel_id, tab, rp_order)
             .await
             .map_err(|e| format!("Channel sort error: {e}"))?;
@@ -2468,9 +2509,7 @@ impl Engine {
         query: &str,
         fallback_details: Option<&ChannelDetails>,
     ) -> Result<Vec<VideoSummary>, String> {
-        let ch = self
-            .rp
-            .query()
+        let ch = self.rp_query().await
             .channel_search(channel_id, query)
             .await
             .map_err(|e| format!("Channel search error: {e}"))?;
@@ -6512,5 +6551,11 @@ https://manifest.example/v1080_video.m3u8
             })
             .collect();
         assert_eq!(ids, vec!["shortVid001", "shortVid002", "shortVid003"]);
+
+        let synth_vd = synthesize_visitor_data();
+        assert!(
+            synth_vd.starts_with("Cg") && synth_vd.len() > 23,
+            "unexpected visitor_data format: {synth_vd}"
+        );
     }
 }
