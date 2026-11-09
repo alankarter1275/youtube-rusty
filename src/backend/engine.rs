@@ -906,7 +906,7 @@ impl Engine {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
             {
-                *self.visitor_data.write().await = Some(vd.to_string());
+                *self.visitor_data.write().await = Some((vd.to_string(), Instant::now()));
             }
         }
 
