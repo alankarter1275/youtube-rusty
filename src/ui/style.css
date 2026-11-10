@@ -496,6 +496,19 @@ popover modelbutton:hover, .yr-menu-item:hover {
 .yr-suggest-row.active {
   background-color: alpha(#E8DDD5, 0.10);
 }
+.yr-collaborators-popover > contents {
+  background-color: @yr_surface;
+  border: 1px solid alpha(#E8DDD5, 0.16);
+  border-radius: 16px;
+  box-shadow: 0 16px 40px alpha(black, 0.55);
+}
+.yr-collaborator-row {
+  border-radius: 12px;
+  padding: 5px 4px;
+}
+.yr-collaborator-row:hover {
+  background-color: alpha(#E8DDD5, 0.06);
+}
 .yr-popover-head {
   font-size: 11px;
   font-weight: 700;

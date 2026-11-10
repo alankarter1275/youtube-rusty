@@ -2177,6 +2177,13 @@ impl ChannelPage {
                 &item.channel_avatar_url,
                 &card.avatar,
             );
+            for (channel_id, avatar_url, avatar) in &card.extra_channel_avatars {
+                if !avatar_url.is_empty() {
+                    self.actions
+                        .image_loader
+                        .load_into_avatar(channel_id, avatar_url, avatar);
+                }
+            }
 
             let sum_play = item.clone();
             let vid_id_sel = item.id.clone();

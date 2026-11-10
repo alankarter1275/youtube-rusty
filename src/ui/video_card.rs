@@ -23,6 +23,7 @@ pub struct VideoCard {
     pub highlight_target: GtkBox,
     pub click_target: GtkBox,
     pub channel_target: Option<GtkBox>,
+    pub extra_channel_avatars: Vec<(String, String, adw::Avatar)>,
     pub picture: Picture,
     pub avatar: adw::Avatar,
 }
@@ -52,31 +53,57 @@ impl VideoCard {
         let details_box = GtkBox::new(Orientation::Horizontal, 10);
         details_box.set_valign(Align::Start);
 
-        let avatar_label = if !summary.channel_name.is_empty() {
-            &summary.channel_name
-        } else {
-            &summary.title
+        let channel_credits = summary.channel_credits();
+        let avatar_label = channel_credits
+            .first()
+            .map(|channel| channel.name.as_str())
+            .filter(|name| !name.is_empty());
+        let avatar = adw::Avatar::new(36, avatar_label, true);
+        avatar.set_size_request(28, 28);
+        avatar.set_valign(Align::Center);
+
+        let visible_credit_count = channel_credits.len().min(3);
+        let stack_width = match visible_credit_count {
+            0 | 1 => 36,
+            2 => 44,
+            _ => 58,
         };
-        let avatar = adw::Avatar::new(36, Some(avatar_label), true);
-        avatar.set_valign(Align::Start);
+        let avatar_stack = Overlay::new();
+        avatar_stack.set_size_request(stack_width, 36);
+        avatar_stack.set_child(Some(&avatar));
+        let mut extra_channel_avatars = Vec::new();
+        for (offset, channel) in channel_credits.iter().skip(1).take(2).enumerate() {
+            let extra = adw::Avatar::new(28, Some(&channel.name), true);
+            extra.set_size_request(28, 28);
+            extra.set_halign(Align::Start);
+            extra.set_valign(Align::Center);
+            extra.set_margin_start(15 + offset as i32 * 14);
+            avatar_stack.add_overlay(&extra);
+            extra_channel_avatars.push((
+                channel.id.clone(),
+                channel.avatar_url.clone(),
+                extra,
+            ));
+        }
 
         let avatar_wrap = GtkBox::new(Orientation::Vertical, 0);
         avatar_wrap.set_valign(Align::Start);
-        avatar_wrap.append(&avatar);
-        let channel_target = if !summary.channel_id.is_empty() {
+        avatar_wrap.append(&avatar_stack);
+        let channel_target = channel_credits.first().and_then(|channel| {
+            if channel.id.is_empty() {
+                return None;
+            }
             avatar_wrap.set_tooltip_text(Some(&format!(
                 "Open channel: {}",
-                if summary.channel_name.is_empty() {
+                if channel.name.is_empty() {
                     "Channel"
                 } else {
-                    &summary.channel_name
+                    &channel.name
                 }
             )));
             set_pointer(&avatar_wrap);
             Some(avatar_wrap.clone())
-        } else {
-            None
-        };
+        });
 
         let text_col = GtkBox::new(Orientation::Vertical, 3);
         text_col.set_hexpand(true);
@@ -90,8 +117,9 @@ impl VideoCard {
         title_label.set_xalign(0.0);
         title_label.add_css_class("yr-title");
 
+        let byline = summary.channel_byline().unwrap_or_default();
         let meta_text = join_non_empty(&[
-            &summary.channel_name,
+            &byline,
             &summary.view_count_text,
             &summary.published_text,
         ]);
@@ -122,6 +150,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
+            extra_channel_avatars,
             picture,
             avatar,
         }
@@ -304,6 +333,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
+            extra_channel_avatars: Vec::new(),
             picture,
             avatar,
         }
@@ -457,6 +487,7 @@ impl VideoCard {
             highlight_target: root_box,
             click_target,
             channel_target: None,
+            extra_channel_avatars: Vec::new(),
             picture,
             avatar,
         }
@@ -671,6 +702,7 @@ impl VideoCard {
             highlight_target: root_box,
             click_target,
             channel_target: None,
+            extra_channel_avatars: Vec::new(),
             picture,
             avatar,
         }
@@ -757,6 +789,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
+            extra_channel_avatars: Vec::new(),
             picture,
             avatar,
         }

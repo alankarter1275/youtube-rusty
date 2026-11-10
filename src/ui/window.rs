@@ -5,7 +5,8 @@ use crate::backend::engine::{
 use crate::backend::history::HistoryStore;
 use crate::backend::models::{
     format_queue_total_duration, looks_like_youtube_url, ChannelDetails, DurationFilter,
-    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoSummary,
+    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab, UploadDateFilter,
+    VideoCollaborator, VideoSummary,
 };
 use crate::backend::playlists::PlaylistStore;
 use crate::backend::search_history::SearchHistoryStore;
@@ -3243,6 +3244,45 @@ impl MainWindow {
             }
         });
 
+        let subscription_store = self.subscription_store.clone();
+        let is_subscribed: Rc<dyn Fn(&str) -> bool> = Rc::new(move |channel_id| {
+            !channel_id.is_empty() && subscription_store.is_subscribed(channel_id)
+        });
+
+        let weak = Rc::downgrade(self);
+        let on_toggle_subscription: Rc<dyn Fn(VideoCollaborator) -> bool> =
+            Rc::new(move |channel| {
+                let Some(w) = weak.upgrade() else {
+                    return false;
+                };
+                if channel.id.is_empty() {
+                    return false;
+                }
+                let subscribed = w.subscription_store.is_subscribed(&channel.id);
+                if subscribed {
+                    w.subscription_store.unsubscribe(&channel.id);
+                    w.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Unsubscribed from {}",
+                        if channel.name.is_empty() { "channel" } else { channel.name.as_str() }
+                    )));
+                } else {
+                    w.subscription_store.subscribe(SubscribedChannel {
+                        id: channel.id.clone(),
+                        name: channel.name.clone(),
+                        handle: channel.handle.clone(),
+                        avatar_url: channel.avatar_url.clone(),
+                    });
+                    w.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Subscribed to {}",
+                        if channel.name.is_empty() { "channel" } else { channel.name.as_str() }
+                    )));
+                }
+                if *w.active_view.borrow() == ActiveView::Subscriptions {
+                    w.load_subscriptions();
+                }
+                !subscribed
+            });
+
         let weak = Rc::downgrade(self);
         let on_playlists_changed: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(w) = weak.upgrade() {
@@ -3272,6 +3312,8 @@ impl MainWindow {
             on_toggle_watch_later,
             on_download,
             on_open_channel,
+            is_subscribed,
+            on_toggle_subscription,
             on_playlists_changed,
             on_toast,
         }
@@ -5791,6 +5833,11 @@ impl MainWindow {
                     &summary.channel_avatar_url,
                     &card.avatar,
                 );
+            }
+            for (channel_id, avatar_url, avatar) in &card.extra_channel_avatars {
+                if !avatar_url.is_empty() {
+                    self.bind_home_avatar(channel_id, avatar_url, avatar);
+                }
             }
         }
 

@@ -235,6 +235,7 @@ mod tests {
             is_short: false,
             thumbnail_url: String::new(),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         }
     }
 

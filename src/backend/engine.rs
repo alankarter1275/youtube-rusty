@@ -1,8 +1,7 @@
 use super::models::{
     format_count, format_duration, format_relative_published_text, relative_published_timestamp,
-    ChannelDetails, ChannelSearchSummary,
-    ChannelSortOrder, DurationFilter, PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab,
-    UploadDateFilter, VideoSummary,
+    ChannelDetails, ChannelSearchSummary, ChannelSortOrder, DurationFilter, PlaylistSearchSummary,
+    SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoCollaborator, VideoSummary,
 };
 use super::subscriptions::SubscribedChannel;
 use crate::player::mpv::{Quality, ResolvedPlayback};
@@ -1781,6 +1780,7 @@ impl Engine {
                     is_short: false,
                     thumbnail_url: thumb,
                     description_snippet: String::new(),
+            collaborators: Vec::new(),
                 });
             }
         }
@@ -1808,6 +1808,7 @@ impl Engine {
             is_short: false,
             thumbnail_url: format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         })
     }
 
@@ -4022,6 +4023,7 @@ fn parse_short_lockup_item(
         is_short: true,
         thumbnail_url,
         description_snippet: String::new(),
+            collaborators: Vec::new(),
     })
 }
 
@@ -4075,6 +4077,7 @@ fn parse_reel_item(
         is_short: true,
         thumbnail_url,
         description_snippet: String::new(),
+            collaborators: Vec::new(),
     })
 }
 
@@ -4426,6 +4429,7 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoSummary> {
         is_short,
         thumbnail_url,
         description_snippet: String::new(),
+            collaborators: Vec::new(),
     })
 }
 
@@ -4439,18 +4443,31 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
         .get("ownerText")
         .or_else(|| vr.get("longBylineText"))
         .or_else(|| vr.get("shortBylineText"));
-    let channel_name = extract_yt_text(byline).unwrap_or_default();
-    let channel_id = byline
+    let mut channel_name = extract_yt_text(byline).unwrap_or_default();
+    let mut channel_id = byline
         .and_then(|b| b.pointer("/runs/0/navigationEndpoint/browseEndpoint/browseId"))
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let channel_avatar_url = pick_json_sources_url(
+    let mut channel_avatar_url = pick_json_sources_url(
         vr.pointer("/channelThumbnailSupportedRenderers/channelThumbnailWithLinkRenderer/thumbnail/thumbnails")
             .and_then(|v| v.as_array()),
         64,
     )
     .unwrap_or_default();
+
+    let collaborators = parse_video_collaborators(vr);
+    if let Some(primary) = collaborators.first() {
+        if !primary.id.is_empty() {
+            channel_id = primary.id.clone();
+        }
+        if !primary.name.is_empty() {
+            channel_name = primary.name.clone();
+        }
+        if !primary.avatar_url.is_empty() {
+            channel_avatar_url = primary.avatar_url.clone();
+        }
+    }
 
     let mut duration_text = extract_yt_text(vr.get("lengthText")).unwrap_or_default();
     let mut is_short = vr
@@ -4528,6 +4545,7 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
         is_short,
         thumbnail_url,
         description_snippet,
+        collaborators,
     })
 }
 
@@ -4821,6 +4839,88 @@ fn shuffle_videos_seeded(items: &mut [VideoSummary], mut state: u64) {
     }
 }
 
+fn parse_video_collaborators(lockup: &Value) -> Vec<VideoCollaborator> {
+    let items = lockup
+        .pointer("/metadata/lockupMetadataViewModel/image/avatarStackViewModel/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
+        .or_else(|| {
+            lockup.pointer("/avatarStackViewModel/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
+        })
+        .or_else(|| {
+            lockup.pointer("/metadata/avatarStackViewModel/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
+        })
+        .and_then(Value::as_array);
+    let Some(items) = items else {
+        return Vec::new();
+    };
+
+    let mut collaborators = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for item in items {
+        let Some(view) = item.get("listItemViewModel") else {
+            continue;
+        };
+        let name = extract_yt_text(view.get("title")).unwrap_or_default();
+        let browse_id = view
+            .pointer("/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let id = if !browse_id.is_empty() {
+            browse_id
+        } else {
+            view.pointer("/rendererContext/commandContext/onTap/innertubeCommand/commandMetadata/webCommandMetadata/url")
+                .and_then(Value::as_str)
+                .and_then(|url| url.strip_prefix("/channel/"))
+                .unwrap_or_default()
+                .to_string()
+        };
+        if name.is_empty() && id.is_empty() {
+            continue;
+        }
+        if !id.is_empty() && !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let subtitle = extract_yt_text(view.get("subtitle")).unwrap_or_default();
+        let subtitle: String = subtitle
+            .chars()
+            .filter(|ch| !matches!(*ch, '\u{200e}' | '\u{200f}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{2069}'))
+            .collect();
+        let metadata_parts: Vec<&str> = subtitle
+            .split(['•', '·'])
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        let handle = metadata_parts
+            .iter()
+            .find(|part| part.starts_with('@'))
+            .copied()
+            .unwrap_or_default()
+            .to_string();
+        let subscriber_count_text = metadata_parts
+            .iter()
+            .find(|part| part.to_ascii_lowercase().contains("subscriber"))
+            .copied()
+            .unwrap_or_default()
+            .to_string();
+        let avatar_url = pick_json_sources_url(
+            view.pointer("/leadingAccessory/avatarViewModel/image/sources")
+                .and_then(Value::as_array),
+            48,
+        )
+        .unwrap_or_default();
+
+        collaborators.push(VideoCollaborator {
+            id,
+            name,
+            handle,
+            subscriber_count_text,
+            avatar_url,
+        });
+    }
+    collaborators
+}
+
 fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
     let content_type = lockup
         .get("contentType")
@@ -4906,6 +5006,7 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
     }
     let duration_seconds = parse_mmss_to_seconds(&duration_text);
 
+    let collaborators = parse_video_collaborators(lockup);
     let mut channel_name = String::new();
     let mut channel_id = lockup
         .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
@@ -4913,13 +5014,24 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
         .filter(|s| s.starts_with("UC"))
         .unwrap_or_default()
         .to_string();
-    let channel_avatar_url = pick_json_sources_url(
+    let mut channel_avatar_url = pick_json_sources_url(
         lockup
             .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/avatar/avatarViewModel/image/sources")
             .and_then(|v| v.as_array()),
         64,
     )
     .unwrap_or_default();
+    if let Some(primary) = collaborators.first() {
+        if !primary.id.is_empty() {
+            channel_id = primary.id.clone();
+        }
+        if !primary.name.is_empty() {
+            channel_name = primary.name.clone();
+        }
+        if !primary.avatar_url.is_empty() {
+            channel_avatar_url = primary.avatar_url.clone();
+        }
+    }
 
     let mut view_count_text = String::new();
     let mut published_text = String::new();
@@ -5002,6 +5114,7 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
         is_short,
         thumbnail_url,
         description_snippet: String::new(),
+        collaborators,
     })
 }
 
@@ -5038,6 +5151,9 @@ fn fill_missing_channel_metadata(target: &mut [VideoSummary], source: &[VideoSum
         }
         if video.published_text.is_empty() {
             video.published_text = details.published_text.clone();
+        }
+        if video.collaborators.is_empty() && !details.collaborators.is_empty() {
+            video.collaborators = details.collaborators.clone();
         }
     }
 }
@@ -5861,6 +5977,7 @@ fn map_video_item(
         is_short,
         thumbnail_url,
         description_snippet,
+        collaborators: Vec::new(),
     }
 }
 
@@ -5884,6 +6001,7 @@ mod tests {
             is_short: false,
             thumbnail_url: String::new(),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         }
     }
 
@@ -5897,6 +6015,89 @@ mod tests {
         let parsed = parse_video_renderer_json(&renderer).unwrap();
         assert_eq!(parsed.duration_seconds, Some(754));
         assert_eq!(parsed.duration_text, "12:34");
+    }
+
+    #[test]
+    fn test_video_lockup_parses_all_collaboration_channels() {
+        let collaborator = |id: &str, name: &str, handle: &str, subs: &str, avatar: &str| {
+            json!({
+                "listItemViewModel": {
+                    "title": { "content": name },
+                    "subtitle": { "content": format!("\u{200e}\u{2068}{handle}\u{2069} • \u{2068}{subs}\u{2069}") },
+                    "leadingAccessory": {
+                        "avatarViewModel": {
+                            "image": { "sources": [{ "url": avatar, "width": 68, "height": 68 }] }
+                        }
+                    },
+                    "rendererContext": {
+                        "commandContext": {
+                            "onTap": {
+                                "innertubeCommand": {
+                                    "browseEndpoint": { "browseId": id }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let lockup = json!({
+            "contentId": "abc123XYZ89",
+            "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+            "metadata": {
+                "lockupMetadataViewModel": {
+                    "title": { "content": "A collaboration video" },
+                    "image": {
+                        "avatarStackViewModel": {
+                            "rendererContext": {
+                                "commandContext": {
+                                    "onTap": {
+                                        "innertubeCommand": {
+                                            "showDialogCommand": {
+                                                "panelLoadingStrategy": {
+                                                    "inlineContent": {
+                                                        "dialogViewModel": {
+                                                            "customContent": {
+                                                                "listViewModel": {
+                                                                    "listItems": [
+                                                                        collaborator("UC-one", "Channel One", "@one", "1.2M subscribers", "https://img/one.jpg"),
+                                                                        collaborator("UC-two", "Channel Two", "@two", "345K subscribers", "https://img/two.jpg"),
+                                                                        collaborator("UC-three", "Channel Three", "@three", "89K subscribers", "https://img/three.jpg")
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "metadata": {
+                        "contentMetadataViewModel": {
+                            "metadataRows": [{
+                                "metadataParts": [
+                                    { "text": { "content": "Channel One" } },
+                                    { "text": { "content": "and 2 more" } }
+                                ]
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_video_lockup_json(&lockup).unwrap();
+        assert_eq!(parsed.collaborators.len(), 3);
+        assert_eq!(parsed.channel_id, "UC-one");
+        assert_eq!(parsed.channel_name, "Channel One");
+        assert_eq!(parsed.channel_avatar_url, "https://img/one.jpg");
+        assert_eq!(parsed.collaborators[1].handle, "@two");
+        assert_eq!(parsed.collaborators[1].subscriber_count_text, "345K subscribers");
+        assert_eq!(parsed.channel_byline().as_deref(), Some("Channel One and 2 more"));
     }
 
     #[test]
