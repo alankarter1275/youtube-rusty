@@ -262,6 +262,8 @@ impl MainWindow {
         let menu_btn = MenuButton::new();
         menu_btn.set_child(Some(&make_icon(KalamIcon::Menu, 22)));
         menu_btn.set_tooltip_text(Some("Main menu"));
+        menu_btn.set_has_frame(false);
+        menu_btn.set_size_request(44, 44);
         menu_btn.add_css_class("yr-rail-btn");
         set_pointer(&menu_btn);
 

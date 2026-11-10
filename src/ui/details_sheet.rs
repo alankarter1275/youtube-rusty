@@ -142,8 +142,6 @@ impl DetailsSheet {
         }
 
         let stats_text = [
-            (!summary.is_short && !summary.duration_text.is_empty())
-                .then_some(summary.duration_text.as_str()),
             (!summary.view_count_text.is_empty()).then_some(summary.view_count_text.as_str()),
             (!summary.published_text.is_empty()).then_some(summary.published_text.as_str()),
         ]
@@ -373,25 +371,30 @@ impl DetailsSheet {
         });
 
         // AdwDialog does not dismiss on outside clicks by default. Observe clicks in the
-        // capture phase and close only when the click lands outside the presented dialog.
+        // capture phase and compare against the actual content card, not the full-screen dialog
+        // host/backdrop, so clicks on the dimmed area dismiss while dialog controls remain usable.
         let parent_widget = parent.upcast_ref::<gtk4::Widget>().clone();
+        let content_widget = content_box.upcast_ref::<gtk4::Widget>().clone();
         let outside_click = GestureClick::new();
         outside_click.set_button(1);
         outside_click.set_propagation_phase(PropagationPhase::Capture);
         let dialog_weak = dialog.downgrade();
         let parent_weak = parent_widget.downgrade();
+        let content_weak = content_widget.downgrade();
         outside_click.connect_pressed(move |gesture, _, x, y| {
-            let (Some(dialog), Some(parent)) = (dialog_weak.upgrade(), parent_weak.upgrade()) else {
+            let (Some(dialog), Some(parent), Some(content)) = (
+                dialog_weak.upgrade(),
+                parent_weak.upgrade(),
+                content_weak.upgrade(),
+            ) else {
                 return;
             };
 
-            // Pick the widget under the click rather than relying only on coordinate bounds:
-            // AdwDialog can be hosted in an internal overlay, where its bounds aren't always
-            // expressed in the same coordinate space as the parent window.
-            let dialog_widget = dialog.upcast_ref::<gtk4::Widget>();
+            // The dialog widget may cover the whole overlay. Use its content card to distinguish
+            // clicks inside from clicks on the backdrop; pick also handles child popovers/buttons.
             let inside = if let Some(picked) = parent.pick(x, y, gtk4::PickFlags::DEFAULT) {
-                picked == *dialog_widget || picked.is_ancestor(dialog_widget)
-            } else if let Some(bounds) = dialog.compute_bounds(&parent) {
+                picked == *content || picked.is_ancestor(&content)
+            } else if let Some(bounds) = content.compute_bounds(&parent) {
                 let left = bounds.x() as f64;
                 let top = bounds.y() as f64;
                 x >= left
