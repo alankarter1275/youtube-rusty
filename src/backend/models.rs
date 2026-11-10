@@ -114,6 +114,70 @@ pub enum SearchSortOrder {
     ViewCount,
 }
 
+/// Convert YouTube's relative upload labels (for example, "2 weeks ago") into an
+/// approximate Unix timestamp. Exact timestamps from RustyPipe take precedence; this fallback
+/// keeps sorting and date filters useful for browse renderers that only expose relative text.
+pub fn relative_published_timestamp(text: &str, now_unix: i64) -> Option<i64> {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if lower.contains("just now") || lower.contains("moments ago") {
+        return Some(now_unix);
+    }
+    if lower.contains("yesterday") {
+        return Some(now_unix.saturating_sub(86_400));
+    }
+
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect();
+    for pair in words.windows(2) {
+        let Ok(amount) = pair[0].parse::<i64>() else {
+            continue;
+        };
+        let unit_secs = match pair[1].trim_end_matches('s') {
+            "second" | "sec" => 1,
+            "minute" | "min" => 60,
+            "hour" | "hr" => 3_600,
+            "day" => 86_400,
+            "week" => 7 * 86_400,
+            "month" => 30 * 86_400,
+            "year" => 365 * 86_400,
+            _ => continue,
+        };
+        return Some(now_unix.saturating_sub(amount.saturating_mul(unit_secs)));
+    }
+    None
+}
+
+pub fn effective_published_timestamp(video: &VideoSummary, now_unix: i64) -> Option<i64> {
+    video.published_unix.or_else(|| {
+        relative_published_timestamp(&video.published_text, now_unix)
+    })
+}
+
+pub fn format_relative_published_text(published_unix: i64, now_unix: i64) -> String {
+    let age = now_unix.saturating_sub(published_unix).max(0) as u64;
+    let (count, unit) = if age < 60 {
+        (age, "second")
+    } else if age < 3_600 {
+        (age / 60, "minute")
+    } else if age < 86_400 {
+        (age / 3_600, "hour")
+    } else if age < 14 * 86_400 {
+        (age / 86_400, "day")
+    } else if age < 60 * 86_400 {
+        (age / (7 * 86_400), "week")
+    } else if age < 365 * 86_400 {
+        (age / (30 * 86_400), "month")
+    } else {
+        (age / (365 * 86_400), "year")
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
+
 pub fn format_duration(secs: u64) -> String {
     let hours = secs / 3600;
     let mins = (secs % 3600) / 60;
@@ -175,12 +239,11 @@ pub fn matches_local_filters(
 ) -> bool {
     let dur_ok = match dur_filter {
         DurationFilter::AnyLength => true,
-        DurationFilter::Under4Min => video.duration_seconds.map(|d| d < 240).unwrap_or(false),
-        DurationFilter::FourTo20Min => video
-            .duration_seconds
+        DurationFilter::Under4Min => video_duration_seconds(video).map(|d| d < 240).unwrap_or(false),
+        DurationFilter::FourTo20Min => video_duration_seconds(video)
             .map(|d| (240..=1200).contains(&d))
             .unwrap_or(false),
-        DurationFilter::Over20Min => video.duration_seconds.map(|d| d > 1200).unwrap_or(false),
+        DurationFilter::Over20Min => video_duration_seconds(video).map(|d| d > 1200).unwrap_or(false),
     };
     if !dur_ok {
         return false;
@@ -202,13 +265,32 @@ pub fn matches_local_filters(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
-            if let Some(ts) = video.published_unix {
-                now.saturating_sub(ts) <= max_age_secs
+            let timestamp = effective_published_timestamp(video, now);
+            if let Some(ts) = timestamp {
+                let age = now.saturating_sub(ts);
+                (0..=max_age_secs).contains(&age)
             } else {
                 matches_published_text_heuristic(&video.published_text, date_filter)
             }
         }
     }
+}
+
+fn video_duration_seconds(video: &VideoSummary) -> Option<u64> {
+    video.duration_seconds.or_else(|| {
+        if video.is_short {
+            return None;
+        }
+        let parts: Vec<&str> = video.duration_text.trim().split(':').collect();
+        match parts.as_slice() {
+            [minutes, seconds] => Some(minutes.parse::<u64>().ok()?.saturating_mul(60)
+                .saturating_add(seconds.parse::<u64>().ok()?)),
+            [hours, minutes, seconds] => Some(hours.parse::<u64>().ok()?.saturating_mul(3_600)
+                .saturating_add(minutes.parse::<u64>().ok()?.saturating_mul(60))
+                .saturating_add(seconds.parse::<u64>().ok()?)),
+            _ => None,
+        }
+    })
 }
 
 fn matches_published_text_heuristic(text: &str, filter: UploadDateFilter) -> bool {
@@ -296,6 +378,61 @@ mod tests {
             &video,
             UploadDateFilter::Today,
             DurationFilter::AnyLength
+        ));
+
+        let mut recent = video.clone();
+        recent.published_text = "2 days ago".to_string();
+        assert!(matches_local_filters(
+            &recent,
+            UploadDateFilter::ThisWeek,
+            DurationFilter::AnyLength
+        ));
+        assert!(!matches_local_filters(
+            &recent,
+            UploadDateFilter::Today,
+            DurationFilter::AnyLength
+        ));
+    }
+
+    #[test]
+    fn test_relative_upload_time_parsing() {
+        let now = 1_800_000_000;
+        assert_eq!(relative_published_timestamp("2 days ago", now), Some(now - 172_800));
+        assert_eq!(relative_published_timestamp("Streamed 3 weeks ago", now), Some(now - 1_814_400));
+        assert_eq!(relative_published_timestamp("yesterday", now), Some(now - 86_400));
+        assert_eq!(relative_published_timestamp("unknown", now), None);
+        assert_eq!(format_relative_published_text(now - 86_400, now), "1 day ago");
+        assert_eq!(format_relative_published_text(now - 3_600, now), "1 hour ago");
+    }
+
+    #[test]
+    fn test_duration_filter_uses_text_when_seconds_are_missing() {
+        let mut video = VideoSummary {
+            id: "test".to_string(),
+            title: "test".to_string(),
+            channel_id: String::new(),
+            channel_name: String::new(),
+            channel_avatar_url: String::new(),
+            duration_seconds: None,
+            duration_text: "3:59".to_string(),
+            view_count_text: String::new(),
+            view_count: None,
+            published_text: String::new(),
+            published_unix: None,
+            is_short: false,
+            thumbnail_url: String::new(),
+            description_snippet: String::new(),
+        };
+        assert!(matches_local_filters(
+            &video,
+            UploadDateFilter::AnyTime,
+            DurationFilter::Under4Min
+        ));
+        video.is_short = true;
+        assert!(!matches_local_filters(
+            &video,
+            UploadDateFilter::AnyTime,
+            DurationFilter::Under4Min
         ));
     }
 

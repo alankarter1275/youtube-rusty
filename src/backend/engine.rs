@@ -1,6 +1,7 @@
 use super::models::{
-    format_count, format_duration, ChannelDetails, ChannelSearchSummary, ChannelSortOrder, DurationFilter,
-    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab,
+    format_count, format_duration, format_relative_published_text, relative_published_timestamp,
+    ChannelDetails, ChannelSearchSummary,
+    ChannelSortOrder, DurationFilter, PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab,
     UploadDateFilter, VideoSummary,
 };
 use super::subscriptions::SubscribedChannel;
@@ -2054,12 +2055,32 @@ impl Engine {
             avatar_url: &d.avatar_url,
         });
 
-        let items = paginator
+        let mut items: Vec<VideoSummary> = paginator
             .items
             .into_iter()
             .filter(|it| !filter_out_shorts || !it.is_short)
             .map(|it| map_video_item(it, fallback.as_ref(), force_short))
             .collect();
+
+        // Channel continuation pages can use the same newer renderers that omit metadata.
+        // Fill gaps from the WEB continuation response only for channel pages, not general feeds.
+        if !force_short
+            && fallback_details.is_some()
+            && items.iter().any(|item| {
+                !item.is_short
+                    && (item.duration_seconds.is_none()
+                        || item.duration_text.is_empty()
+                        || (item.published_unix.is_none() && item.published_text.is_empty()))
+            })
+        {
+            if let Ok(raw) = self
+                .fetch_channel_browse_json("", None, Some(&cursor.ctoken))
+                .await
+            {
+                let direct_page = parse_home_feed_response(&raw);
+                fill_missing_channel_metadata(&mut items, &direct_page.items);
+            }
+        }
 
         Ok(PagedVideos { items, next })
     }
@@ -2319,18 +2340,21 @@ impl Engine {
             .map(|it| map_video_item(it, Some(&fallback), false))
             .collect();
 
-        // RustyPipe's channel mapper can omit duration metadata for newer renderer variants.
-        // Only on that partial-data path, consult the WEB browse response's lengthText overlay.
-        if items
-            .iter()
-            .any(|item| !item.is_short && (item.duration_seconds.is_none() || item.duration_text.is_empty()))
+        // RustyPipe can omit duration or upload-date fields for newer renderer variants.
+        // On that partial-data path, consult the WEB browse response for matching metadata.
+        if items.iter().any(|item| {
+            !item.is_short
+                && (item.duration_seconds.is_none()
+                    || item.duration_text.is_empty()
+                    || (item.published_unix.is_none() && item.published_text.is_empty()))
+        })
         {
             if let Ok(raw) = self
                 .fetch_channel_browse_json(channel_id, Some("EgZ2aWRlb3PyBgQKAjoA"), None)
                 .await
             {
                 let direct_page = parse_home_feed_response(&raw);
-                fill_missing_video_durations(&mut items, &direct_page.items);
+                fill_missing_channel_metadata(&mut items, &direct_page.items);
             }
         }
 
@@ -2470,6 +2494,26 @@ impl Engine {
             }
             let (_, paged) = self.channel_videos(channel_id).await?;
             return Ok(paged);
+        }
+
+        // The Shorts browse endpoint exposes sort chips as continuation tokens. RustyPipe's
+        // tab-order request can return the default order for Oldest on this tab, so prefer the
+        // explicit YouTube chip when it is available.
+        if is_shorts && order == ChannelSortOrder::Oldest {
+            if let Ok(raw) = self
+                .fetch_channel_browse_json(
+                    channel_id,
+                    Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
+                    None,
+                )
+                .await
+            {
+                if let Some(token) = extract_channel_sort_chip_token(&raw, "oldest") {
+                    return self
+                        .continue_channel_shorts_direct(&token, fallback_details)
+                        .await;
+                }
+            }
         }
 
         let tab = if is_shorts {
@@ -3937,6 +3981,8 @@ fn parse_short_lockup_item(
     })
     .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
 
+    let published_text = find_published_label(lockup).unwrap_or_default();
+    let published_unix = inferred_publish_timestamp(&published_text);
     Some(VideoSummary {
         id: vid.to_string(),
         title,
@@ -3947,12 +3993,12 @@ fn parse_short_lockup_item(
             .to_string(),
         channel_name: fallback.map(|f| f.name).unwrap_or("").to_string(),
         channel_avatar_url: fallback.map(|f| f.avatar_url).unwrap_or("").to_string(),
-        duration_seconds: Some(60),
+        duration_seconds: None,
         duration_text: "SHORTS".to_string(),
         view_count_text,
         view_count,
-        published_text: String::new(),
-        published_unix: None,
+        published_text,
+        published_unix,
         is_short: true,
         thumbnail_url,
         description_snippet: String::new(),
@@ -3988,6 +4034,8 @@ fn parse_reel_item(
     )
     .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
 
+    let published_text = find_published_label(reel).unwrap_or_default();
+    let published_unix = inferred_publish_timestamp(&published_text);
     Some(VideoSummary {
         id: vid.to_string(),
         title,
@@ -3998,12 +4046,12 @@ fn parse_reel_item(
             .to_string(),
         channel_name: fallback.map(|f| f.name).unwrap_or("").to_string(),
         channel_avatar_url: fallback.map(|f| f.avatar_url).unwrap_or("").to_string(),
-        duration_seconds: Some(60),
+        duration_seconds: None,
         duration_text: "SHORTS".to_string(),
         view_count_text,
         view_count,
-        published_text: String::new(),
-        published_unix: None,
+        published_text,
+        published_unix,
         is_short: true,
         thumbnail_url,
         description_snippet: String::new(),
@@ -4151,6 +4199,85 @@ fn parse_shorts_browse_response(
     PagedVideos { items, next }
 }
 
+fn inferred_publish_timestamp(text: &str) -> Option<i64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    relative_published_timestamp(text, now)
+}
+
+fn extract_channel_sort_chip_token(node: &Value, wanted_label: &str) -> Option<String> {
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| extract_channel_sort_chip_token(item, wanted_label)),
+        Value::Object(map) => {
+            if let Some(chip) = map.get("chipCloudChipRenderer") {
+                let label = extract_yt_text(chip.get("text")).unwrap_or_default();
+                if label.trim().eq_ignore_ascii_case(wanted_label) {
+                    if let Some(endpoint) = chip.get("navigationEndpoint") {
+                        if let Some(token) = endpoint
+                            .pointer("/continuationCommand/token")
+                            .or_else(|| endpoint.pointer("/continuationEndpoint/continuationCommand/token"))
+                            .and_then(Value::as_str)
+                            .filter(|token| !token.is_empty())
+                        {
+                            return Some(token.to_string());
+                        }
+                        if let Some(commands) = endpoint
+                            .pointer("/commandExecutorCommand/commands")
+                            .and_then(Value::as_array)
+                        {
+                            for command in commands {
+                                if let Some(token) = command
+                                    .pointer("/continuationCommand/token")
+                                    .and_then(Value::as_str)
+                                    .filter(|token| !token.is_empty())
+                                {
+                                    return Some(token.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            map.values()
+                .find_map(|value| extract_channel_sort_chip_token(value, wanted_label))
+        }
+        _ => None,
+    }
+}
+
+fn find_published_label(node: &Value) -> Option<String> {
+    match node {
+        Value::Array(items) => items.iter().find_map(find_published_label),
+        Value::Object(map) => {
+            const DATE_KEYS: &[&str] = &[
+                "publishedTimeText",
+                "publishedText",
+                "publishDateText",
+                "videoPublishedAt",
+                "timestampText",
+            ];
+            for key in DATE_KEYS {
+                if let Some(text) = map.get(*key).and_then(|value| extract_yt_text(Some(value))) {
+                    return Some(text);
+                }
+            }
+            map.values().find_map(find_published_label)
+        }
+        Value::String(text) => {
+            let lower = text.to_ascii_lowercase();
+            [" ago", "streamed", "premiered", "yesterday", "today"]
+                .iter()
+                .any(|needle| lower.contains(needle))
+                .then(|| text.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
 fn extract_yt_text(node: Option<&Value>) -> Option<String> {
     let v = node?;
     if let Some(s) = v.as_str() {
@@ -4273,8 +4400,8 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoSummary> {
         duration_text,
         view_count_text,
         view_count,
+        published_unix: inferred_publish_timestamp(&published_text),
         published_text,
-        published_unix: None,
         is_short,
         thumbnail_url,
         description_snippet: String::new(),
@@ -4375,8 +4502,8 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
         duration_text,
         view_count_text,
         view_count,
+        published_unix: inferred_publish_timestamp(&published_text),
         published_text,
-        published_unix: None,
         is_short,
         thumbnail_url,
         description_snippet,
@@ -4849,23 +4976,20 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
         duration_text,
         view_count_text,
         view_count,
+        published_unix: inferred_publish_timestamp(&published_text),
         published_text,
-        published_unix: None,
         is_short,
         thumbnail_url,
         description_snippet: String::new(),
     })
 }
 
-fn fill_missing_video_durations(target: &mut [VideoSummary], source: &[VideoSummary]) {
+fn fill_missing_channel_metadata(target: &mut [VideoSummary], source: &[VideoSummary]) {
     let by_id: HashMap<&str, &VideoSummary> = source
         .iter()
         .map(|video| (video.id.as_str(), video))
         .collect();
     for video in target {
-        if video.duration_seconds.is_some() && !video.duration_text.is_empty() {
-            continue;
-        }
         let Some(details) = by_id.get(video.id.as_str()) else {
             continue;
         };
@@ -4881,6 +5005,18 @@ fn fill_missing_video_durations(target: &mut [VideoSummary], source: &[VideoSumm
                     .map(format_duration)
                     .unwrap_or_default()
             };
+        }
+        if video.view_count.is_none() {
+            video.view_count = details.view_count;
+        }
+        if video.view_count_text.is_empty() {
+            video.view_count_text = details.view_count_text.clone();
+        }
+        if video.published_unix.is_none() {
+            video.published_unix = details.published_unix;
+        }
+        if video.published_text.is_empty() {
+            video.published_text = details.published_text.clone();
         }
     }
 }
@@ -5673,8 +5809,20 @@ fn map_video_item(
     }
 
     let description_snippet = item.short_description.unwrap_or_default();
-    let published_text = item.publish_date_txt.unwrap_or_default();
-    let published_unix = item.publish_date.map(|dt| dt.unix_timestamp());
+    let mut published_text = item.publish_date_txt.unwrap_or_default();
+    let published_unix = item
+        .publish_date
+        .map(|dt| dt.unix_timestamp())
+        .or_else(|| inferred_publish_timestamp(&published_text));
+    if published_text.is_empty() {
+        if let Some(timestamp) = published_unix {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(timestamp);
+            published_text = format_relative_published_text(timestamp, now);
+        }
+    }
     let is_short = force_short || item.is_short;
 
     VideoSummary {
@@ -5740,7 +5888,7 @@ mod tests {
             duration_test_video("missing", Some(754), "12:34"),
             duration_test_video("known", Some(99), "1:39"),
         ];
-        fill_missing_video_durations(&mut from_rustypipe, &direct);
+        fill_missing_channel_metadata(&mut from_rustypipe, &direct);
         assert_eq!(from_rustypipe[0].duration_seconds, Some(754));
         assert_eq!(from_rustypipe[0].duration_text, "12:34");
         assert_eq!(from_rustypipe[1].duration_seconds, Some(60));
@@ -6570,5 +6718,26 @@ https://manifest.example/v1080_video.m3u8
             synth_vd.starts_with("Cg") && synth_vd.len() > 23,
             "unexpected visitor_data format: {synth_vd}"
         );
+    }
+
+    #[test]
+    fn test_channel_oldest_chip_token_extraction() {
+        let response = json!({
+            "header": {
+                "chipCloudRenderer": {
+                    "chips": [
+                        { "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Latest" },
+                            "navigationEndpoint": { "continuationCommand": { "token": "LATEST" } }
+                        }},
+                        { "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Oldest" },
+                            "navigationEndpoint": { "continuationCommand": { "token": "OLDEST" } }
+                        }}
+                    ]
+                }
+            }
+        });
+        assert_eq!(extract_channel_sort_chip_token(&response, "oldest"), Some("OLDEST".into()));
     }
 }

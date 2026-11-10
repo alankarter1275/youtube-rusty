@@ -89,7 +89,11 @@ impl VideoCard {
         title_label.set_xalign(0.0);
         title_label.add_css_class("yr-title");
 
-        let meta_text = join_non_empty(&[&summary.channel_name, &summary.view_count_text]);
+        let meta_text = join_non_empty(&[
+            &summary.channel_name,
+            &summary.view_count_text,
+            &summary.published_text,
+        ]);
         let meta_label = Label::new(Some(&meta_text));
         meta_label.set_halign(Align::Start);
         meta_label.set_xalign(0.0);
@@ -607,7 +611,8 @@ impl VideoCard {
         title_label.set_xalign(0.0);
         title_label.add_css_class("yr-title");
 
-        let views_label = Label::new(Some(&summary.view_count_text));
+        let stats_text = join_non_empty(&[&summary.view_count_text, &summary.published_text]);
+        let views_label = Label::new(Some(&stats_text));
         views_label.set_halign(Align::Start);
         views_label.set_xalign(0.0);
         views_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -641,7 +646,7 @@ impl VideoCard {
             None
         };
 
-        if !summary.view_count_text.is_empty() {
+        if !stats_text.is_empty() {
             root_box.append(&views_label);
         }
 

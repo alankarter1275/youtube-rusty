@@ -5,8 +5,8 @@ use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::image_loader::ImageLoader;
 use adw::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Entry, GestureClick, Label, Orientation, Overflow, Overlay,
-    Picture, Popover, ScrolledWindow, Separator, ToggleButton,
+    Align, Box as GtkBox, Button, Entry, EventSequenceState, GestureClick, Label, Orientation,
+    Overflow, Overlay, Picture, Popover, PropagationPhase, ScrolledWindow, Separator, ToggleButton,
 };
 use libadwaita as adw;
 use std::rc::Rc;
@@ -42,6 +42,7 @@ impl DetailsSheet {
             .title(&summary.title)
             .build();
         dialog.add_css_class("yr-sheet");
+        dialog.set_can_close(true);
 
         let content_box = GtkBox::new(Orientation::Vertical, 14);
         content_box.set_margin_top(16);
@@ -140,15 +141,16 @@ impl DetailsSheet {
             channel_info.append(&channel_name);
         }
 
-        let stats_text = match (
-            summary.view_count_text.is_empty(),
-            summary.published_text.is_empty(),
-        ) {
-            (false, false) => format!("{} · {}", summary.view_count_text, summary.published_text),
-            (false, true) => summary.view_count_text.clone(),
-            (true, false) => summary.published_text.clone(),
-            (true, true) => String::new(),
-        };
+        let stats_text = [
+            (!summary.is_short && !summary.duration_text.is_empty())
+                .then_some(summary.duration_text.as_str()),
+            (!summary.view_count_text.is_empty()).then_some(summary.view_count_text.as_str()),
+            (!summary.published_text.is_empty()).then_some(summary.published_text.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
         if !stats_text.is_empty() {
             let stats_label = Label::new(Some(&stats_text));
             stats_label.add_css_class("yr-meta");
@@ -370,6 +372,39 @@ impl DetailsSheet {
             on_dl(sum_dl.clone(), q);
         });
 
+        // AdwDialog does not dismiss on outside clicks by default. Observe clicks in the
+        // capture phase and close only when the click lands outside the presented dialog.
+        let parent_widget = parent.upcast_ref::<gtk4::Widget>().clone();
+        let outside_click = GestureClick::new();
+        outside_click.set_button(1);
+        outside_click.set_propagation_phase(PropagationPhase::Capture);
+        let dialog_weak = dialog.downgrade();
+        let parent_weak = parent_widget.downgrade();
+        outside_click.connect_pressed(move |gesture, _, x, y| {
+            let (Some(dialog), Some(parent)) = (dialog_weak.upgrade(), parent_weak.upgrade()) else {
+                return;
+            };
+            let Some(bounds) = dialog.compute_bounds(&parent) else {
+                return;
+            };
+            let left = bounds.x() as f64;
+            let top = bounds.y() as f64;
+            let right = left + bounds.width() as f64;
+            let bottom = top + bounds.height() as f64;
+            let inside = x >= left && x <= right && y >= top && y <= bottom;
+            if !inside {
+                gesture.set_state(EventSequenceState::Claimed);
+                dialog.close();
+            }
+        });
+        parent_widget.add_controller(outside_click.clone());
+
+        let parent_weak = parent_widget.downgrade();
+        dialog.connect_closed(move |_| {
+            if let Some(parent) = parent_weak.upgrade() {
+                parent.remove_controller(&outside_click);
+            }
+        });
         dialog.present(Some(parent));
     }
 }

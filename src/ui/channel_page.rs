@@ -2,8 +2,8 @@ use crate::backend::engine::{
     ChannelHeaderStats, Engine, PageCursor, PagedPlaylists, PagedVideos,
 };
 use crate::backend::models::{
-    matches_local_filters, ChannelDetails, ChannelSortOrder, DurationFilter,
-    PlaylistSearchSummary, UploadDateFilter, VideoSummary,
+    effective_published_timestamp, matches_local_filters, ChannelDetails, ChannelSortOrder,
+    DurationFilter, PlaylistSearchSummary, UploadDateFilter, VideoSummary,
 };
 use crate::backend::subscriptions::{SubscribedChannel, SubscriptionStore};
 use crate::player::mpv::Quality;
@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 
 const VIRTUAL_WINDOW_ROWS: usize = 8;
@@ -79,6 +80,7 @@ pub struct ChannelPage {
     bottom_spacer: GtkBox,
     status_box: GtkBox,
     status_page: adw::StatusPage,
+    search_more_matches_btn: Button,
     active_tab: Cell<ChannelTab>,
     is_narrow: Cell<bool>,
     is_compact: Cell<bool>,
@@ -86,6 +88,7 @@ pub struct ChannelPage {
     shorts_cols: Cell<u32>,
     is_loading: Cell<bool>,
     is_loading_more: Cell<bool>,
+    filter_scan_pages: Cell<u8>,
     is_suspended: Cell<bool>,
     in_window_sync: Cell<bool>,
     playlists_loaded: Cell<bool>,
@@ -281,6 +284,13 @@ impl ChannelPage {
         status_box.set_valign(Align::Center);
         status_box.set_visible(false);
         status_box.append(&status_page);
+        let search_more_matches_btn = Button::with_label("Search more channel videos");
+        search_more_matches_btn.add_css_class("yr-chip");
+        search_more_matches_btn.add_css_class("active");
+        search_more_matches_btn.set_halign(Align::Center);
+        search_more_matches_btn.set_margin_top(12);
+        search_more_matches_btn.set_visible(false);
+        status_box.append(&search_more_matches_btn);
 
         let top_spacer = GtkBox::new(Orientation::Vertical, 0);
         top_spacer.set_hexpand(true);
@@ -363,6 +373,7 @@ impl ChannelPage {
             bottom_spacer,
             status_box,
             status_page,
+            search_more_matches_btn,
             active_tab: Cell::new(ChannelTab::Videos),
             is_narrow: Cell::new(narrow),
             is_compact: Cell::new(compact),
@@ -370,6 +381,7 @@ impl ChannelPage {
             shorts_cols: Cell::new(shorts_cols),
             is_loading: Cell::new(true),
             is_loading_more: Cell::new(false),
+            filter_scan_pages: Cell::new(0),
             is_suspended: Cell::new(false),
             in_window_sync: Cell::new(false),
             playlists_loaded: Cell::new(false),
@@ -410,6 +422,15 @@ impl ChannelPage {
         self.refresh_btn.connect_clicked(move |_| {
             if let Some(cp) = weak_refresh.upgrade() {
                 cp.reload();
+            }
+        });
+
+        let weak_more_matches = Rc::downgrade(self);
+        self.search_more_matches_btn.connect_clicked(move |_| {
+            if let Some(cp) = weak_more_matches.upgrade() {
+                cp.filter_scan_pages.set(0);
+                cp.search_more_matches_btn.set_visible(false);
+                cp.load_more_active_tab();
             }
         });
 
@@ -467,6 +488,7 @@ impl ChannelPage {
             if btn.is_active() {
                 if let Some(cp) = weak.upgrade() {
                     cp.active_tab.set(ChannelTab::Videos);
+                    cp.filter_scan_pages.set(0);
                     cp.play_all_btn.set_visible(false);
                     cp.filter_btn.set_visible(true);
                     cp.sort_btn.set_visible(true);
@@ -489,6 +511,11 @@ impl ChannelPage {
             if btn.is_active() {
                 if let Some(cp) = weak.upgrade() {
                     cp.active_tab.set(ChannelTab::Shorts);
+                    cp.filter_scan_pages.set(0);
+                    cp.duration_filter.set(DurationFilter::AnyLength);
+                    if cp.date_filter.get() == UploadDateFilter::AnyTime {
+                        cp.filter_btn.remove_css_class("active");
+                    }
                     cp.play_all_btn.set_visible(true);
                     cp.filter_btn.set_visible(true);
                     cp.sort_btn.set_visible(true);
@@ -817,6 +844,7 @@ impl ChannelPage {
                 pop.popdown();
             }
             if let Some(cp) = weak_reset.upgrade() {
+                cp.filter_scan_pages.set(0);
                 cp.date_filter.set(UploadDateFilter::AnyTime);
                 cp.duration_filter.set(DurationFilter::AnyLength);
                 cp.filter_btn.remove_css_class("active");
@@ -833,6 +861,7 @@ impl ChannelPage {
                 pop.popdown();
             }
             if let Some(cp) = weak_apply.upgrade() {
+                cp.filter_scan_pages.set(0);
                 let df = pd_apply.get();
                 let duf = pdur_apply.get();
                 cp.date_filter.set(df);
@@ -847,7 +876,31 @@ impl ChannelPage {
         });
 
         let pop_weak = popover.downgrade();
+        let weak_cp = Rc::downgrade(self);
+        let duration_header = h2.clone();
+        let duration_separator = sep.clone();
+        let duration_buttons = dur_buttons_rc.clone();
+        let pending_dur_open = pending_dur.clone();
         self.filter_btn.connect_clicked(move |_| {
+            if let Some(cp) = weak_cp.upgrade() {
+                let show_duration = cp.active_tab.get() != ChannelTab::Shorts;
+                duration_header.set_visible(show_duration);
+                duration_separator.set_visible(show_duration);
+                for (_, _, button) in duration_buttons.iter() {
+                    button.set_visible(show_duration);
+                }
+                if !show_duration {
+                    pending_dur_open.set(DurationFilter::AnyLength);
+                    for (value, label, button) in duration_buttons.iter() {
+                        let selected = *value == DurationFilter::AnyLength;
+                        set_pop_item_text(
+                            button,
+                            &if selected { format!("{label} ✓") } else { label.to_string() },
+                            selected,
+                        );
+                    }
+                }
+            }
             if let Some(pop) = pop_weak.upgrade() {
                 pop.popup();
             }
@@ -912,6 +965,7 @@ impl ChannelPage {
                 }
                 if let Some(cp) = weak_cp.upgrade() {
                     if cp.sort_order.get() != chosen {
+                        cp.filter_scan_pages.set(0);
                         cp.sort_order.set(chosen);
                         cp.sort_btn.set_label(chosen.button_label());
                         if cp.search_results.borrow().is_some() {
@@ -1208,6 +1262,15 @@ impl ChannelPage {
                 }
                 Err(err) => {
                     (cp.actions.on_toast)(err);
+                    let has_filter = cp.date_filter.get() != UploadDateFilter::AnyTime
+                        || cp.duration_filter.get() != DurationFilter::AnyLength;
+                    if has_filter && cp.search_results.borrow().is_none() {
+                        cp.show_status(
+                            "Could not check more videos",
+                            "The filter couldn’t load another page. You can retry or clear the filters.",
+                        );
+                        cp.search_more_matches_btn.set_visible(true);
+                    }
                 }
             }
         });
@@ -1620,6 +1683,7 @@ impl ChannelPage {
     }
 
     fn show_status(&self, title: &str, description: &str) {
+        self.search_more_matches_btn.set_visible(false);
         self.clear_selection();
         self.reset_spacers_and_window();
         while let Some(child) = self.flow_box.first_child() {
@@ -1641,22 +1705,27 @@ impl ChannelPage {
             }
         };
 
-        // Sort the loaded channel items locally. YouTube's channel-order continuation endpoint
-        // is intermittently rejected; local sorting keeps the controls functional without an
-        // error or an extra request, and newly loaded pages are re-sorted together.
+        // Re-sort all loaded pages together. Some renderer variants only provide relative
+        // upload text, so use its approximate timestamp when the exact timestamp is absent.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         match self.sort_order.get() {
             ChannelSortOrder::Newest => base.sort_by(|a, b| {
-                b.published_unix
-                    .unwrap_or(i64::MIN)
-                    .cmp(&a.published_unix.unwrap_or(i64::MIN))
+                compare_optional_timestamps_desc(
+                    effective_published_timestamp(a, now),
+                    effective_published_timestamp(b, now),
+                )
             }),
             ChannelSortOrder::Oldest => base.sort_by(|a, b| {
-                a.published_unix
-                    .unwrap_or(i64::MAX)
-                    .cmp(&b.published_unix.unwrap_or(i64::MAX))
+                compare_optional_timestamps(
+                    effective_published_timestamp(a, now),
+                    effective_published_timestamp(b, now),
+                )
             }),
             ChannelSortOrder::Popular => {
-                base.sort_by(|a, b| b.view_count.unwrap_or(0).cmp(&a.view_count.unwrap_or(0)))
+                base.sort_by(|a, b| b.view_count.cmp(&a.view_count))
             }
         }
 
@@ -1698,14 +1767,38 @@ impl ChannelPage {
 
         let items = self.filtered_active_items();
         if items.is_empty() {
-            let has_filter = self.date_filter.get() != UploadDateFilter::AnyTime
-                || self.duration_filter.get() != DurationFilter::AnyLength
-                || self.search_results.borrow().is_some();
+            let has_channel_filter = self.date_filter.get() != UploadDateFilter::AnyTime
+                || self.duration_filter.get() != DurationFilter::AnyLength;
+            let has_filter = has_channel_filter || self.search_results.borrow().is_some();
             if has_filter {
-                self.show_status(
-                    "No matching videos",
-                    "Try clearing your channel search or resetting filters.",
-                );
+                let can_scan_more = self.search_results.borrow().is_none()
+                    && match self.active_tab.get() {
+                        ChannelTab::Shorts => self.shorts_cursor.borrow().is_some(),
+                        ChannelTab::Videos => self.videos_cursor.borrow().is_some(),
+                        ChannelTab::Playlists => false,
+                    };
+                if has_channel_filter && can_scan_more && self.filter_scan_pages.get() < 4 {
+                    self.filter_scan_pages
+                        .set(self.filter_scan_pages.get().saturating_add(1));
+                    self.show_status(
+                        "Looking for matching videos",
+                        "Loading another page of channel videos…",
+                    );
+                    self.load_more_active_tab();
+                    return;
+                }
+                if has_channel_filter && can_scan_more {
+                    self.show_status(
+                        "No matches in the loaded videos",
+                        "You can check more of the channel or clear the filters.",
+                    );
+                    self.search_more_matches_btn.set_visible(true);
+                } else {
+                    self.show_status(
+                        "No matching videos",
+                        "Try clearing your channel search or resetting filters.",
+                    );
+                }
             } else {
                 let label = match self.active_tab.get() {
                     ChannelTab::Videos => "This channel has no videos yet.",
@@ -1726,6 +1819,26 @@ impl ChannelPage {
             self.sync_virtual_window(true);
         }
         self.actions.image_loader.schedule_heap_trim();
+
+        // Keep scanning filtered pages until the grid has a useful batch of matches, but cap
+        // automatic requests so a restrictive filter cannot silently crawl an entire channel.
+        let has_channel_filter = self.date_filter.get() != UploadDateFilter::AnyTime
+            || self.duration_filter.get() != DurationFilter::AnyLength;
+        let has_more = match self.active_tab.get() {
+            ChannelTab::Videos => self.videos_cursor.borrow().is_some(),
+            ChannelTab::Shorts => self.shorts_cursor.borrow().is_some(),
+            ChannelTab::Playlists => false,
+        };
+        if has_channel_filter
+            && self.search_results.borrow().is_none()
+            && self.rendered_items.borrow().len() < 12
+            && self.filter_scan_pages.get() < 4
+            && has_more
+        {
+            self.filter_scan_pages
+                .set(self.filter_scan_pages.get().saturating_add(1));
+            self.load_more_active_tab();
+        }
     }
 
     fn on_scroll_changed(self: &Rc<Self>) {
@@ -2093,6 +2206,24 @@ impl ChannelPage {
     }
 }
 
+fn compare_optional_timestamps(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_optional_timestamps_desc(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 fn create_pop_item(label: &str) -> Button {
     let btn = Button::builder().label(label).halign(Align::Fill).build();
     btn.add_css_class("flat");
@@ -2168,6 +2299,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sort_timestamp_comparator_orders_newest_oldest_and_unknowns_last() {
+        assert_eq!(
+            compare_optional_timestamps(Some(30), Some(20)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_optional_timestamps(Some(20), Some(30)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_optional_timestamps(Some(20), None),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_optional_timestamps_desc(Some(30), Some(20)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_optional_timestamps_desc(Some(20), None),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
     fn test_virtual_slice_bounds_live_widgets_and_preserves_total_height() {
         // 600 Shorts across 6 columns = 100 rows, stride = 366px (342px card + 24px gap)
         let total_items = 600;
@@ -2210,4 +2365,3 @@ mod tests {
         assert_eq!(top0, 0);
     }
 }
-

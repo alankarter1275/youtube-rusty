@@ -191,20 +191,35 @@ flowboxchild:hover, flowboxchild:selected, flowboxchild:focus {
 
 /* ---------- search + chips + buttons (no double focus ring) ---------- */
 .yr-search, entry.yr-search, searchentry.yr-search {
-  background-color: alpha(#E8DDD5, 0.08);
+  background-color: alpha(#E8DDD5, 0.07);
   color: @yr_text;
-  border-radius: 10px;
-  border: 1px solid transparent;
+  border-radius: 999px;
+  border: 1px solid alpha(#E8DDD5, 0.11);
   outline: none;
   box-shadow: none;
-  min-height: 36px;
-  padding: 0 12px;
+  min-height: 42px;
+  padding: 0 16px;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+.yr-search text,
+entry.yr-search text,
+searchentry.yr-search text {
+  background-color: transparent;
+  color: @yr_text;
+  border: none;
+  outline: none;
+  box-shadow: none;
 }
 .yr-search:focus-within, entry.yr-search:focus-within, searchentry.yr-search:focus-within {
-  border-color: alpha(@yr_accent_hi, 0.65);
+  border-color: alpha(@yr_accent_hi, 0.72);
   background-color: alpha(#E8DDD5, 0.10);
   outline: none;
-  box-shadow: none;
+  box-shadow: 0 0 0 3px alpha(@yr_accent, 0.16);
+}
+.yr-search placeholder,
+entry.yr-search placeholder,
+searchentry.yr-search placeholder {
+  color: alpha(@yr_text2, 0.72);
 }
 .yr-chip {
   border-radius: 999px;
@@ -409,8 +424,10 @@ popover modelbutton:hover, .yr-menu-item:hover {
   margin: 8px 14px 2px 14px;
 }
 dialog.yr-sheet, .yr-sheet {
-  background-color: @yr_surface;
+  background-color: alpha(@yr_surface, 0.90);
+  border: 1px solid alpha(#E8DDD5, 0.14);
   border-radius: 22px;
+  box-shadow: 0 24px 72px alpha(black, 0.55);
 }
 
 /* ---------- inline Kalam Preferences page ---------- */
