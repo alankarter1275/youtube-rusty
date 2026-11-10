@@ -370,41 +370,35 @@ impl DetailsSheet {
             on_dl(sum_dl.clone(), q);
         });
 
-        // AdwDialog does not dismiss on outside clicks by default. Observe clicks in the
-        // capture phase and compare against the actual content card, not the full-screen dialog
-        // host/backdrop, so clicks on the dimmed area dismiss while dialog controls remain usable.
-        let parent_widget = parent.upcast_ref::<gtk4::Widget>().clone();
-        // AdwApplicationWindow's first child is its AdwDialogHost. Attach to that actual
-        // presentation layer: it contains both the app content and the dimmed dialog backdrop.
-        let event_host = parent_widget
-            .first_child()
-            .unwrap_or_else(|| parent_widget.clone());
+        // AdwDialog does not dismiss on outside clicks by default. Its own widget fills the
+        // presentation host, so capture clicks there and compare them with the actual content
+        // card. This sees backdrop clicks without depending on the native window's event routing.
+        let dialog_widget = dialog.upcast_ref::<gtk4::Widget>().clone();
         let content_widget = content_box.upcast_ref::<gtk4::Widget>().clone();
         let outside_click = GestureClick::new();
         outside_click.set_button(1);
         outside_click.set_propagation_phase(PropagationPhase::Capture);
         let dialog_weak = dialog.downgrade();
-        let host_weak = event_host.downgrade();
+        let surface_weak = dialog_widget.downgrade();
         let content_weak = content_widget.downgrade();
         outside_click.connect_pressed(move |gesture, _, x, y| {
-            let (Some(dialog), Some(host), Some(content)) = (
+            let (Some(dialog), Some(surface), Some(content)) = (
                 dialog_weak.upgrade(),
-                host_weak.upgrade(),
+                surface_weak.upgrade(),
                 content_weak.upgrade(),
             ) else {
                 return;
             };
 
-            // Compare coordinates in the same content-root coordinate space as this gesture.
-            let bounds = content.compute_bounds(&host);
-            let inside = if let Some(bounds) = bounds {
+            // Gesture coordinates and bounds are both local to the dialog's full-screen surface.
+            let inside = if let Some(bounds) = content.compute_bounds(&surface) {
                 let left = bounds.x() as f64;
                 let top = bounds.y() as f64;
                 x >= left
                     && x <= left + bounds.width() as f64
                     && y >= top
                     && y <= top + bounds.height() as f64
-            } else if let Some(picked) = host.pick(x, y, gtk4::PickFlags::DEFAULT) {
+            } else if let Some(picked) = surface.pick(x, y, gtk4::PickFlags::DEFAULT) {
                 picked == content || picked.is_ancestor(&content)
             } else {
                 false
@@ -415,12 +409,12 @@ impl DetailsSheet {
                 dialog.close();
             }
         });
-        event_host.add_controller(outside_click.clone());
+        dialog_widget.add_controller(outside_click.clone());
 
-        let host_weak = event_host.downgrade();
+        let surface_weak = dialog_widget.downgrade();
         dialog.connect_closed(move |_| {
-            if let Some(host) = host_weak.upgrade() {
-                host.remove_controller(&outside_click);
+            if let Some(surface) = surface_weak.upgrade() {
+                surface.remove_controller(&outside_click);
             }
         });
         dialog.present(Some(parent));
