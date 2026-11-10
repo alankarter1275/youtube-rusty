@@ -1705,27 +1705,31 @@ impl ChannelPage {
             }
         };
 
-        // Re-sort all loaded pages together. Some renderer variants only provide relative
-        // upload text, so use its approximate timestamp when the exact timestamp is absent.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        match self.sort_order.get() {
-            ChannelSortOrder::Newest => base.sort_by(|a, b| {
-                compare_optional_timestamps_desc(
-                    effective_published_timestamp(a, now),
-                    effective_published_timestamp(b, now),
-                )
-            }),
-            ChannelSortOrder::Oldest => base.sort_by(|a, b| {
-                compare_optional_timestamps(
-                    effective_published_timestamp(a, now),
-                    effective_published_timestamp(b, now),
-                )
-            }),
-            ChannelSortOrder::Popular => {
-                base.sort_by(|a, b| b.view_count.cmp(&a.view_count))
+        // Videos may need a local sort because renderer metadata can be incomplete. For the
+        // channel Shorts tab, YouTube supplies the sort order (including Oldest via its sort
+        // chip continuation); re-sorting by approximate/missing metadata here would undo it.
+        let has_search_results = self.search_results.borrow().is_some();
+        if should_sort_channel_items_locally(self.active_tab.get(), has_search_results) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            match self.sort_order.get() {
+                ChannelSortOrder::Newest => base.sort_by(|a, b| {
+                    compare_optional_timestamps_desc(
+                        effective_published_timestamp(a, now),
+                        effective_published_timestamp(b, now),
+                    )
+                }),
+                ChannelSortOrder::Oldest => base.sort_by(|a, b| {
+                    compare_optional_timestamps(
+                        effective_published_timestamp(a, now),
+                        effective_published_timestamp(b, now),
+                    )
+                }),
+                ChannelSortOrder::Popular => {
+                    base.sort_by(|a, b| b.view_count.cmp(&a.view_count))
+                }
             }
         }
 
@@ -2206,6 +2210,10 @@ impl ChannelPage {
     }
 }
 
+fn should_sort_channel_items_locally(tab: ChannelTab, has_search_results: bool) -> bool {
+    has_search_results || tab != ChannelTab::Shorts
+}
+
 fn compare_optional_timestamps(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
     match (left, right) {
         (Some(a), Some(b)) => a.cmp(&b),
@@ -2297,6 +2305,13 @@ fn compute_virtual_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_shorts_keep_youtube_order_but_other_lists_sort_locally() {
+        assert!(!should_sort_channel_items_locally(ChannelTab::Shorts, false));
+        assert!(should_sort_channel_items_locally(ChannelTab::Videos, false));
+        assert!(should_sort_channel_items_locally(ChannelTab::Shorts, true));
+    }
 
     #[test]
     fn sort_timestamp_comparator_orders_newest_oldest_and_unknowns_last() {
