@@ -2505,27 +2505,27 @@ impl Engine {
                 ChannelSortOrder::Newest => None,
             };
             if let Some(label) = wanted_label {
-                if let Ok(raw) = self
+                let raw = self
                     .fetch_channel_browse_json(
                         channel_id,
                         Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
                         None,
                     )
                     .await
-                {
-                    let token = extract_channel_sort_chip_token(&raw, label).or_else(|| {
-                        if order == ChannelSortOrder::Popular {
-                            extract_channel_sort_chip_token(&raw, "most popular")
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(token) = token {
-                        return self
-                            .continue_channel_shorts_direct(&token, fallback_details)
-                            .await;
+                    .map_err(|err| format!("Could not load Shorts sort options: {err}"))?;
+                let token = extract_channel_sort_chip_token(&raw, label).or_else(|| {
+                    if order == ChannelSortOrder::Popular {
+                        extract_channel_sort_chip_token(&raw, "most popular")
+                    } else {
+                        None
                     }
-                }
+                });
+                let token = token.ok_or_else(|| {
+                    format!("YouTube did not return a Shorts {label} sort token")
+                })?;
+                return self
+                    .continue_channel_shorts_direct(&token, fallback_details)
+                    .await;
             }
         }
 
@@ -4244,12 +4244,16 @@ fn extract_channel_sort_chip_token(node: &Value, wanted_label: &str) -> Option<S
             .iter()
             .find_map(|item| extract_channel_sort_chip_token(item, wanted_label)),
         Value::Object(map) => {
-            if let Some(chip) = map.get("chipCloudChipRenderer") {
-                let label = extract_yt_text(chip.get("text")).unwrap_or_default();
-                if label.trim().eq_ignore_ascii_case(wanted_label) {
-                    if let Some(token) = find_nested_continuation_token(chip) {
-                        return Some(token);
-                    }
+            let label = map
+                .get("text")
+                .or_else(|| map.get("title"))
+                .and_then(|value| extract_yt_text(Some(value)));
+            if label
+                .as_deref()
+                .is_some_and(|label| label.trim().eq_ignore_ascii_case(wanted_label))
+            {
+                if let Some(token) = find_nested_continuation_token(node) {
+                    return Some(token);
                 }
             }
             map.values()
@@ -6767,6 +6771,23 @@ https://manifest.example/v1080_video.m3u8
         assert_eq!(
             extract_channel_sort_chip_token(&response, "most popular"),
             Some("MOST_POPULAR".into())
+        );
+
+        let sort_filter = json!({
+            "sortFilterSubMenuRenderer": {
+                "subMenuItems": [{
+                    "title": "Oldest",
+                    "serviceEndpoint": {
+                        "innertubeCommand": {
+                            "continuationCommand": { "token": "OLD_SORT_FILTER" }
+                        }
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            extract_channel_sort_chip_token(&sort_filter, "oldest"),
+            Some("OLD_SORT_FILTER".into())
         );
 
         let service_endpoint = json!({
