@@ -2,5 +2,8 @@ pub mod cache;
 pub mod engine;
 pub mod history;
 pub mod models;
+pub mod playlists;
+pub mod search_history;
 pub mod settings;
 pub mod subscriptions;
+pub mod watch_later;

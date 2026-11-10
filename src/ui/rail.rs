@@ -1,99 +1,124 @@
+use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use gtk4::prelude::*;
-use gtk4::{Align, Box as GtkBox, Button, Image, Orientation, Overlay};
+use gtk4::{Align, Box as GtkBox, Button, Orientation, Overlay};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RailTab {
     Home,
     Subscriptions,
+    Playlists,
     History,
     Settings,
 }
 
 pub struct Rail {
     pub container: Overlay,
+    pub logo_btn: Button,
     pub home_btn: Button,
     pub subs_btn: Button,
+    pub playlists_btn: Button,
     pub hist_btn: Button,
     pub settings_btn: Button,
 }
 
 impl Rail {
     pub fn new() -> Self {
-        let rail_box = GtkBox::new(Orientation::Vertical, 0);
-        rail_box.add_css_class("yr-rail");
-        rail_box.set_width_request(68);
+        let base_box = GtkBox::new(Orientation::Vertical, 0);
+        base_box.set_width_request(68);
+        base_box.set_vexpand(true);
+        base_box.set_hexpand(false);
+        base_box.add_css_class("yr-rail");
 
-        // Logo at top: 28px from top (terracotta rounded square with play icon)
-        let logo_box = GtkBox::new(Orientation::Vertical, 0);
-        logo_box.set_halign(Align::Center);
-        logo_box.set_valign(Align::Start);
-        logo_box.add_css_class("yr-logo");
-        let logo_icon = Image::from_icon_name("media-playback-start-symbolic");
-        logo_icon.set_pixel_size(18);
-        logo_box.append(&logo_icon);
-        rail_box.append(&logo_box);
-
-        // Center navigation group: Home, Subscriptions, History
-        let center_box = GtkBox::new(Orientation::Vertical, 16);
+        // Center Navigation Group: true vertical center of the full window height
+        let center_box = GtkBox::new(Orientation::Vertical, 8);
+        center_box.set_halign(Align::Center);
         center_box.set_valign(Align::Center);
         center_box.set_vexpand(true);
-        center_box.set_halign(Align::Center);
 
-        let home_btn = create_rail_button("user-home-symbolic", "Home", true);
-        let subs_btn = create_rail_button("emblem-favorite-symbolic", "Subscriptions", false);
-        let hist_btn = create_rail_button("document-open-recent-symbolic", "History", false);
+        let home_btn = create_nav_btn(KalamIcon::Home, "Home", true);
+        let subs_btn = create_nav_btn(KalamIcon::Subscriptions, "Subscriptions", false);
+        let playlists_btn = create_nav_btn(KalamIcon::Playlists, "Playlists", false);
+        let hist_btn = create_nav_btn(KalamIcon::History, "History", false);
 
         center_box.append(&home_btn);
         center_box.append(&subs_btn);
+        center_box.append(&playlists_btn);
         center_box.append(&hist_btn);
-        rail_box.append(&center_box);
+        base_box.append(&center_box);
 
-        // Settings button pinned to bottom (24px bottom inset)
-        let settings_btn = create_rail_button("emblem-system-symbolic", "Settings", false);
-        settings_btn.set_valign(Align::End);
+        let overlay = Overlay::new();
+        overlay.set_vexpand(true);
+        overlay.set_hexpand(false);
+        overlay.set_child(Some(&base_box));
+
+        // Top App Logo: 38x38 terracotta badge pinned 24px from top
+        let logo_btn = Button::new();
+        logo_btn.set_child(Some(&make_icon(KalamIcon::LogoPlay, 38)));
+        logo_btn.add_css_class("yr-logo");
+        logo_btn.set_halign(Align::Center);
+        logo_btn.set_valign(Align::Start);
+        logo_btn.set_margin_top(24);
+        logo_btn.set_tooltip_text(Some("youtube-rusty — Go Home"));
+        set_pointer(&logo_btn);
+        overlay.add_overlay(&logo_btn);
+
+        // Bottom Settings Button: pinned 24px from bottom
+        let settings_btn = create_nav_btn(KalamIcon::Settings, "Preferences", false);
         settings_btn.set_halign(Align::Center);
-        rail_box.append(&settings_btn);
+        settings_btn.set_valign(Align::End);
+        settings_btn.set_margin_bottom(24);
+        overlay.add_overlay(&settings_btn);
 
-        // Inset 2px separator line at the rail's right edge
+        // Symmetric Floating Right Divider Line (24px top, 24px bottom)
         let sep = GtkBox::new(Orientation::Vertical, 0);
         sep.add_css_class("yr-rail-sep");
-        sep.set_width_request(2);
         sep.set_halign(Align::End);
-
-        let container = Overlay::new();
-        container.set_child(Some(&rail_box));
-        container.add_overlay(&sep);
+        sep.set_vexpand(true);
+        sep.set_width_request(2);
+        sep.set_margin_top(24);
+        sep.set_margin_bottom(24);
+        sep.set_can_target(false);
+        overlay.add_overlay(&sep);
 
         Self {
-            container,
+            container: overlay,
+            logo_btn,
             home_btn,
             subs_btn,
+            playlists_btn,
             hist_btn,
             settings_btn,
         }
     }
 
-    pub fn set_active(&self, tab: RailTab) {
+    pub fn set_active(&self, active: Option<RailTab>) {
         self.home_btn.remove_css_class("active");
         self.subs_btn.remove_css_class("active");
+        self.playlists_btn.remove_css_class("active");
         self.hist_btn.remove_css_class("active");
         self.settings_btn.remove_css_class("active");
 
-        match tab {
-            RailTab::Home => self.home_btn.add_css_class("active"),
-            RailTab::Subscriptions => self.subs_btn.add_css_class("active"),
-            RailTab::History => self.hist_btn.add_css_class("active"),
-            RailTab::Settings => self.settings_btn.add_css_class("active"),
+        if let Some(tab) = active {
+            match tab {
+                RailTab::Home => self.home_btn.add_css_class("active"),
+                RailTab::Subscriptions => self.subs_btn.add_css_class("active"),
+                RailTab::Playlists => self.playlists_btn.add_css_class("active"),
+                RailTab::History => self.hist_btn.add_css_class("active"),
+                RailTab::Settings => self.settings_btn.add_css_class("active"),
+            }
         }
     }
 }
 
-fn create_rail_button(icon_name: &str, tooltip: &str, is_active: bool) -> Button {
-    let btn = Button::from_icon_name(icon_name);
+fn create_nav_btn(icon: KalamIcon, tooltip: &str, is_active: bool) -> Button {
+    let btn = Button::new();
+    btn.set_child(Some(&make_icon(icon, 22)));
     btn.add_css_class("yr-rail-btn");
-    btn.set_tooltip_text(Some(tooltip));
+    btn.set_halign(Align::Center);
     btn.set_width_request(44);
     btn.set_height_request(44);
+    btn.set_tooltip_text(Some(tooltip));
+    set_pointer(&btn);
     if is_active {
         btn.add_css_class("active");
     }

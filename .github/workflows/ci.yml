@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK4 and Libadwaita dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Cargo check, test, and build
+        run: |
+          python3 - << 'PY'
+          import subprocess, sys
+
+          def emit_chunks(level, title, text):
+              lines = text.splitlines()
+              chunks = []
+              cur = []
+              cur_len = 0
+              for line in lines:
+                  esc = (
+                      line.replace("%", "%25")
+                          .replace("\r", "%0D")
+                  )
+                  add_len = len(esc) + 3
+                  if cur and cur_len + add_len > 3000:
+                      chunks.append("%0A".join(cur))
+                      cur = [esc]
+                      cur_len = add_len
+                  else:
+                      cur.append(esc)
+                      cur_len += add_len
+              if cur:
+                  chunks.append("%0A".join(cur))
+              for idx, part in enumerate(chunks[:45], 1):
+                  t = title if len(chunks) == 1 else f"{title} ({idx}/{len(chunks)})"
+                  print(f"::{level} title={t}::{part}", flush=True)
+
+          steps = [
+              ("cargo check", ["cargo", "check", "-q", "--all-targets"]),
+              ("cargo test", ["cargo", "test", "-q"]),
+              ("cargo build", ["cargo", "build", "-q"]),
+          ]
+
+          for label, cmd in steps:
+              print(f"=== Running: {label} ===", flush=True)
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              out = (proc.stdout or "").strip()
+              print(out, flush=True)
+              if proc.returncode != 0:
+                  emit_chunks("error", f"Failed {label}", out or f"Exit code {proc.returncode}")
+                  sys.exit(proc.returncode)
+              elif out and "warning:" in out:
+                  emit_chunks("warning", f"Warnings {label}", out)
+
+          print("::notice title=CI Passed::cargo check, cargo test, and cargo build all succeeded cleanly.", flush=True)
+          PY

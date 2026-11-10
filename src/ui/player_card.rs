@@ -1,59 +1,111 @@
-use crate::backend::models::VideoSummary;
-use gtk4::gdk::Texture;
-use gtk4::prelude::*;
+use crate::backend::models::{format_duration, format_queue_total_duration, VideoSummary};
+use crate::ui::icons::set_pointer;
+use crate::ui::image_loader::ImageLoader;
+use adw::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, Orientation, Overlay, Picture, ProgressBar,
+    gdk, glib, Align, Box as GtkBox, Button, DragSource, DropTarget, Entry, EventControllerKey,
+    GestureClick, Label, Orientation, Overflow, Overlay, Picture, Popover, ProgressBar,
     ScrolledWindow, Separator,
 };
-use std::cell::RefCell;
+use libadwaita as adw;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static SHUFFLE_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct PlayerCard {
     pub root: GtkBox,
+    inner_clamp: adw::Clamp,
+    image_loader: Rc<ImageLoader>,
     thumb_pic: Picture,
+    thumb_overlay: Overlay,
+    thumb_h_clamp: adw::Clamp,
+    thumb_v_clamp: adw::Clamp,
     title_label: Label,
     channel_btn: Button,
     queue_pos_label: Label,
     progress_bar: ProgressBar,
+    times_row: GtkBox,
     time_elapsed_label: Label,
     time_total_label: Label,
+    controls_row: GtkBox,
     pub prev_btn: Button,
     pub play_pause_btn: Button,
+    narrow_play_pause_btn: Button,
     pub next_btn: Button,
     pub close_btn: Button,
     pub expand_btn: Button,
     queue_box: GtkBox,
     queue_list: GtkBox,
     queue_summary_label: Label,
+    save_btn: Button,
     shuffle_btn: Button,
     clear_btn: Button,
-    is_expanded: RefCell<bool>,
-    is_playing: RefCell<bool>,
+    is_expanded: Cell<bool>,
+    is_playing: Cell<bool>,
+    is_loading: Cell<bool>,
+    is_narrow: Cell<bool>,
+    is_shorts_mode: Cell<bool>,
     queue: RefCell<Vec<VideoSummary>>,
-    current_index: RefCell<usize>,
+    current_index: Cell<usize>,
+    on_open_channel: RefCell<Option<Rc<dyn Fn(String, String)>>>,
+    on_jump_to: RefCell<Option<Rc<dyn Fn(usize)>>>,
+    on_save_playlist: RefCell<Option<Rc<dyn Fn(String, Vec<VideoSummary>)>>>,
+    on_empty_stop: RefCell<Option<Rc<dyn Fn()>>>,
+    on_queue_mutated: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl PlayerCard {
-    pub fn new() -> Rc<Self> {
-        let root = GtkBox::new(Orientation::Vertical, 10);
-        root.set_width_request(370);
+    pub fn new(image_loader: Rc<ImageLoader>) -> Rc<Self> {
+        let root = GtkBox::new(Orientation::Vertical, 0);
+        root.set_width_request(356);
         root.set_halign(Align::End);
         root.set_valign(Align::End);
+        root.set_focusable(true);
         root.add_css_class("yr-player");
         root.set_visible(false);
+
+        let body = GtkBox::new(Orientation::Vertical, 10);
+        body.set_hexpand(true);
+        let inner_clamp = adw::Clamp::builder()
+            .maximum_size(328)
+            .tightening_threshold(328)
+            .child(&body)
+            .build();
+        root.append(&inner_clamp);
 
         // --- Collapsed Top Row ---
         let top_row = GtkBox::new(Orientation::Horizontal, 12);
         top_row.set_valign(Align::Center);
 
         let thumb_pic = Picture::new();
-        thumb_pic.set_width_request(96);
-        thumb_pic.set_height_request(54);
+        thumb_pic.set_can_shrink(true);
+        thumb_pic.set_hexpand(true);
+        thumb_pic.set_vexpand(true);
         thumb_pic.set_content_fit(gtk4::ContentFit::Cover);
 
         let thumb_overlay = Overlay::new();
         thumb_overlay.set_child(Some(&thumb_pic));
+        thumb_overlay.set_overflow(Overflow::Hidden);
+        thumb_overlay.set_size_request(96, 54);
         thumb_overlay.add_css_class("yr-thumb");
+
+        let thumb_v_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Vertical)
+            .maximum_size(54)
+            .tightening_threshold(54)
+            .child(&thumb_overlay)
+            .build();
+        let thumb_h_clamp = adw::Clamp::builder()
+            .orientation(Orientation::Horizontal)
+            .maximum_size(96)
+            .tightening_threshold(96)
+            .halign(Align::Start)
+            .valign(Align::Center)
+            .child(&thumb_v_clamp)
+            .build();
 
         let text_col = GtkBox::new(Orientation::Vertical, 2);
         text_col.set_hexpand(true);
@@ -70,8 +122,9 @@ impl PlayerCard {
         channel_btn.add_css_class("flat");
         channel_btn.add_css_class("yr-link");
         channel_btn.set_halign(Align::Start);
+        channel_btn.set_tooltip_text(Some("Open channel"));
 
-        let queue_pos_label = Label::new(Some("Queue · 0 of 0"));
+        let queue_pos_label = Label::new(Some("Queue · 1 of 1"));
         queue_pos_label.add_css_class("yr-meta");
         queue_pos_label.set_halign(Align::Start);
         queue_pos_label.set_xalign(0.0);
@@ -80,23 +133,34 @@ impl PlayerCard {
         text_col.append(&channel_btn);
         text_col.append(&queue_pos_label);
 
+        let narrow_play_pause_btn = Button::builder()
+            .icon_name("media-playback-pause-symbolic")
+            .tooltip_text("Play / Pause")
+            .valign(Align::Center)
+            .visible(false)
+            .build();
+        narrow_play_pause_btn.add_css_class("yr-rail-btn");
+        narrow_play_pause_btn.add_css_class("active");
+
         let close_btn = Button::builder()
             .icon_name("window-close-symbolic")
+            .tooltip_text("Stop playback and close player")
             .valign(Align::Start)
             .build();
         close_btn.add_css_class("flat");
         close_btn.add_css_class("circular");
 
-        top_row.append(&thumb_overlay);
+        top_row.append(&thumb_h_clamp);
         top_row.append(&text_col);
+        top_row.append(&narrow_play_pause_btn);
         top_row.append(&close_btn);
-        root.append(&top_row);
+        body.append(&top_row);
 
         // --- Progress Bar & Times ---
         let progress_bar = ProgressBar::new();
         progress_bar.add_css_class("yr-progress");
         progress_bar.set_fraction(0.0);
-        root.append(&progress_bar);
+        body.append(&progress_bar);
 
         let times_row = GtkBox::new(Orientation::Horizontal, 0);
         let time_elapsed_label = Label::new(Some("0:00"));
@@ -113,7 +177,7 @@ impl PlayerCard {
         times_row.append(&time_elapsed_label);
         times_row.append(&spacer);
         times_row.append(&time_total_label);
-        root.append(&times_row);
+        body.append(&times_row);
 
         // --- Controls Row ---
         let controls_row = GtkBox::new(Orientation::Horizontal, 8);
@@ -121,24 +185,30 @@ impl PlayerCard {
 
         let prev_btn = Button::builder()
             .icon_name("media-skip-backward-symbolic")
+            .tooltip_text("Previous video")
             .build();
         prev_btn.add_css_class("flat");
 
         let play_pause_btn = Button::builder()
             .icon_name("media-playback-pause-symbolic")
+            .tooltip_text("Play / Pause (Space)")
             .build();
         play_pause_btn.add_css_class("yr-rail-btn");
-        play_pause_btn.add_css_class("active"); // Terracotta accent circle!
+        play_pause_btn.add_css_class("active");
 
         let next_btn = Button::builder()
             .icon_name("media-skip-forward-symbolic")
+            .tooltip_text("Next video")
             .build();
         next_btn.add_css_class("flat");
 
         let ctrl_spacer = GtkBox::new(Orientation::Horizontal, 0);
         ctrl_spacer.set_hexpand(true);
 
-        let expand_btn = Button::builder().label("Queue · 0 ^").build();
+        let expand_btn = Button::builder()
+            .label("Queue · 0 ⌃")
+            .tooltip_text("Show or hide queue")
+            .build();
         expand_btn.add_css_class("yr-chip");
 
         controls_row.append(&prev_btn);
@@ -146,7 +216,7 @@ impl PlayerCard {
         controls_row.append(&next_btn);
         controls_row.append(&ctrl_spacer);
         controls_row.append(&expand_btn);
-        root.append(&controls_row);
+        body.append(&controls_row);
 
         // --- Expanded Queue Section ---
         let queue_box = GtkBox::new(Orientation::Vertical, 8);
@@ -157,24 +227,30 @@ impl PlayerCard {
         divider.set_margin_bottom(4);
         queue_box.append(&divider);
 
-        let queue_header = GtkBox::new(Orientation::Horizontal, 8);
+        let queue_header = GtkBox::new(Orientation::Horizontal, 6);
         queue_header.set_valign(Align::Center);
 
-        let queue_summary_label = Label::new(Some("0 videos · drag to reorder"));
+        let queue_summary_label = Label::new(Some("0 videos"));
         queue_summary_label.add_css_class("yr-meta");
         queue_summary_label.set_halign(Align::Start);
+        queue_summary_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        queue_summary_label.set_hexpand(true);
+        queue_summary_label.set_xalign(0.0);
 
-        let q_head_spacer = GtkBox::new(Orientation::Horizontal, 0);
-        q_head_spacer.set_hexpand(true);
+        let save_btn = Button::with_label("Save");
+        save_btn.add_css_class("yr-chip");
+        save_btn.set_tooltip_text(Some("Save queue as playlist"));
 
         let shuffle_btn = Button::with_label("Shuffle");
         shuffle_btn.add_css_class("yr-chip");
+        shuffle_btn.set_tooltip_text(Some("Shuffle upcoming videos"));
 
         let clear_btn = Button::with_label("Clear");
         clear_btn.add_css_class("yr-chip");
+        clear_btn.set_tooltip_text(Some("Clear queue"));
 
         queue_header.append(&queue_summary_label);
-        queue_header.append(&q_head_spacer);
+        queue_header.append(&save_btn);
         queue_header.append(&shuffle_btn);
         queue_header.append(&clear_btn);
         queue_box.append(&queue_header);
@@ -185,114 +261,394 @@ impl PlayerCard {
             .max_content_height(220)
             .propagate_natural_height(true)
             .build();
+        scrolled.add_css_class("yr-no-scrollbar");
 
         let queue_list = GtkBox::new(Orientation::Vertical, 4);
         scrolled.set_child(Some(&queue_list));
         queue_box.append(&scrolled);
-        root.append(&queue_box);
+        body.append(&queue_box);
 
         let card = Rc::new(Self {
             root,
+            inner_clamp,
+            image_loader,
             thumb_pic,
+            thumb_overlay,
+            thumb_h_clamp,
+            thumb_v_clamp,
             title_label,
             channel_btn,
             queue_pos_label,
             progress_bar,
+            times_row,
             time_elapsed_label,
             time_total_label,
+            controls_row,
             prev_btn,
             play_pause_btn,
+            narrow_play_pause_btn,
             next_btn,
             close_btn,
             expand_btn,
             queue_box,
             queue_list,
             queue_summary_label,
+            save_btn,
             shuffle_btn,
             clear_btn,
-            is_expanded: RefCell::new(false),
-            is_playing: RefCell::new(true),
+            is_expanded: Cell::new(false),
+            is_playing: Cell::new(true),
+            is_loading: Cell::new(false),
+            is_narrow: Cell::new(false),
+            is_shorts_mode: Cell::new(false),
             queue: RefCell::new(Vec::new()),
-            current_index: RefCell::new(0),
+            current_index: Cell::new(0),
+            on_open_channel: RefCell::new(None),
+            on_jump_to: RefCell::new(None),
+            on_save_playlist: RefCell::new(None),
+            on_empty_stop: RefCell::new(None),
+            on_queue_mutated: RefCell::new(None),
         });
 
-        // Setup expand toggle
+        set_pointer(&card.channel_btn);
+        set_pointer(&card.prev_btn);
+        set_pointer(&card.play_pause_btn);
+        set_pointer(&card.narrow_play_pause_btn);
+        set_pointer(&card.next_btn);
+        set_pointer(&card.close_btn);
+        set_pointer(&card.expand_btn);
+        set_pointer(&card.save_btn);
+        set_pointer(&card.shuffle_btn);
+        set_pointer(&card.clear_btn);
+
+        // Save queue as playlist popover
+        card.setup_save_queue_popover();
+
+        // Expand/collapse toggle
         let card_weak = Rc::downgrade(&card);
         card.expand_btn.connect_clicked(move |_| {
             if let Some(c) = card_weak.upgrade() {
-                let mut exp = c.is_expanded.borrow_mut();
-                *exp = !*exp;
-                let is_exp = *exp;
-                c.queue_box.set_visible(is_exp);
-                let q_count = c.queue.borrow().len();
-                if is_exp {
-                    c.expand_btn.set_label(&format!("Queue · {q_count} ⌵"));
-                } else {
-                    c.expand_btn.set_label(&format!("Queue · {q_count} ⌃"));
+                let next_exp = !c.is_expanded.get();
+                c.is_expanded.set(next_exp);
+                if !c.is_narrow.get() {
+                    c.queue_box.set_visible(next_exp);
+                }
+                c.update_ui();
+            }
+        });
+
+        // Channel link click -> opens channel page
+        let card_weak = Rc::downgrade(&card);
+        card.channel_btn.connect_clicked(move |_| {
+            if let Some(c) = card_weak.upgrade() {
+                let maybe_chan = {
+                    let q = c.queue.borrow();
+                    q.get(c.current_index.get())
+                        .map(|v| (v.channel_id.clone(), v.channel_name.clone()))
+                };
+                if let Some((cid, cname)) = maybe_chan {
+                    if !cid.is_empty() {
+                        let cb_opt = c.on_open_channel.borrow().clone();
+                        if let Some(cb) = cb_opt {
+                            cb(cid, cname);
+                        }
+                    }
                 }
             }
         });
 
+        // Shuffle button
+        let card_weak = Rc::downgrade(&card);
+        card.shuffle_btn.connect_clicked(move |_| {
+            if let Some(c) = card_weak.upgrade() {
+                c.shuffle_queue();
+            }
+        });
+
+        // Spacebar shortcut when PlayerCard has focus
+        let key_ctrl = EventControllerKey::new();
+        let play_btn_key = card.play_pause_btn.clone();
+        key_ctrl.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::space {
+                play_btn_key.emit_clicked();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        card.root.add_controller(key_ctrl);
+
         card
     }
 
-    pub fn set_queue(&self, items: Vec<VideoSummary>, current_pos: usize) {
+    fn setup_save_queue_popover(self: &Rc<Self>) {
+        let popover = Popover::new();
+        popover.set_parent(&self.save_btn);
+        popover.set_has_arrow(false);
+
+        let pop_cleanup = popover.clone();
+        self.save_btn.connect_destroy(move |_| {
+            pop_cleanup.unparent();
+        });
+
+        let vbox = GtkBox::new(Orientation::Vertical, 6);
+        vbox.set_width_request(230);
+        vbox.set_margin_top(4);
+        vbox.set_margin_bottom(4);
+        vbox.set_margin_start(4);
+        vbox.set_margin_end(4);
+
+        let head = Label::new(Some("SAVE QUEUE AS PLAYLIST"));
+        head.add_css_class("yr-popover-head");
+        head.set_halign(Align::Start);
+        vbox.append(&head);
+
+        let entry = Entry::builder()
+            .placeholder_text("Playlist name…")
+            .text("Queue Mix")
+            .build();
+        entry.add_css_class("yr-search");
+        vbox.append(&entry);
+
+        let confirm_btn = Button::with_label("Save playlist");
+        confirm_btn.add_css_class("yr-btn");
+        confirm_btn.add_css_class("primary");
+        set_pointer(&confirm_btn);
+        vbox.append(&confirm_btn);
+
+        popover.set_child(Some(&vbox));
+
+        let card_weak = Rc::downgrade(self);
+        let pop_weak = popover.downgrade();
+        let entry_cl = entry.clone();
+        let do_save = Rc::new(move || {
+            let name = entry_cl.text().trim().to_string();
+            if name.is_empty() {
+                return;
+            }
+            if let Some(c) = card_weak.upgrade() {
+                let items = c.queue.borrow().clone();
+                if !items.is_empty() {
+                    let cb_opt = c.on_save_playlist.borrow().clone();
+                    if let Some(cb) = cb_opt {
+                        cb(name, items);
+                    }
+                }
+            }
+            if let Some(p) = pop_weak.upgrade() {
+                p.popdown();
+            }
+        });
+
+        let ds_btn = do_save.clone();
+        confirm_btn.connect_clicked(move |_| ds_btn());
+        entry.connect_activate(move |_| do_save());
+
+        let pop_open = popover.downgrade();
+        self.save_btn.connect_clicked(move |_| {
+            if let Some(p) = pop_open.upgrade() {
+                p.popup();
+            }
+        });
+    }
+
+    pub fn set_queue(
+        self: &Rc<Self>,
+        items: Vec<VideoSummary>,
+        current_pos: usize,
+        shorts_mode: bool,
+    ) {
+        self.is_shorts_mode.set(shorts_mode);
+        let clamped_pos = if items.is_empty() {
+            0
+        } else {
+            current_pos.min(items.len() - 1)
+        };
         *self.queue.borrow_mut() = items;
-        *self.current_index.borrow_mut() = current_pos;
+        self.current_index.set(clamped_pos);
+        self.reset_progress_labels();
         self.update_ui();
     }
 
-    pub fn add_item(&self, item: VideoSummary) {
+    pub fn add_item(self: &Rc<Self>, item: VideoSummary) {
         self.queue.borrow_mut().push(item);
         self.update_ui();
     }
 
-    pub fn set_current_index(&self, index: usize) {
-        *self.current_index.borrow_mut() = index;
+    pub fn append_items(self: &Rc<Self>, items: Vec<VideoSummary>) -> Vec<VideoSummary> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let mut added = Vec::new();
+        {
+            let mut q = self.queue.borrow_mut();
+            let mut seen: std::collections::HashSet<String> =
+                q.iter().map(|v| v.id.clone()).collect();
+            for it in items {
+                if seen.insert(it.id.clone()) {
+                    added.push(it.clone());
+                    q.push(it);
+                }
+            }
+        }
+        if !added.is_empty() {
+            self.update_ui();
+        }
+        added
+    }
+
+    pub fn all_items(&self) -> Vec<VideoSummary> {
+        self.queue.borrow().clone()
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.borrow().len()
+    }
+
+    pub fn current_idx(&self) -> usize {
+        self.current_index.get()
+    }
+
+    pub fn item_at(&self, idx: usize) -> Option<VideoSummary> {
+        self.queue.borrow().get(idx).cloned()
+    }
+
+    pub fn current_video(&self) -> Option<VideoSummary> {
+        self.queue.borrow().get(self.current_index.get()).cloned()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.borrow().is_empty()
+    }
+
+    /// Advances to the next queued video if available. Returns `Some(video)` when advanced.
+    pub fn advance_next(self: &Rc<Self>) -> Option<VideoSummary> {
+        let len = self.queue.borrow().len();
+        let cur = self.current_index.get();
+        if cur + 1 < len {
+            self.current_index.set(cur + 1);
+            self.reset_progress_labels();
+            self.update_ui();
+            self.current_video()
+        } else {
+            None
+        }
+    }
+
+    /// Moves to the previous queued video (or restarts index 0).
+    pub fn advance_prev(self: &Rc<Self>) -> Option<VideoSummary> {
+        let len = self.queue.borrow().len();
+        if len == 0 {
+            return None;
+        }
+        let cur = self.current_index.get();
+        let next_idx = cur.saturating_sub(1);
+        self.current_index.set(next_idx);
+        self.reset_progress_labels();
         self.update_ui();
+        self.current_video()
+    }
+
+    pub fn set_current_index(self: &Rc<Self>, index: usize) {
+        let len = self.queue.borrow().len();
+        if index < len && index != self.current_index.get() {
+            self.current_index.set(index);
+            self.reset_progress_labels();
+            self.update_ui();
+        } else if index < len {
+            self.update_ui();
+        }
+    }
+
+    fn reset_progress_labels(&self) {
+        self.progress_bar.set_fraction(0.0);
+        self.time_elapsed_label.set_text("0:00");
+        let dur_txt = self
+            .queue
+            .borrow()
+            .get(self.current_index.get())
+            .and_then(|v| v.duration_seconds)
+            .map(format_duration)
+            .unwrap_or_else(|| "0:00".to_string());
+        self.time_total_label.set_text(&dur_txt);
+    }
+
+    /// Static loading state — no continuous 120ms pulse timer (prevents Gdk frame timing warnings).
+    pub fn set_loading(self: &Rc<Self>, loading: bool) {
+        self.is_loading.set(loading);
+        self.update_header_labels();
+        if loading {
+            self.progress_bar.set_fraction(0.0);
+        }
     }
 
     pub fn set_progress(&self, elapsed: f64, duration: f64) {
+        if self.is_loading.get() && elapsed > 0.0 {
+            self.is_loading.set(false);
+            self.update_header_labels();
+        }
+        let safe_elapsed = elapsed.max(0.0);
+        self.time_elapsed_label
+            .set_text(&format_duration(safe_elapsed as u64));
         if duration > 0.0 {
-            let frac = (elapsed / duration).clamp(0.0, 1.0);
+            let frac = (safe_elapsed / duration).clamp(0.0, 1.0);
             self.progress_bar.set_fraction(frac);
-            self.time_elapsed_label.set_text(&format_time(elapsed));
-            self.time_total_label.set_text(&format_time(duration));
+            self.time_total_label
+                .set_text(&format_duration(duration as u64));
         }
     }
 
     pub fn set_playing(&self, playing: bool) {
-        *self.is_playing.borrow_mut() = playing;
-        if playing {
-            self.play_pause_btn
-                .set_icon_name("media-playback-pause-symbolic");
-            self.root.set_visible(true);
+        self.is_playing.set(playing);
+        let icon = if playing {
+            "media-playback-pause-symbolic"
         } else {
-            self.play_pause_btn
-                .set_icon_name("media-playback-start-symbolic");
+            "media-playback-start-symbolic"
+        };
+        self.play_pause_btn.set_icon_name(icon);
+        self.narrow_play_pause_btn.set_icon_name(icon);
+        if playing && !self.queue.borrow().is_empty() {
+            self.root.set_visible(true);
         }
     }
 
-    pub fn set_narrow_mode(&self, narrow: bool) {
+    pub fn set_narrow_mode(self: &Rc<Self>, narrow: bool) {
+        self.is_narrow.set(narrow);
         if narrow {
             self.root.set_width_request(-1);
             self.root.set_halign(Align::Fill);
-            self.root.set_margin_start(0);
-            self.root.set_margin_end(0);
-            self.root.set_margin_bottom(0);
             self.root.add_css_class("yr-player-narrow");
+            self.inner_clamp.set_maximum_size(2400);
+            self.inner_clamp.set_tightening_threshold(2400);
+            self.thumb_overlay.set_size_request(64, 36);
+            self.thumb_h_clamp.set_maximum_size(64);
+            self.thumb_h_clamp.set_tightening_threshold(64);
+            self.thumb_v_clamp.set_maximum_size(36);
+            self.thumb_v_clamp.set_tightening_threshold(36);
+            self.close_btn.set_valign(Align::Center);
+            self.narrow_play_pause_btn.set_visible(true);
+            self.progress_bar.set_visible(false);
+            self.times_row.set_visible(false);
+            self.controls_row.set_visible(false);
+            self.queue_box.set_visible(false);
         } else {
-            self.root.set_width_request(370);
+            self.root.set_width_request(356);
             self.root.set_halign(Align::End);
-            self.root.set_margin_start(20);
-            self.root.set_margin_end(20);
-            self.root.set_margin_bottom(20);
             self.root.remove_css_class("yr-player-narrow");
+            self.inner_clamp.set_maximum_size(328);
+            self.inner_clamp.set_tightening_threshold(328);
+            self.thumb_overlay.set_size_request(96, 54);
+            self.thumb_h_clamp.set_maximum_size(96);
+            self.thumb_h_clamp.set_tightening_threshold(96);
+            self.thumb_v_clamp.set_maximum_size(54);
+            self.thumb_v_clamp.set_tightening_threshold(54);
+            self.close_btn.set_valign(Align::Start);
+            self.narrow_play_pause_btn.set_visible(false);
+            self.progress_bar.set_visible(true);
+            self.times_row.set_visible(true);
+            self.controls_row.set_visible(true);
+            self.queue_box.set_visible(self.is_expanded.get());
         }
-    }
-
-    pub fn set_thumbnail(&self, texture: &Texture) {
-        self.thumb_pic.set_paintable(Some(texture));
+        self.update_header_labels();
     }
 
     pub fn connect_close(&self, callback: impl Fn() + 'static) {
@@ -300,7 +656,10 @@ impl PlayerCard {
     }
 
     pub fn connect_play_pause(&self, callback: impl Fn() + 'static) {
-        self.play_pause_btn.connect_clicked(move |_| callback());
+        let cb = Rc::new(callback);
+        let cb_wide = cb.clone();
+        self.play_pause_btn.connect_clicked(move |_| cb_wide());
+        self.narrow_play_pause_btn.connect_clicked(move |_| cb());
     }
 
     pub fn connect_next(&self, callback: impl Fn() + 'static) {
@@ -311,73 +670,306 @@ impl PlayerCard {
         self.prev_btn.connect_clicked(move |_| callback());
     }
 
-    pub fn connect_shuffle(&self, callback: impl Fn() + 'static) {
-        self.shuffle_btn.connect_clicked(move |_| callback());
-    }
-
     pub fn connect_clear(&self, callback: impl Fn() + 'static) {
         self.clear_btn.connect_clicked(move |_| callback());
     }
 
-    pub fn connect_jump_to(&self, mut callback: impl FnMut(usize) + 'static) {
-        // Will be called when row clicked
-        let _ = &mut callback;
+    pub fn connect_open_channel(&self, callback: impl Fn(String, String) + 'static) {
+        *self.on_open_channel.borrow_mut() = Some(Rc::new(callback));
     }
 
-    pub fn update_ui(&self) {
-        let queue = self.queue.borrow();
-        let cur_idx = *self.current_index.borrow();
-        let count = queue.len();
+    pub fn connect_jump_to(&self, callback: impl Fn(usize) + 'static) {
+        *self.on_jump_to.borrow_mut() = Some(Rc::new(callback));
+    }
 
-        if count == 0 {
+    pub fn connect_save_playlist(&self, callback: impl Fn(String, Vec<VideoSummary>) + 'static) {
+        *self.on_save_playlist.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub fn connect_empty_stop(&self, callback: impl Fn() + 'static) {
+        *self.on_empty_stop.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    pub fn connect_queue_mutated(&self, callback: impl Fn() + 'static) {
+        *self.on_queue_mutated.borrow_mut() = Some(Rc::new(callback));
+    }
+
+    fn notify_queue_mutated(&self) {
+        let cb_opt = self.on_queue_mutated.borrow().clone();
+        if let Some(cb) = cb_opt {
+            cb();
+        }
+    }
+
+    fn move_item_internal(&self, from_idx: usize, to_idx: usize) -> bool {
+        let mut q = self.queue.borrow_mut();
+        let len = q.len();
+        if from_idx >= len || to_idx >= len || from_idx == to_idx {
+            return false;
+        }
+        let item = q.remove(from_idx);
+        q.insert(to_idx, item);
+
+        let cur = self.current_index.get();
+        let new_cur = if cur == from_idx {
+            to_idx
+        } else if from_idx < cur && to_idx >= cur {
+            cur - 1
+        } else if from_idx > cur && to_idx <= cur {
+            cur + 1
+        } else {
+            cur
+        };
+        self.current_index.set(new_cur);
+        true
+    }
+
+    pub fn move_item(self: &Rc<Self>, from_idx: usize, to_idx: usize) {
+        if self.move_item_internal(from_idx, to_idx) {
+            self.update_ui();
+            self.notify_queue_mutated();
+        }
+    }
+
+    pub fn remove_item_at(self: &Rc<Self>, index: usize) {
+        let was_current = index == self.current_index.get();
+        let len_after = {
+            let mut q = self.queue.borrow_mut();
+            if index >= q.len() {
+                return;
+            }
+            q.remove(index);
+            q.len()
+        };
+
+        if len_after == 0 {
+            self.current_index.set(0);
             self.root.set_visible(false);
+            let cb_opt = self.on_empty_stop.borrow().clone();
+            if let Some(cb) = cb_opt {
+                cb();
+            }
             return;
         }
 
-        self.root.set_visible(true);
+        let cur = self.current_index.get();
+        if index < cur {
+            self.current_index.set(cur - 1);
+        } else if cur >= len_after {
+            self.current_index.set(len_after - 1);
+        }
 
+        self.update_ui();
+        if was_current {
+            let cb_opt = self.on_jump_to.borrow().clone();
+            if let Some(cb) = cb_opt {
+                cb(self.current_index.get());
+            }
+        } else {
+            self.notify_queue_mutated();
+        }
+    }
+
+    pub fn shuffle_queue(self: &Rc<Self>) {
+        let len = self.queue.borrow().len();
+        if len <= 1 {
+            return;
+        }
+
+        let cur = self.current_index.get();
+        if cur != 0 {
+            self.move_item_internal(cur, 0);
+        }
+
+        let mut state = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
+            ^ SHUFFLE_SEED_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        if state == 0 {
+            state = 0x9E37_79B9_7F4A_7C15;
+        }
+
+        for i in 1..len.saturating_sub(1) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let span = len - i;
+            let j = i + (state as usize % span);
+            if j != i {
+                self.move_item_internal(j, i);
+            }
+        }
+
+        self.update_ui();
+        self.notify_queue_mutated();
+    }
+
+    fn update_header_labels(&self) {
+        let queue = self.queue.borrow();
+        let count = queue.len();
+        if count == 0 {
+            return;
+        }
+        let cur_idx = self.current_index.get().min(count - 1);
         if let Some(cur) = queue.get(cur_idx) {
             self.title_label.set_text(&cur.title);
             self.channel_btn.set_label(&cur.channel_name);
-            self.queue_pos_label
-                .set_text(&format!("Queue · {} of {}", cur_idx + 1, count));
+            self.channel_btn.set_visible(!cur.channel_name.is_empty());
+            self.channel_btn.set_sensitive(!cur.channel_id.is_empty());
+
+            if self.is_loading.get() {
+                self.queue_pos_label.set_text("Opening in MPV…");
+            } else {
+                let prefix = if self.is_shorts_mode.get() {
+                    "Short"
+                } else {
+                    "Queue"
+                };
+                if self.is_narrow.get() {
+                    self.queue_pos_label
+                        .set_text(&format!("{} of {}", cur_idx + 1, count));
+                } else {
+                    self.queue_pos_label
+                        .set_text(&format!("{prefix} · {} of {}", cur_idx + 1, count));
+                }
+            }
+        }
+    }
+
+    pub fn update_ui(self: &Rc<Self>) {
+        let (count, cur_idx, cur_thumb, total_secs) = {
+            let queue = self.queue.borrow();
+            let count = queue.len();
+            if count == 0 {
+                self.root.set_visible(false);
+                return;
+            }
+            let cur_idx = self.current_index.get().min(count - 1);
+            let cur_thumb = queue
+                .get(cur_idx)
+                .map(|v| (v.id.clone(), v.thumbnail_url.clone()));
+            let total_secs: u64 = queue.iter().filter_map(|v| v.duration_seconds).sum();
+            (count, cur_idx, cur_thumb, total_secs)
+        };
+
+        self.root.set_visible(true);
+        self.update_header_labels();
+
+        if let Some((vid, url)) = cur_thumb {
+            if url.is_empty() {
+                self.thumb_pic.set_paintable(gtk4::gdk::Texture::NONE);
+            } else {
+                self.image_loader
+                    .load_into_picture(&vid, &url, &self.thumb_pic);
+            }
         }
 
-        let is_exp = *self.is_expanded.borrow();
-        if is_exp {
-            self.expand_btn.set_label(&format!("Queue · {count} ⌵"));
+        let is_exp = self.is_expanded.get();
+        self.expand_btn.set_label(&format!(
+            "Queue · {count} {}",
+            if is_exp { "⌵" } else { "⌃" }
+        ));
+
+        let word = if count == 1 { "video" } else { "videos" };
+        let dur_part = format_queue_total_duration(total_secs);
+        if dur_part.is_empty() {
+            self.queue_summary_label.set_text(&format!("{count} {word}"));
         } else {
-            self.expand_btn.set_label(&format!("Queue · {count} ⌃"));
+            self.queue_summary_label
+                .set_text(&format!("{count} {word} · {dur_part}"));
         }
 
-        self.queue_summary_label
-            .set_text(&format!("{count} videos · drag to reorder"));
-
-        // Render queue rows
         while let Some(child) = self.queue_list.first_child() {
             self.queue_list.remove(&child);
         }
 
-        for (i, item) in queue.iter().enumerate() {
+        if !is_exp {
+            return;
+        }
+
+        const MAX_VISIBLE_QUEUE_ROWS: usize = 36;
+        let win_start = if count <= MAX_VISIBLE_QUEUE_ROWS {
+            0
+        } else {
+            cur_idx
+                .saturating_sub(8)
+                .min(count - MAX_VISIBLE_QUEUE_ROWS)
+        };
+        let win_end = (win_start + MAX_VISIBLE_QUEUE_ROWS).min(count);
+
+        if win_start > 0 {
+            let earlier_lbl = Label::new(Some(&format!("… {win_start} earlier in queue")));
+            earlier_lbl.add_css_class("yr-meta");
+            earlier_lbl.set_halign(Align::Center);
+            earlier_lbl.set_margin_top(4);
+            earlier_lbl.set_margin_bottom(4);
+            self.queue_list.append(&earlier_lbl);
+        }
+
+        let slice_snapshot: Vec<(usize, VideoSummary)> = {
+            let q = self.queue.borrow();
+            q[win_start..win_end]
+                .iter()
+                .enumerate()
+                .map(|(off, v)| (win_start + off, v.clone()))
+                .collect()
+        };
+
+        for (i, item) in slice_snapshot {
             let row = GtkBox::new(Orientation::Horizontal, 8);
             row.add_css_class("yr-queue-row");
             if i == cur_idx {
                 row.add_css_class("current");
             }
 
-            let handle = gtk4::Image::from_icon_name("open-menu-symbolic");
+            let click_area = GtkBox::new(Orientation::Horizontal, 8);
+            click_area.set_hexpand(true);
+            set_pointer(&click_area);
+
+            let handle = gtk4::Image::from_icon_name("list-drag-handle-symbolic");
             handle.add_css_class("yr-meta");
+            handle.set_tooltip_text(Some("Drag to reorder"));
 
             let thumb = Picture::new();
-            thumb.set_width_request(48);
-            thumb.set_height_request(27);
+            thumb.set_can_shrink(true);
+            thumb.set_hexpand(true);
+            thumb.set_vexpand(true);
             thumb.set_content_fit(gtk4::ContentFit::Cover);
-            thumb.add_css_class("yr-thumb");
+
+            let row_thumb_overlay = Overlay::new();
+            row_thumb_overlay.set_child(Some(&thumb));
+            row_thumb_overlay.set_overflow(Overflow::Hidden);
+            row_thumb_overlay.add_css_class("yr-thumb");
+            row_thumb_overlay.set_size_request(64, 36);
+
+            let row_v_clamp = adw::Clamp::builder()
+                .orientation(Orientation::Vertical)
+                .maximum_size(36)
+                .tightening_threshold(36)
+                .child(&row_thumb_overlay)
+                .build();
+            let row_h_clamp = adw::Clamp::builder()
+                .orientation(Orientation::Horizontal)
+                .maximum_size(64)
+                .tightening_threshold(64)
+                .valign(Align::Center)
+                .child(&row_v_clamp)
+                .build();
+
+            if !item.thumbnail_url.is_empty() {
+                self.image_loader
+                    .load_into_picture(&item.id, &item.thumbnail_url, &thumb);
+            }
 
             let text_box = GtkBox::new(Orientation::Vertical, 1);
             text_box.set_hexpand(true);
+            text_box.set_valign(Align::Center);
 
             let row_title = Label::new(Some(&item.title));
+            row_title.add_css_class("yr-title");
             row_title.set_halign(Align::Start);
             row_title.set_xalign(0.0);
             row_title.set_lines(1);
@@ -392,29 +984,88 @@ impl PlayerCard {
             row_chan.add_css_class("yr-meta");
             row_chan.set_halign(Align::Start);
             row_chan.set_xalign(0.0);
+            row_chan.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
             text_box.append(&row_title);
             text_box.append(&row_chan);
 
+            click_area.append(&handle);
+            click_area.append(&row_h_clamp);
+            click_area.append(&text_box);
+
+            let row_click = GestureClick::new();
+            row_click.set_button(1);
+            let card_weak = Rc::downgrade(self);
+            row_click.connect_released(move |_, _, _, _| {
+                if let Some(card) = card_weak.upgrade() {
+                    card.set_current_index(i);
+                    let cb_opt = card.on_jump_to.borrow().clone();
+                    if let Some(cb) = cb_opt {
+                        cb(i);
+                    }
+                }
+            });
+            click_area.add_controller(row_click);
+
             let remove_btn = Button::builder()
                 .icon_name("window-close-symbolic")
+                .tooltip_text("Remove from queue")
                 .valign(Align::Center)
                 .build();
             remove_btn.add_css_class("flat");
+            let card_weak = Rc::downgrade(self);
+            remove_btn.connect_clicked(move |_| {
+                if let Some(card) = card_weak.upgrade() {
+                    card.remove_item_at(i);
+                }
+            });
 
-            row.append(&handle);
-            row.append(&thumb);
-            row.append(&text_box);
+            row.append(&click_area);
             row.append(&remove_btn);
+
+            let drag_source = DragSource::new();
+            drag_source.set_actions(gdk::DragAction::MOVE);
+            let drag_idx = i as u32;
+            drag_source.connect_prepare(move |_, _, _| {
+                Some(gdk::ContentProvider::for_value(&drag_idx.to_value()))
+            });
+            row.add_controller(drag_source);
+
+            let drop_target = DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+            let row_enter = row.clone();
+            drop_target.connect_enter(move |_, _, _| {
+                row_enter.add_css_class("drop-target");
+                gdk::DragAction::MOVE
+            });
+            let row_leave = row.clone();
+            drop_target.connect_leave(move |_| {
+                row_leave.remove_css_class("drop-target");
+            });
+            let row_drop = row.clone();
+            let card_weak = Rc::downgrade(self);
+            let target_idx = i;
+            drop_target.connect_drop(move |_, val, _, _| {
+                row_drop.remove_css_class("drop-target");
+                if let Ok(from_u32) = val.get::<u32>() {
+                    if let Some(card) = card_weak.upgrade() {
+                        card.move_item(from_u32 as usize, target_idx);
+                        return true;
+                    }
+                }
+                false
+            });
+            row.add_controller(drop_target);
 
             self.queue_list.append(&row);
         }
-    }
-}
 
-fn format_time(seconds: f64) -> String {
-    let s = seconds as u64;
-    let m = s / 60;
-    let rem_s = s % 60;
-    format!("{}:{:02}", m, rem_s)
+        if win_end < count {
+            let more_lbl = Label::new(Some(&format!("… {} more in queue", count - win_end)));
+            more_lbl.add_css_class("yr-meta");
+            more_lbl.set_halign(Align::Center);
+            more_lbl.set_margin_top(4);
+            more_lbl.set_margin_bottom(4);
+            self.queue_list.append(&more_lbl);
+        }
+    }
 }

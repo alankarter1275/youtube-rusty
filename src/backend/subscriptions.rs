@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::fs::{create_dir_all, File};
-use std::io::{BufReader, BufWriter};
+use std::fs::{self, create_dir_all, File};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,8 +19,13 @@ impl SubscriptionStore {
     pub fn new() -> Self {
         let config_dir = glib::user_config_dir().join("youtube-rusty");
         let _ = create_dir_all(&config_dir);
-        let path = config_dir.join("subscriptions.json");
+        Self::with_path(config_dir.join("subscriptions.json"))
+    }
 
+    pub fn with_path(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = create_dir_all(parent);
+        }
         Self { path }
     }
 
@@ -43,10 +48,20 @@ impl SubscriptionStore {
 
     pub fn subscribe(&self, channel: SubscribedChannel) {
         let mut list = self.load_all();
-        if !list.iter().any(|c| c.id == channel.id) {
+        if let Some(existing) = list.iter_mut().find(|c| c.id == channel.id) {
+            if !channel.name.is_empty() {
+                existing.name = channel.name;
+            }
+            if !channel.handle.is_empty() {
+                existing.handle = channel.handle;
+            }
+            if !channel.avatar_url.is_empty() {
+                existing.avatar_url = channel.avatar_url;
+            }
+        } else {
             list.push(channel);
-            self.save_all(&list);
         }
+        self.save_all(&list);
     }
 
     pub fn unsubscribe(&self, channel_id: &str) {
@@ -56,9 +71,17 @@ impl SubscriptionStore {
     }
 
     fn save_all(&self, list: &[SubscribedChannel]) {
-        if let Ok(file) = File::create(&self.path) {
-            let writer = BufWriter::new(file);
-            let _ = serde_json::to_writer_pretty(writer, list);
+        if let Some(parent) = self.path.parent() {
+            let _ = create_dir_all(parent);
         }
+        let tmp_path = self.path.with_extension("json.tmp");
+        if let Ok(file) = File::create(&tmp_path) {
+            let mut writer = BufWriter::new(file);
+            if serde_json::to_writer_pretty(&mut writer, list).is_ok() && writer.flush().is_ok() {
+                let _ = fs::rename(&tmp_path, &self.path);
+                return;
+            }
+        }
+        let _ = fs::remove_file(&tmp_path);
     }
 }
