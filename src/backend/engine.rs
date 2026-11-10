@@ -4839,17 +4839,50 @@ fn shuffle_videos_seeded(items: &mut [VideoSummary], mut state: u64) {
     }
 }
 
+fn find_list_items_in_avatar_stack(value: &Value) -> Option<&[Value]> {
+    let path = "/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/\
+        panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems";
+    if let Some(items) = value.pointer(path).and_then(Value::as_array) {
+        return Some(items.as_slice());
+    }
+
+    fn find_list_items(value: &Value) -> Option<&[Value]> {
+        match value {
+            Value::Array(values) => values.iter().find_map(find_list_items),
+            Value::Object(map) => {
+                if let Some(items) = map
+                    .get("listViewModel")
+                    .and_then(|list| list.get("listItems"))
+                    .and_then(Value::as_array)
+                {
+                    return Some(items.as_slice());
+                }
+                map.values().find_map(find_list_items)
+            }
+            _ => None,
+        }
+    }
+
+    find_list_items(value)
+}
+
+fn find_collaboration_items(value: &Value) -> Option<&[Value]> {
+    match value {
+        Value::Array(values) => values.iter().find_map(find_collaboration_items),
+        Value::Object(map) => {
+            if let Some(stack) = map.get("avatarStackViewModel") {
+                if let Some(items) = find_list_items_in_avatar_stack(stack) {
+                    return Some(items);
+                }
+            }
+            map.values().find_map(find_collaboration_items)
+        }
+        _ => None,
+    }
+}
+
 fn parse_video_collaborators(lockup: &Value) -> Vec<VideoCollaborator> {
-    let items = lockup
-        .pointer("/metadata/lockupMetadataViewModel/image/avatarStackViewModel/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
-        .or_else(|| {
-            lockup.pointer("/avatarStackViewModel/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
-        })
-        .or_else(|| {
-            lockup.pointer("/metadata/avatarStackViewModel/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
-        })
-        .and_then(Value::as_array);
-    let Some(items) = items else {
+    let Some(items) = find_collaboration_items(lockup) else {
         return Vec::new();
     };
 
@@ -6015,6 +6048,7 @@ mod tests {
         let parsed = parse_video_renderer_json(&renderer).unwrap();
         assert_eq!(parsed.duration_seconds, Some(754));
         assert_eq!(parsed.duration_text, "12:34");
+        assert!(!parsed.is_collaboration());
     }
 
     #[test]
@@ -6098,6 +6132,68 @@ mod tests {
         assert_eq!(parsed.collaborators[1].handle, "@two");
         assert_eq!(parsed.collaborators[1].subscriber_count_text, "345K subscribers");
         assert_eq!(parsed.channel_byline().as_deref(), Some("Channel One and 2 more"));
+    }
+
+    #[test]
+    fn test_video_renderer_finds_nested_collaboration_avatar_stack() {
+        let list_item = |id: &str, name: &str| {
+            json!({
+                "listItemViewModel": {
+                    "title": { "content": name },
+                    "rendererContext": {
+                        "commandContext": {
+                            "onTap": {
+                                "innertubeCommand": {
+                                    "browseEndpoint": { "browseId": id }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let renderer = json!({
+            "videoId": "video-collab",
+            "ownerText": { "simpleText": "Lead channel" },
+            "newRendererWrapper": {
+                "metadata": {
+                    "image": {
+                        "avatarStackViewModel": {
+                            "rendererContext": {
+                                "commandContext": {
+                                    "onTap": {
+                                        "innertubeCommand": {
+                                            "showDialogCommand": {
+                                                "panelLoadingStrategy": {
+                                                    "inlineContent": {
+                                                        "dialogViewModel": {
+                                                            "customContent": {
+                                                                "listViewModel": {
+                                                                    "listItems": [
+                                                                        list_item("UC-first", "First channel"),
+                                                                        list_item("UC-second", "Second channel")
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_video_renderer_json(&renderer).unwrap();
+        assert!(parsed.is_collaboration());
+        assert_eq!(parsed.collaborators.len(), 2);
+        assert_eq!(parsed.channel_name, "First channel");
+        assert_eq!(parsed.channel_id, "UC-first");
     }
 
     #[test]

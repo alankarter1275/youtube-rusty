@@ -3,6 +3,7 @@ use crate::backend::playlists::PlaylistStore;
 use crate::player::mpv::Quality;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::image_loader::ImageLoader;
+use crate::ui::video_card::build_collaborator_avatar_stack;
 use adw::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, Entry, EventSequenceState, GestureClick, Label, Orientation,
@@ -124,6 +125,7 @@ impl DetailsSheet {
             .map(|channel| channel.name.as_str())
             .filter(|name| !name.is_empty());
         let avatar = adw::Avatar::new(36, avatar_label, true);
+        avatar.set_size_request(36, 36);
         if let Some(primary) = primary {
             if !primary.avatar_url.is_empty() {
                 actions
@@ -131,27 +133,14 @@ impl DetailsSheet {
                     .load_into_avatar(&primary.id, &primary.avatar_url, &avatar);
             }
         }
-        let avatar_stack = Overlay::new();
-        let visible_credit_count = collaborators.len().min(3);
-        let stack_width = match visible_credit_count {
-            0 | 1 => 36,
-            2 => 56,
-            _ => 72,
-        };
-        avatar_stack.set_size_request(stack_width, 40);
-        avatar_stack.set_child(Some(&avatar));
-        for (offset, channel) in collaborators.iter().skip(1).take(2).enumerate() {
-            let extra = adw::Avatar::new(36, Some(&channel.name), true);
-            extra.set_size_request(36, 36);
-            extra.set_halign(Align::Start);
-            extra.set_valign(Align::Center);
-            extra.set_margin_start(20 + offset as i32 * 16);
-            if !channel.avatar_url.is_empty() {
+        let (avatar_stack, extra_avatars) =
+            build_collaborator_avatar_stack(&avatar, &collaborators, 36);
+        for (channel_id, avatar_url, extra) in extra_avatars {
+            if !avatar_url.is_empty() {
                 actions
                     .image_loader
-                    .load_into_avatar(&channel.id, &channel.avatar_url, &extra);
+                    .load_into_avatar(&channel_id, &avatar_url, &extra);
             }
-            avatar_stack.add_overlay(&extra);
         }
         channel_row.append(&avatar_stack);
 
@@ -184,19 +173,44 @@ impl DetailsSheet {
         }
         channel_row.append(&channel_info);
 
-        if !collaborators.is_empty() {
+        if summary.is_collaboration() {
             let subscribe_btn = Button::with_label("Subscribe");
             subscribe_btn.add_css_class("yr-btn");
             subscribe_btn.add_css_class("primary");
             set_pointer(&subscribe_btn);
-            let popover = build_collaborators_popover(&subscribe_btn, &collaborators, actions);
-            let popover_weak = popover.downgrade();
+            let channels = summary.collaborators.clone();
+            let dialog_weak = dialog.downgrade();
+            let actions = actions.clone();
             subscribe_btn.connect_clicked(move |_| {
-                if let Some(popover) = popover_weak.upgrade() {
-                    popover.popup();
+                if let Some(details_dialog) = dialog_weak.upgrade() {
+                    show_collaborators_dialog(
+                        &details_dialog,
+                        &details_dialog,
+                        &channels,
+                        &actions,
+                    );
                 }
             });
             channel_row.append(&subscribe_btn);
+        } else if let Some(channel) = collaborators
+            .first()
+            .filter(|channel| !channel.id.is_empty())
+        {
+            // Keep the original single-channel action; only real collaborations open the list.
+            let open_channel_btn = Button::with_label("Open channel");
+            open_channel_btn.add_css_class("yr-btn");
+            set_pointer(&open_channel_btn);
+            let channel_id = channel.id.clone();
+            let channel_name = channel.name.clone();
+            let dialog_weak = dialog.downgrade();
+            let on_open_channel = actions.on_open_channel.clone();
+            open_channel_btn.connect_clicked(move |_| {
+                if let Some(dialog) = dialog_weak.upgrade() {
+                    dialog.close();
+                }
+                on_open_channel(channel_id.clone(), channel_name.clone());
+            });
+            channel_row.append(&open_channel_btn);
         }
 
         content_box.append(&channel_row);
@@ -444,27 +458,30 @@ impl DetailsSheet {
     }
 }
 
-fn build_collaborators_popover(
-    anchor: &Button,
+fn show_collaborators_dialog(
+    parent: &adw::Dialog,
+    details_dialog: &adw::Dialog,
     collaborators: &[VideoCollaborator],
     actions: &CardActions,
-) -> Popover {
-    let popover = Popover::new();
-    popover.set_parent(anchor);
-    popover.set_has_arrow(false);
-    popover.add_css_class("yr-collaborators-popover");
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Collaborators")
+        .content_width(440)
+        .build();
+    dialog.add_css_class("yr-collaborators-dialog");
+    dialog.set_can_close(true);
 
-    let list = GtkBox::new(Orientation::Vertical, 10);
-    list.set_width_request(360);
-    list.set_margin_top(12);
-    list.set_margin_bottom(12);
-    list.set_margin_start(12);
-    list.set_margin_end(12);
+    let root = GtkBox::new(Orientation::Vertical, 10);
+    root.set_width_request(400);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
 
     let heading = Label::new(Some("Collaborators"));
     heading.add_css_class("yr-popover-head");
     heading.set_halign(Align::Start);
-    list.append(&heading);
+    root.append(&heading);
 
     let rows = GtkBox::new(Orientation::Vertical, 8);
     for channel in collaborators {
@@ -501,9 +518,17 @@ fn build_collaborators_popover(
             let channel_id = channel.id.clone();
             let channel_name = channel.name.clone();
             let on_open_channel = actions.on_open_channel.clone();
+            let collaborators_weak = dialog.downgrade();
+            let details_weak = details_dialog.downgrade();
             let open_channel = GestureClick::new();
             open_channel.set_button(1);
             open_channel.connect_released(move |_, _, _, _| {
+                if let Some(dialog) = collaborators_weak.upgrade() {
+                    dialog.close();
+                }
+                if let Some(dialog) = details_weak.upgrade() {
+                    dialog.close();
+                }
                 on_open_channel(channel_id.clone(), channel_name.clone());
             });
             name.add_controller(open_channel);
@@ -559,9 +584,53 @@ fn build_collaborators_popover(
         .child(&rows)
         .build();
     scrolled.add_css_class("yr-no-scrollbar");
-    list.append(&scrolled);
-    popover.set_child(Some(&list));
-    popover
+    root.append(&scrolled);
+    dialog.set_child(Some(&root));
+    add_dialog_outside_click_dismissal(&dialog, &root);
+    dialog.present(Some(parent));
+}
+
+fn add_dialog_outside_click_dismissal(dialog: &adw::Dialog, content: &GtkBox) {
+    let surface = dialog.upcast_ref::<gtk4::Widget>().clone();
+    let content_widget = content.upcast_ref::<gtk4::Widget>().clone();
+    let outside_click = GestureClick::new();
+    outside_click.set_button(1);
+    outside_click.set_propagation_phase(PropagationPhase::Capture);
+    let dialog_weak = dialog.downgrade();
+    let surface_weak = surface.downgrade();
+    let content_weak = content_widget.downgrade();
+    outside_click.connect_pressed(move |gesture, _, x, y| {
+        let (Some(dialog), Some(surface), Some(content)) = (
+            dialog_weak.upgrade(),
+            surface_weak.upgrade(),
+            content_weak.upgrade(),
+        ) else {
+            return;
+        };
+        let inside = if let Some(bounds) = content.compute_bounds(&surface) {
+            let left = bounds.x() as f64;
+            let top = bounds.y() as f64;
+            x >= left
+                && x <= left + bounds.width() as f64
+                && y >= top
+                && y <= top + bounds.height() as f64
+        } else if let Some(picked) = surface.pick(x, y, gtk4::PickFlags::DEFAULT) {
+            picked == content || picked.is_ancestor(&content)
+        } else {
+            false
+        };
+        if !inside {
+            gesture.set_state(EventSequenceState::Claimed);
+            dialog.close();
+        }
+    });
+    surface.add_controller(outside_click.clone());
+    let surface_weak = surface.downgrade();
+    dialog.connect_closed(move |_| {
+        if let Some(surface) = surface_weak.upgrade() {
+            surface.remove_controller(&outside_click);
+        }
+    });
 }
 
 fn attach_playlist_picker_popover(

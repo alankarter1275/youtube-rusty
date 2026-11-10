@@ -55,6 +55,12 @@ impl VideoSummary {
         }]
     }
 
+    /// True only when YouTube identifies more than one credited channel.
+    /// The legacy channel fields are deliberately not used for this check.
+    pub fn is_collaboration(&self) -> bool {
+        self.collaborators.len() > 1
+    }
+
     /// Compact YouTube-style byline: the first credited channel plus an overflow count.
     pub fn channel_byline(&self) -> Option<String> {
         let credits = self.channel_credits();
@@ -431,10 +437,12 @@ mod tests {
         };
         assert_eq!(video.channel_byline().as_deref(), Some("Primary Channel and 2 more"));
         assert_eq!(video.channel_credits().len(), 3);
+        assert!(video.is_collaboration());
 
         video.collaborators.clear();
         assert_eq!(video.channel_byline().as_deref(), Some("Primary Channel"));
         assert_eq!(video.channel_credits().len(), 1);
+        assert!(!video.is_collaboration());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use crate::backend::history::HistoryEntry;
-use crate::backend::models::{ChannelSearchSummary, PlaylistSearchSummary, VideoSummary};
+use crate::backend::models::{
+    ChannelSearchSummary, PlaylistSearchSummary, VideoCollaborator, VideoSummary,
+};
 use crate::backend::playlists::SavedPlaylist;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use adw::prelude::*;
@@ -26,6 +28,83 @@ pub struct VideoCard {
     pub extra_channel_avatars: Vec<(String, String, adw::Avatar)>,
     pub picture: Picture,
     pub avatar: adw::Avatar,
+}
+
+/// Build YouTube-style collaboration avatars. Two channels share one row; three
+/// form a compact triangle; larger groups use a +N badge in the third position.
+pub(crate) fn build_collaborator_avatar_stack(
+    primary: &adw::Avatar,
+    credits: &[VideoCollaborator],
+    diameter: i32,
+) -> (Overlay, Vec<(String, String, adw::Avatar)>) {
+    let count = credits.len();
+    let overlap = (diameter * 5 / 12).max(5);
+    let width = if count > 1 {
+        diameter * 2 - overlap
+    } else {
+        diameter
+    };
+    let height = if count > 2 {
+        diameter * 2 - overlap
+    } else {
+        diameter
+    };
+
+    let stack = Overlay::new();
+    stack.set_size_request(width, height);
+    stack.set_halign(Align::Start);
+    stack.set_overflow(Overflow::Visible);
+    stack.set_child(Some(primary));
+    primary.set_halign(Align::Start);
+    primary.set_valign(Align::Start);
+    if count > 1 {
+        primary.add_css_class("yr-collaborator-avatar");
+    }
+
+    let real_avatar_count = if count >= 4 { 2 } else { count.min(3) };
+    let mut extra_avatars = Vec::new();
+    for index in 1..real_avatar_count {
+        let channel = &credits[index];
+        let avatar = adw::Avatar::new(diameter, Some(&channel.name), true);
+        avatar.set_size_request(diameter, diameter);
+        avatar.set_halign(Align::Start);
+        avatar.set_valign(Align::Start);
+        avatar.add_css_class("yr-collaborator-avatar");
+        let (x, y) = if index == 1 {
+            (diameter - overlap, 0)
+        } else {
+            (width.saturating_sub(diameter) / 2, diameter - overlap)
+        };
+        avatar.set_margin_start(x);
+        avatar.set_margin_top(y);
+        stack.add_overlay(&avatar);
+        extra_avatars.push((
+            channel.id.clone(),
+            channel.avatar_url.clone(),
+            avatar,
+        ));
+    }
+
+    if count >= 4 {
+        let more_count = count - 2;
+        let badge = GtkBox::new(Orientation::Vertical, 0);
+        badge.set_size_request(diameter, diameter);
+        badge.set_halign(Align::Start);
+        badge.set_valign(Align::Start);
+        badge.set_margin_start(width.saturating_sub(diameter) / 2);
+        badge.set_margin_top(diameter - overlap);
+        badge.add_css_class("yr-collaborator-overflow");
+        if diameter < 30 {
+            badge.add_css_class("small");
+        }
+        let label = Label::new(Some(&format!("+{more_count}")));
+        label.set_halign(Align::Center);
+        label.set_valign(Align::Center);
+        badge.append(&label);
+        stack.add_overlay(&badge);
+    }
+
+    (stack, extra_avatars)
 }
 
 impl VideoCard {
@@ -58,33 +137,12 @@ impl VideoCard {
             .first()
             .map(|channel| channel.name.as_str())
             .filter(|name| !name.is_empty());
-        let avatar = adw::Avatar::new(36, avatar_label, true);
+        let avatar_size = if channel_credits.len() > 1 { 28 } else { 36 };
+        let avatar = adw::Avatar::new(avatar_size, avatar_label, true);
         avatar.set_size_request(28, 28);
         avatar.set_valign(Align::Center);
-
-        let visible_credit_count = channel_credits.len().min(3);
-        let stack_width = match visible_credit_count {
-            0 | 1 => 36,
-            2 => 44,
-            _ => 58,
-        };
-        let avatar_stack = Overlay::new();
-        avatar_stack.set_size_request(stack_width, 36);
-        avatar_stack.set_child(Some(&avatar));
-        let mut extra_channel_avatars = Vec::new();
-        for (offset, channel) in channel_credits.iter().skip(1).take(2).enumerate() {
-            let extra = adw::Avatar::new(28, Some(&channel.name), true);
-            extra.set_size_request(28, 28);
-            extra.set_halign(Align::Start);
-            extra.set_valign(Align::Center);
-            extra.set_margin_start(15 + offset as i32 * 14);
-            avatar_stack.add_overlay(&extra);
-            extra_channel_avatars.push((
-                channel.id.clone(),
-                channel.avatar_url.clone(),
-                extra,
-            ));
-        }
+        let (avatar_stack, extra_channel_avatars) =
+            build_collaborator_avatar_stack(&avatar, &channel_credits, 28);
 
         let avatar_wrap = GtkBox::new(Orientation::Vertical, 0);
         avatar_wrap.set_valign(Align::Start);
@@ -277,33 +335,40 @@ impl VideoCard {
             info_box.append(&stats_label);
         }
 
-        let avatar_label = if !summary.channel_name.is_empty() {
-            &summary.channel_name
-        } else {
-            &summary.title
-        };
+        let channel_credits = summary.channel_credits();
+        let avatar_label = channel_credits
+            .first()
+            .map(|channel| channel.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&summary.title);
         let avatar = adw::Avatar::new(24, Some(avatar_label), true);
-        avatar.set_valign(Align::Center);
+        avatar.set_size_request(24, 24);
+        let (avatar_stack, extra_channel_avatars) =
+            build_collaborator_avatar_stack(&avatar, &channel_credits, 24);
 
         let mut channel_target = None;
-        if !summary.channel_name.is_empty() {
+        let byline = summary.channel_byline().unwrap_or_default();
+        if !byline.is_empty() {
             let channel_row = GtkBox::new(Orientation::Horizontal, 8);
             channel_row.set_halign(Align::Start);
             channel_row.set_valign(Align::Center);
             channel_row.set_margin_top(2);
             channel_row.set_margin_bottom(2);
 
-            let channel_label = Label::new(Some(&summary.channel_name));
+            let channel_label = Label::new(Some(&byline));
             channel_label.add_css_class("yr-meta");
-            if !summary.channel_id.is_empty() {
+            if let Some(channel) = channel_credits
+                .first()
+                .filter(|channel| !channel.id.is_empty())
+            {
                 channel_label.add_css_class("yr-chan-hover");
-                channel_row.set_tooltip_text(Some(&format!("Open {}", summary.channel_name)));
+                channel_row.set_tooltip_text(Some(&format!("Open {}", channel.name)));
                 set_pointer(&channel_row);
                 channel_target = Some(channel_row.clone());
             }
             channel_label.set_halign(Align::Start);
             channel_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            channel_row.append(&avatar);
+            channel_row.append(&avatar_stack);
             channel_row.append(&channel_label);
             info_box.append(&channel_row);
         }
@@ -333,7 +398,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
-            extra_channel_avatars: Vec::new(),
+            extra_channel_avatars,
             picture,
             avatar,
         }
