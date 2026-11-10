@@ -525,6 +525,10 @@ impl ChannelPage {
                         && cp.search_results.borrow().is_none()
                     {
                         cp.reload_sorted_tab();
+                    } else if cp.date_filter.get() != UploadDateFilter::AnyTime
+                        && cp.search_results.borrow().is_none()
+                    {
+                        cp.hydrate_loaded_shorts_for_date_filter();
                     } else {
                         cp.render_active_tab();
                     }
@@ -871,7 +875,14 @@ impl ChannelPage {
                 } else {
                     cp.filter_btn.remove_css_class("active");
                 }
-                cp.render_active_tab();
+                if df != UploadDateFilter::AnyTime
+                    && cp.active_tab.get() == ChannelTab::Shorts
+                    && cp.search_results.borrow().is_none()
+                {
+                    cp.hydrate_loaded_shorts_for_date_filter();
+                } else {
+                    cp.render_active_tab();
+                }
             }
         });
 
@@ -994,6 +1005,43 @@ impl ChannelPage {
         next
     }
 
+    fn hydrate_loaded_shorts_for_date_filter(self: &Rc<Self>) {
+        if self.date_filter.get() == UploadDateFilter::AnyTime
+            || self.active_tab.get() != ChannelTab::Shorts
+            || self.search_results.borrow().is_some()
+        {
+            self.render_active_tab();
+            return;
+        }
+
+        let req_id = self.next_request_id();
+        self.is_loading.set(true);
+        self.show_skeletons();
+        let items = self.shorts_list.borrow().clone();
+        let engine = self.engine.clone();
+        let (tx, rx) = async_channel::bounded::<Vec<VideoSummary>>(1);
+        self.runtime.spawn(async move {
+            let hydrated = engine.hydrate_shorts_upload_dates(items).await;
+            let _ = tx.send(hydrated).await;
+        });
+
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(items) = rx.recv().await else {
+                return;
+            };
+            let Some(cp) = weak.upgrade() else {
+                return;
+            };
+            if cp.request_seq.get() != req_id {
+                return;
+            }
+            *cp.shorts_list.borrow_mut() = items;
+            cp.is_loading.set(false);
+            cp.render_active_tab();
+        });
+    }
+
     fn reload_sorted_tab(self: &Rc<Self>) {
         if self.search_results.borrow().is_some() {
             self.render_active_tab();
@@ -1004,6 +1052,7 @@ impl ChannelPage {
         self.show_skeletons();
 
         let is_shorts = self.active_tab.get() == ChannelTab::Shorts;
+        let needs_shorts_dates = is_shorts && self.date_filter.get() != UploadDateFilter::AnyTime;
         let order = self.sort_order.get();
         let channel_id = self.channel_id.clone();
         let fallback = self.channel_details.borrow().clone();
@@ -1013,6 +1062,15 @@ impl ChannelPage {
             let result = engine
                 .channel_tab_ordered(&channel_id, is_shorts, order, fallback.as_ref())
                 .await;
+            let result = match result {
+                Ok(mut paged) => {
+                    if needs_shorts_dates {
+                        paged.items = engine.hydrate_shorts_upload_dates(paged.items).await;
+                    }
+                    Ok(paged)
+                }
+                Err(err) => Err(err),
+            };
             let _ = tx.send(result).await;
         });
 
@@ -1181,12 +1239,22 @@ impl ChannelPage {
         self.is_loading_more.set(true);
 
         let fallback = self.channel_details.borrow().clone();
+        let needs_shorts_dates = is_shorts && self.date_filter.get() != UploadDateFilter::AnyTime;
         let engine = self.engine.clone();
         let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
         self.runtime.spawn(async move {
             let res = engine
                 .load_more(&cursor, fallback.as_ref(), is_shorts, false)
                 .await;
+            let res = match res {
+                Ok(mut paged) => {
+                    if needs_shorts_dates {
+                        paged.items = engine.hydrate_shorts_upload_dates(paged.items).await;
+                    }
+                    Ok(paged)
+                }
+                Err(err) => Err(err),
+            };
             let _ = tx.send(res).await;
         });
 
@@ -1580,7 +1648,11 @@ impl ChannelPage {
         *self.shorts_cursor.borrow_mut() = paged.next;
         if self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none() {
             self.is_loading.set(false);
-            self.render_active_tab();
+            if self.date_filter.get() != UploadDateFilter::AnyTime {
+                self.hydrate_loaded_shorts_for_date_filter();
+            } else {
+                self.render_active_tab();
+            }
         }
     }
 
