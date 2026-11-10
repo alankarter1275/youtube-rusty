@@ -1704,15 +1704,10 @@ impl ChannelPage {
             }
         };
 
-        // Keep YouTube's source order for Shorts Newest/Oldest; their upload timestamps are
-        // incomplete. Popular remains locally sorted by view count, which is available on the
-        // Shorts cards and was the previously working behavior.
+        // Keep YouTube's source order for Shorts: its sort-chip continuation controls the order,
+        // while Shorts timestamps and view counts are incomplete approximations for local sorting.
         let has_search_results = self.search_results.borrow().is_some();
-        if should_sort_channel_items_locally(
-            self.active_tab.get(),
-            has_search_results,
-            self.sort_order.get(),
-        ) {
+        if should_sort_channel_items_locally(self.active_tab.get(), has_search_results) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -2222,12 +2217,8 @@ impl ChannelPage {
     }
 }
 
-fn should_sort_channel_items_locally(
-    tab: ChannelTab,
-    has_search_results: bool,
-    order: ChannelSortOrder,
-) -> bool {
-    has_search_results || tab != ChannelTab::Shorts || order == ChannelSortOrder::Popular
+fn should_sort_channel_items_locally(tab: ChannelTab, has_search_results: bool) -> bool {
+    has_search_results || tab != ChannelTab::Shorts
 }
 
 fn has_active_channel_filters(
@@ -2337,32 +2328,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channel_shorts_only_locally_sort_popular() {
-        assert!(!should_sort_channel_items_locally(
-            ChannelTab::Shorts,
-            false,
-            ChannelSortOrder::Newest
-        ));
-        assert!(!should_sort_channel_items_locally(
-            ChannelTab::Shorts,
-            false,
-            ChannelSortOrder::Oldest
-        ));
-        assert!(should_sort_channel_items_locally(
-            ChannelTab::Shorts,
-            false,
-            ChannelSortOrder::Popular
-        ));
-        assert!(should_sort_channel_items_locally(
-            ChannelTab::Videos,
-            false,
-            ChannelSortOrder::Newest
-        ));
-        assert!(should_sort_channel_items_locally(
-            ChannelTab::Shorts,
-            true,
-            ChannelSortOrder::Newest
-        ));
+    fn channel_shorts_preserve_youtube_sort_order() {
+        assert!(!should_sort_channel_items_locally(ChannelTab::Shorts, false));
+        assert!(should_sort_channel_items_locally(ChannelTab::Videos, false));
+        assert!(should_sort_channel_items_locally(ChannelTab::Shorts, true));
     }
 
     #[test]
