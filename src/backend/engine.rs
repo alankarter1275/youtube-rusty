@@ -1751,61 +1751,6 @@ impl Engine {
         }
     }
 
-    /// Fill missing upload dates for Shorts only when a date filter needs them. The Shorts
-    /// browse renderer often omits publish-time metadata, while video_details exposes it.
-    /// Bound requests so filtering a page does not fan out unbounded network work.
-    pub async fn hydrate_shorts_upload_dates(
-        self: &Arc<Self>,
-        mut items: Vec<VideoSummary>,
-    ) -> Vec<VideoSummary> {
-        let semaphore = Arc::new(Semaphore::new(4));
-        let mut jobs = JoinSet::new();
-
-        for (index, item) in items.iter().enumerate() {
-            if !item.is_short
-                || item.id.is_empty()
-                || item.published_unix.is_some()
-                || inferred_publish_timestamp(&item.published_text).is_some()
-            {
-                continue;
-            }
-
-            let engine = self.clone();
-            let semaphore = semaphore.clone();
-            let video_id = item.id.clone();
-            jobs.spawn(async move {
-                let _permit = semaphore.acquire_owned().await.ok()?;
-                let details = engine
-                    .rp_query()
-                    .await
-                    .video_details(&video_id)
-                    .await
-                    .ok()?;
-                let text = details.publish_date_txt.unwrap_or_default();
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .ok()
-                    .map(|duration| duration.as_secs() as i64)
-                    .unwrap_or(0);
-                let timestamp = details
-                    .publish_date
-                    .map(|date| date.unix_timestamp())
-                    .or_else(|| relative_published_timestamp(&text, now));
-                timestamp.map(|timestamp| (index, timestamp, text))
-            });
-        }
-
-        while let Some(result) = jobs.join_next().await {
-            if let Ok(Some((index, timestamp, text))) = result {
-                if let Some(item) = items.get_mut(index) {
-                    item.published_unix = Some(timestamp);
-                    item.published_text = text;
-                }
-            }
-        }
-        items
-    }
-
     pub async fn fetch_video_summary(&self, video_id: &str) -> Result<VideoSummary, String> {
         if let Ok(pool) = self.fetch_candidate_pool(video_id).await {
             if let Some(title) = pool.title.filter(|t| !t.is_empty()) {
@@ -4262,6 +4207,24 @@ fn inferred_publish_timestamp(text: &str) -> Option<i64> {
     relative_published_timestamp(text, now)
 }
 
+fn find_nested_continuation_token(node: &Value) -> Option<String> {
+    match node {
+        Value::Array(items) => items.iter().find_map(find_nested_continuation_token),
+        Value::Object(map) => {
+            if let Some(token) = node
+                .pointer("/continuationCommand/token")
+                .or_else(|| node.pointer("/continuationEndpoint/continuationCommand/token"))
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+            {
+                return Some(token.to_string());
+            }
+            map.values().find_map(find_nested_continuation_token)
+        }
+        _ => None,
+    }
+}
+
 fn extract_channel_sort_chip_token(node: &Value, wanted_label: &str) -> Option<String> {
     match node {
         Value::Array(items) => items
@@ -4271,29 +4234,8 @@ fn extract_channel_sort_chip_token(node: &Value, wanted_label: &str) -> Option<S
             if let Some(chip) = map.get("chipCloudChipRenderer") {
                 let label = extract_yt_text(chip.get("text")).unwrap_or_default();
                 if label.trim().eq_ignore_ascii_case(wanted_label) {
-                    if let Some(endpoint) = chip.get("navigationEndpoint") {
-                        if let Some(token) = endpoint
-                            .pointer("/continuationCommand/token")
-                            .or_else(|| endpoint.pointer("/continuationEndpoint/continuationCommand/token"))
-                            .and_then(Value::as_str)
-                            .filter(|token| !token.is_empty())
-                        {
-                            return Some(token.to_string());
-                        }
-                        if let Some(commands) = endpoint
-                            .pointer("/commandExecutorCommand/commands")
-                            .and_then(Value::as_array)
-                        {
-                            for command in commands {
-                                if let Some(token) = command
-                                    .pointer("/continuationCommand/token")
-                                    .and_then(Value::as_str)
-                                    .filter(|token| !token.is_empty())
-                                {
-                                    return Some(token.to_string());
-                                }
-                            }
-                        }
+                    if let Some(token) = find_nested_continuation_token(chip) {
+                        return Some(token);
                     }
                 }
             }
@@ -6794,5 +6736,20 @@ https://manifest.example/v1080_video.m3u8
             }
         });
         assert_eq!(extract_channel_sort_chip_token(&response, "oldest"), Some("OLDEST".into()));
+
+        let service_endpoint = json!({
+            "chipCloudChipRenderer": {
+                "text": { "simpleText": "Oldest" },
+                "serviceEndpoint": {
+                    "innertubeCommand": {
+                        "continuationCommand": { "token": "OLDEST_SERVICE" }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            extract_channel_sort_chip_token(&service_endpoint, "oldest"),
+            Some("OLDEST_SERVICE".into())
+        );
     }
 }

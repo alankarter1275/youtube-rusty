@@ -512,12 +512,8 @@ impl ChannelPage {
                 if let Some(cp) = weak.upgrade() {
                     cp.active_tab.set(ChannelTab::Shorts);
                     cp.filter_scan_pages.set(0);
-                    cp.duration_filter.set(DurationFilter::AnyLength);
-                    if cp.date_filter.get() == UploadDateFilter::AnyTime {
-                        cp.filter_btn.remove_css_class("active");
-                    }
                     cp.play_all_btn.set_visible(true);
-                    cp.filter_btn.set_visible(true);
+                    cp.filter_btn.set_visible(false);
                     cp.sort_btn.set_visible(true);
                     cp.update_grid_columns();
                     cp.scrolled.vadjustment().set_value(0.0);
@@ -525,10 +521,6 @@ impl ChannelPage {
                         && cp.search_results.borrow().is_none()
                     {
                         cp.reload_sorted_tab();
-                    } else if cp.date_filter.get() != UploadDateFilter::AnyTime
-                        && cp.search_results.borrow().is_none()
-                    {
-                        cp.hydrate_loaded_shorts_for_date_filter();
                     } else {
                         cp.render_active_tab();
                     }
@@ -875,14 +867,7 @@ impl ChannelPage {
                 } else {
                     cp.filter_btn.remove_css_class("active");
                 }
-                if df != UploadDateFilter::AnyTime
-                    && cp.active_tab.get() == ChannelTab::Shorts
-                    && cp.search_results.borrow().is_none()
-                {
-                    cp.hydrate_loaded_shorts_for_date_filter();
-                } else {
-                    cp.render_active_tab();
-                }
+                cp.render_active_tab();
             }
         });
 
@@ -1005,43 +990,6 @@ impl ChannelPage {
         next
     }
 
-    fn hydrate_loaded_shorts_for_date_filter(self: &Rc<Self>) {
-        if self.date_filter.get() == UploadDateFilter::AnyTime
-            || self.active_tab.get() != ChannelTab::Shorts
-            || self.search_results.borrow().is_some()
-        {
-            self.render_active_tab();
-            return;
-        }
-
-        let req_id = self.next_request_id();
-        self.is_loading.set(true);
-        self.show_skeletons();
-        let items = self.shorts_list.borrow().clone();
-        let engine = self.engine.clone();
-        let (tx, rx) = async_channel::bounded::<Vec<VideoSummary>>(1);
-        self.runtime.spawn(async move {
-            let hydrated = engine.hydrate_shorts_upload_dates(items).await;
-            let _ = tx.send(hydrated).await;
-        });
-
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let Ok(items) = rx.recv().await else {
-                return;
-            };
-            let Some(cp) = weak.upgrade() else {
-                return;
-            };
-            if cp.request_seq.get() != req_id {
-                return;
-            }
-            *cp.shorts_list.borrow_mut() = items;
-            cp.is_loading.set(false);
-            cp.render_active_tab();
-        });
-    }
-
     fn reload_sorted_tab(self: &Rc<Self>) {
         if self.search_results.borrow().is_some() {
             self.render_active_tab();
@@ -1052,7 +1000,6 @@ impl ChannelPage {
         self.show_skeletons();
 
         let is_shorts = self.active_tab.get() == ChannelTab::Shorts;
-        let needs_shorts_dates = is_shorts && self.date_filter.get() != UploadDateFilter::AnyTime;
         let order = self.sort_order.get();
         let channel_id = self.channel_id.clone();
         let fallback = self.channel_details.borrow().clone();
@@ -1062,15 +1009,6 @@ impl ChannelPage {
             let result = engine
                 .channel_tab_ordered(&channel_id, is_shorts, order, fallback.as_ref())
                 .await;
-            let result = match result {
-                Ok(mut paged) => {
-                    if needs_shorts_dates {
-                        paged.items = engine.hydrate_shorts_upload_dates(paged.items).await;
-                    }
-                    Ok(paged)
-                }
-                Err(err) => Err(err),
-            };
             let _ = tx.send(result).await;
         });
 
@@ -1096,9 +1034,9 @@ impl ChannelPage {
                         *cp.videos_cursor.borrow_mut() = paged.next;
                     }
                 }
-                Err(_) => {
-                    // Keep the current list and apply the selected order locally rather than
-                    // replacing the channel page with an error state.
+                Err(err) => {
+                    // Keep the current items, but don't silently imply the requested order loaded.
+                    (cp.actions.on_toast)(format!("Could not load sorted channel videos: {err}"));
                 }
             }
             cp.render_active_tab();
@@ -1239,22 +1177,12 @@ impl ChannelPage {
         self.is_loading_more.set(true);
 
         let fallback = self.channel_details.borrow().clone();
-        let needs_shorts_dates = is_shorts && self.date_filter.get() != UploadDateFilter::AnyTime;
         let engine = self.engine.clone();
         let (tx, rx) = async_channel::bounded::<Result<PagedVideos, String>>(1);
         self.runtime.spawn(async move {
             let res = engine
                 .load_more(&cursor, fallback.as_ref(), is_shorts, false)
                 .await;
-            let res = match res {
-                Ok(mut paged) => {
-                    if needs_shorts_dates {
-                        paged.items = engine.hydrate_shorts_upload_dates(paged.items).await;
-                    }
-                    Ok(paged)
-                }
-                Err(err) => Err(err),
-            };
             let _ = tx.send(res).await;
         });
 
@@ -1330,8 +1258,11 @@ impl ChannelPage {
                 }
                 Err(err) => {
                     (cp.actions.on_toast)(err);
-                    let has_filter = cp.date_filter.get() != UploadDateFilter::AnyTime
-                        || cp.duration_filter.get() != DurationFilter::AnyLength;
+                    let has_filter = has_active_channel_filters(
+                        cp.active_tab.get(),
+                        cp.date_filter.get(),
+                        cp.duration_filter.get(),
+                    );
                     if has_filter && cp.search_results.borrow().is_none() {
                         cp.show_status(
                             "Could not check more videos",
@@ -1648,11 +1579,7 @@ impl ChannelPage {
         *self.shorts_cursor.borrow_mut() = paged.next;
         if self.active_tab.get() == ChannelTab::Shorts && self.search_results.borrow().is_none() {
             self.is_loading.set(false);
-            if self.date_filter.get() != UploadDateFilter::AnyTime {
-                self.hydrate_loaded_shorts_for_date_filter();
-            } else {
-                self.render_active_tab();
-            }
+            self.render_active_tab();
         }
     }
 
@@ -1777,11 +1704,15 @@ impl ChannelPage {
             }
         };
 
-        // Videos may need a local sort because renderer metadata can be incomplete. For the
-        // channel Shorts tab, YouTube supplies the sort order (including Oldest via its sort
-        // chip continuation); re-sorting by approximate/missing metadata here would undo it.
+        // Keep YouTube's source order for Shorts Newest/Oldest; their upload timestamps are
+        // incomplete. Popular remains locally sorted by view count, which is available on the
+        // Shorts cards and was the previously working behavior.
         let has_search_results = self.search_results.borrow().is_some();
-        if should_sort_channel_items_locally(self.active_tab.get(), has_search_results) {
+        if should_sort_channel_items_locally(
+            self.active_tab.get(),
+            has_search_results,
+            self.sort_order.get(),
+        ) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -1800,13 +1731,16 @@ impl ChannelPage {
                     )
                 }),
                 ChannelSortOrder::Popular => {
-                    base.sort_by(|a, b| b.view_count.cmp(&a.view_count))
+                    base.sort_by(|a, b| compare_view_counts_desc(a.view_count, b.view_count))
                 }
             }
         }
 
-        let df = self.date_filter.get();
-        let duf = self.duration_filter.get();
+        let (df, duf) = if self.active_tab.get() == ChannelTab::Shorts {
+            (UploadDateFilter::AnyTime, DurationFilter::AnyLength)
+        } else {
+            (self.date_filter.get(), self.duration_filter.get())
+        };
         base.into_iter()
             .filter(|video| matches_local_filters(video, df, duf))
             .collect()
@@ -1843,8 +1777,11 @@ impl ChannelPage {
 
         let items = self.filtered_active_items();
         if items.is_empty() {
-            let has_channel_filter = self.date_filter.get() != UploadDateFilter::AnyTime
-                || self.duration_filter.get() != DurationFilter::AnyLength;
+            let has_channel_filter = has_active_channel_filters(
+                self.active_tab.get(),
+                self.date_filter.get(),
+                self.duration_filter.get(),
+            );
             let has_filter = has_channel_filter || self.search_results.borrow().is_some();
             if has_filter {
                 let can_scan_more = self.search_results.borrow().is_none()
@@ -1898,8 +1835,11 @@ impl ChannelPage {
 
         // Keep scanning filtered pages until the grid has a useful batch of matches, but cap
         // automatic requests so a restrictive filter cannot silently crawl an entire channel.
-        let has_channel_filter = self.date_filter.get() != UploadDateFilter::AnyTime
-            || self.duration_filter.get() != DurationFilter::AnyLength;
+        let has_channel_filter = has_active_channel_filters(
+            self.active_tab.get(),
+            self.date_filter.get(),
+            self.duration_filter.get(),
+        );
         let has_more = match self.active_tab.get() {
             ChannelTab::Videos => self.videos_cursor.borrow().is_some(),
             ChannelTab::Shorts => self.shorts_cursor.borrow().is_some(),
@@ -2282,8 +2222,26 @@ impl ChannelPage {
     }
 }
 
-fn should_sort_channel_items_locally(tab: ChannelTab, has_search_results: bool) -> bool {
-    has_search_results || tab != ChannelTab::Shorts
+fn should_sort_channel_items_locally(
+    tab: ChannelTab,
+    has_search_results: bool,
+    order: ChannelSortOrder,
+) -> bool {
+    has_search_results || tab != ChannelTab::Shorts || order == ChannelSortOrder::Popular
+}
+
+fn has_active_channel_filters(
+    tab: ChannelTab,
+    date_filter: UploadDateFilter,
+    duration_filter: DurationFilter,
+) -> bool {
+    tab != ChannelTab::Shorts
+        && (date_filter != UploadDateFilter::AnyTime
+            || duration_filter != DurationFilter::AnyLength)
+}
+
+fn compare_view_counts_desc(left: Option<u64>, right: Option<u64>) -> std::cmp::Ordering {
+    right.cmp(&left)
 }
 
 fn compare_optional_timestamps(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
@@ -2379,10 +2337,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn channel_shorts_keep_youtube_order_but_other_lists_sort_locally() {
-        assert!(!should_sort_channel_items_locally(ChannelTab::Shorts, false));
-        assert!(should_sort_channel_items_locally(ChannelTab::Videos, false));
-        assert!(should_sort_channel_items_locally(ChannelTab::Shorts, true));
+    fn channel_shorts_only_locally_sort_popular() {
+        assert!(!should_sort_channel_items_locally(
+            ChannelTab::Shorts,
+            false,
+            ChannelSortOrder::Newest
+        ));
+        assert!(!should_sort_channel_items_locally(
+            ChannelTab::Shorts,
+            false,
+            ChannelSortOrder::Oldest
+        ));
+        assert!(should_sort_channel_items_locally(
+            ChannelTab::Shorts,
+            false,
+            ChannelSortOrder::Popular
+        ));
+        assert!(should_sort_channel_items_locally(
+            ChannelTab::Videos,
+            false,
+            ChannelSortOrder::Newest
+        ));
+        assert!(should_sort_channel_items_locally(
+            ChannelTab::Shorts,
+            true,
+            ChannelSortOrder::Newest
+        ));
+    }
+
+    #[test]
+    fn shorts_listing_ignores_video_filter_state() {
+        assert!(!has_active_channel_filters(
+            ChannelTab::Shorts,
+            UploadDateFilter::ThisMonth,
+            DurationFilter::Under4Min
+        ));
+        assert!(has_active_channel_filters(
+            ChannelTab::Videos,
+            UploadDateFilter::ThisMonth,
+            DurationFilter::AnyLength
+        ));
+        assert!(!has_active_channel_filters(
+            ChannelTab::Shorts,
+            UploadDateFilter::ThisMonth,
+            DurationFilter::AnyLength
+        ));
+    }
+
+    #[test]
+    fn popular_sort_uses_descending_views_and_keeps_unknown_counts_last() {
+        assert_eq!(
+            compare_view_counts_desc(Some(100), Some(20)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_view_counts_desc(Some(20), None),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
