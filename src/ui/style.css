@@ -221,6 +221,22 @@ entry.yr-search placeholder,
 searchentry.yr-search placeholder {
   color: alpha(@yr_text2, 0.72);
 }
+entry.yr-search image.right {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 4px;
+  border-radius: 999px;
+  background-color: transparent;
+  color: alpha(@yr_text, 0.78);
+  transition: background-color 140ms ease, color 140ms ease;
+}
+entry.yr-search image.right:hover {
+  background-color: alpha(#E8DDD5, 0.16);
+  color: @yr_text;
+}
+entry.yr-search image.right:active {
+  background-color: alpha(#E8DDD5, 0.23);
+}
 .yr-chip {
   border-radius: 999px;
   padding: 7px 14px;

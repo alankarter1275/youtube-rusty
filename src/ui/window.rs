@@ -1096,7 +1096,7 @@ impl MainWindow {
             self.search_entry.set_secondary_icon_activatable(false);
         } else {
             self.search_entry
-                .set_secondary_icon_name(Some("edit-clear-symbolic"));
+                .set_secondary_icon_name(Some("window-close-symbolic"));
             self.search_entry.set_secondary_icon_activatable(true);
             self.search_entry
                 .set_secondary_icon_tooltip_text(Some("Clear search"));
@@ -1639,7 +1639,7 @@ impl MainWindow {
             });
 
             let rm_btn = Button::builder()
-                .icon_name("window-close-symbolic")
+                .icon_name("user-trash-symbolic")
                 .tooltip_text("Remove from search history")
                 .build();
             rm_btn.set_can_focus(false);
@@ -1731,7 +1731,7 @@ impl MainWindow {
 
             if is_hist {
                 let rm_btn = Button::builder()
-                    .icon_name("window-close-symbolic")
+                    .icon_name("user-trash-symbolic")
                     .tooltip_text("Remove from search history")
                     .build();
                 rm_btn.set_can_focus(false);

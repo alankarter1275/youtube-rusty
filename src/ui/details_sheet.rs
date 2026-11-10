@@ -384,14 +384,24 @@ impl DetailsSheet {
             let (Some(dialog), Some(parent)) = (dialog_weak.upgrade(), parent_weak.upgrade()) else {
                 return;
             };
-            let Some(bounds) = dialog.compute_bounds(&parent) else {
-                return;
+
+            // Pick the widget under the click rather than relying only on coordinate bounds:
+            // AdwDialog can be hosted in an internal overlay, where its bounds aren't always
+            // expressed in the same coordinate space as the parent window.
+            let dialog_widget = dialog.upcast_ref::<gtk4::Widget>();
+            let inside = if let Some(picked) = parent.pick(x, y, gtk4::PickFlags::DEFAULT) {
+                picked == *dialog_widget || picked.is_ancestor(dialog_widget)
+            } else if let Some(bounds) = dialog.compute_bounds(&parent) {
+                let left = bounds.x() as f64;
+                let top = bounds.y() as f64;
+                x >= left
+                    && x <= left + bounds.width() as f64
+                    && y >= top
+                    && y <= top + bounds.height() as f64
+            } else {
+                false
             };
-            let left = bounds.x() as f64;
-            let top = bounds.y() as f64;
-            let right = left + bounds.width() as f64;
-            let bottom = top + bounds.height() as f64;
-            let inside = x >= left && x <= right && y >= top && y <= bottom;
+
             if !inside {
                 gesture.set_state(EventSequenceState::Claimed);
                 dialog.close();
