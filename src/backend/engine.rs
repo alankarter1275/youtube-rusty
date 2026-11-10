@@ -2496,37 +2496,44 @@ impl Engine {
             return Ok(paged);
         }
 
-        // Shorts sorting chips carry opaque continuation tokens. Use YouTube's own chip token
-        // for both Popular and Oldest so the request matches the browser's sort selection.
-        if is_shorts {
-            let wanted_label = match order {
-                ChannelSortOrder::Popular => Some("popular"),
-                ChannelSortOrder::Oldest => Some("oldest"),
-                ChannelSortOrder::Newest => None,
+        // YouTube's sort controls carry opaque continuation tokens. Reuse the selected chip's
+        // token directly instead of asking RustyPipe to synthesize one that the endpoint rejects.
+        let wanted_label = match order {
+            ChannelSortOrder::Popular => Some("popular"),
+            ChannelSortOrder::Oldest => Some("oldest"),
+            ChannelSortOrder::Newest => None,
+        };
+        if let Some(label) = wanted_label {
+            let params = if is_shorts {
+                "EgZzaG9ydHPyBgUKA5oBAA%3D%3D"
+            } else {
+                "EgZ2aWRlb3PyBgQKAjoA"
             };
-            if let Some(label) = wanted_label {
-                let raw = self
-                    .fetch_channel_browse_json(
-                        channel_id,
-                        Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
-                        None,
-                    )
-                    .await
-                    .map_err(|err| format!("Could not load Shorts sort options: {err}"))?;
-                let token = extract_channel_sort_chip_token(&raw, label).or_else(|| {
-                    if order == ChannelSortOrder::Popular {
-                        extract_channel_sort_chip_token(&raw, "most popular")
-                    } else {
-                        None
-                    }
-                });
-                let token = token.ok_or_else(|| {
-                    format!("YouTube did not return a Shorts {label} sort token")
-                })?;
+            let tab_name = if is_shorts { "Shorts" } else { "Videos" };
+            let raw = self
+                .fetch_channel_browse_json(channel_id, Some(params), None)
+                .await
+                .map_err(|err| format!("Could not load {tab_name} sort options: {err}"))?;
+            let token = extract_channel_sort_chip_token(&raw, label).or_else(|| {
+                if order == ChannelSortOrder::Popular {
+                    extract_channel_sort_chip_token(&raw, "most popular")
+                } else {
+                    None
+                }
+            });
+            let token = token.ok_or_else(|| {
+                format!("YouTube did not return a {tab_name} {label} sort token")
+            })?;
+            if is_shorts {
                 return self
                     .continue_channel_shorts_direct(&token, fallback_details)
                     .await;
             }
+            let mut page = self.continue_playlist_videos_direct(&token).await?;
+            if let Some(next) = page.next.as_mut() {
+                next.kind = CursorKind::DirectHomeFeed;
+            }
+            return Ok(page);
         }
 
         let tab = if is_shorts {
