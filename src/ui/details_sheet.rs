@@ -495,6 +495,19 @@ fn build_collaborators_popover(
         name.set_xalign(0.0);
         name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         name.add_css_class("yr-title");
+        if !channel.id.is_empty() {
+            name.add_css_class("yr-chan-hover");
+            set_pointer(&name);
+            let channel_id = channel.id.clone();
+            let channel_name = channel.name.clone();
+            let on_open_channel = actions.on_open_channel.clone();
+            let open_channel = GestureClick::new();
+            open_channel.set_button(1);
+            open_channel.connect_released(move |_, _, _, _| {
+                on_open_channel(channel_id.clone(), channel_name.clone());
+            });
+            name.add_controller(open_channel);
+        }
         info.append(&name);
 
         let metadata = [
