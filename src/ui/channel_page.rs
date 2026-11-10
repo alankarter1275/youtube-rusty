@@ -855,7 +855,7 @@ impl ChannelPage {
         let weak_apply = Rc::downgrade(self);
         let pop_apply = popover.downgrade();
         let pd_apply = pending_date;
-        let pdur_apply = pending_dur;
+        let pdur_apply = pending_dur.clone();
         apply_btn.connect_clicked(move |_| {
             if let Some(pop) = pop_apply.upgrade() {
                 pop.popdown();
