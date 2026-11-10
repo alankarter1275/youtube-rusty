@@ -486,7 +486,16 @@ impl VideoCard {
 
         let click_target = GtkBox::new(Orientation::Horizontal, gap);
         click_target.set_hexpand(true);
+        click_target.set_focusable(true);
+        click_target.set_tooltip_text(Some("Click or focus this row, then press Alt+Up or Alt+Down to reorder"));
         set_pointer(&click_target);
+        let focus_click = GestureClick::new();
+        focus_click.set_button(1);
+        let click_focus = click_target.clone();
+        focus_click.connect_pressed(move |_, _, _, _| {
+            click_focus.grab_focus();
+        });
+        click_target.add_controller(focus_click);
 
         let idx_lbl = Label::new(Some(&format!("{}", index + 1)));
         idx_lbl.add_css_class("yr-meta");
@@ -529,7 +538,7 @@ impl VideoCard {
             let reorder: Rc<dyn Fn(usize, usize)> = Rc::new(on_reorder);
             let drag_handle = Button::builder()
                 .icon_name("list-drag-handle-symbolic")
-                .tooltip_text("Drag to reorder · Alt+Up/Down also works")
+                .tooltip_text("Drag to reorder; focus this handle and press Alt+Up or Alt+Down")
                 .valign(Align::Center)
                 .build();
             drag_handle.add_css_class("flat");
@@ -545,46 +554,84 @@ impl VideoCard {
             });
             drag_handle.add_controller(drag_source);
 
-            let key_controller = EventControllerKey::new();
-            let reorder_key = Rc::clone(&reorder);
-            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
-                if !modifiers.contains(gdk::ModifierType::ALT_MASK) {
-                    return gtk4::glib::Propagation::Proceed;
-                }
-                let target = if key == gdk::Key::Up && index > 0 {
-                    Some(index - 1)
-                } else if key == gdk::Key::Down && index + 1 < total {
-                    Some(index + 1)
-                } else {
-                    None
-                };
-                if let Some(target) = target {
-                    reorder_key(index, target);
+            let reorder_key_action: Rc<dyn Fn(gdk::Key, gdk::ModifierType) -> bool> = {
+                let reorder = Rc::clone(&reorder);
+                Rc::new(move |key, modifiers| {
+                    if !modifiers.contains(gdk::ModifierType::ALT_MASK) {
+                        return false;
+                    }
+                    let target = if key == gdk::Key::Up && index > 0 {
+                        Some(index - 1)
+                    } else if key == gdk::Key::Down && index + 1 < total {
+                        Some(index + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        reorder(index, target);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            };
+            let handle_keys = EventControllerKey::new();
+            let action = Rc::clone(&reorder_key_action);
+            handle_keys.connect_key_pressed(move |_, key, _, modifiers| {
+                if action(key, modifiers) {
                     gtk4::glib::Propagation::Stop
                 } else {
                     gtk4::glib::Propagation::Proceed
                 }
             });
-            drag_handle.add_controller(key_controller);
+            drag_handle.add_controller(handle_keys);
+
+            let row_keys = EventControllerKey::new();
+            row_keys.connect_key_pressed(move |_, key, _, modifiers| {
+                if reorder_key_action(key, modifiers) {
+                    gtk4::glib::Propagation::Stop
+                } else {
+                    gtk4::glib::Propagation::Proceed
+                }
+            });
+            click_target.add_controller(row_keys);
 
             let drop_target = DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
-            let row_enter = root_box.clone();
-            drop_target.connect_enter(move |_, _, _| {
-                row_enter.add_css_class("drop-target");
+            let row_motion = root_box.clone();
+            drop_target.connect_motion(move |_, _, y| {
+                row_motion.remove_css_class("drop-before");
+                row_motion.remove_css_class("drop-after");
+                if y < row_motion.height() as f64 / 2.0 {
+                    row_motion.add_css_class("drop-before");
+                } else {
+                    row_motion.add_css_class("drop-after");
+                }
                 gdk::DragAction::MOVE
             });
             let row_leave = root_box.clone();
             drop_target.connect_leave(move |_| {
-                row_leave.remove_css_class("drop-target");
+                row_leave.remove_css_class("drop-before");
+                row_leave.remove_css_class("drop-after");
             });
             let row_drop = root_box.clone();
             let reorder_drop = Rc::clone(&reorder);
-            drop_target.connect_drop(move |_, value, _, _| {
-                row_drop.remove_css_class("drop-target");
+            drop_target.connect_drop(move |_, value, _, y| {
+                row_drop.remove_css_class("drop-before");
+                row_drop.remove_css_class("drop-after");
                 if let Ok(from) = value.get::<u32>() {
                     let from = from as usize;
-                    if from < total && from != index {
-                        reorder_drop(from, index);
+                    let insertion = if y < row_drop.height() as f64 / 2.0 {
+                        index
+                    } else {
+                        index + 1
+                    };
+                    let to = if from < insertion {
+                        insertion.saturating_sub(1)
+                    } else {
+                        insertion
+                    };
+                    if from < total && to < total && from != to {
+                        reorder_drop(from, to);
                         return true;
                     }
                 }

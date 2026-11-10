@@ -374,26 +374,29 @@ impl DetailsSheet {
         // capture phase and compare against the actual content card, not the full-screen dialog
         // host/backdrop, so clicks on the dimmed area dismiss while dialog controls remain usable.
         let parent_widget = parent.upcast_ref::<gtk4::Widget>().clone();
+        // AdwApplicationWindow's first child is its AdwDialogHost. Attach to that actual
+        // presentation layer: it contains both the app content and the dimmed dialog backdrop.
+        let event_host = parent_widget
+            .first_child()
+            .unwrap_or_else(|| parent_widget.clone());
         let content_widget = content_box.upcast_ref::<gtk4::Widget>().clone();
         let outside_click = GestureClick::new();
         outside_click.set_button(1);
         outside_click.set_propagation_phase(PropagationPhase::Capture);
         let dialog_weak = dialog.downgrade();
-        let parent_weak = parent_widget.downgrade();
+        let host_weak = event_host.downgrade();
         let content_weak = content_widget.downgrade();
         outside_click.connect_pressed(move |gesture, _, x, y| {
-            let (Some(dialog), Some(parent), Some(content)) = (
+            let (Some(dialog), Some(host), Some(content)) = (
                 dialog_weak.upgrade(),
-                parent_weak.upgrade(),
+                host_weak.upgrade(),
                 content_weak.upgrade(),
             ) else {
                 return;
             };
 
-// The dialog widget may cover the whole overlay and the backdrop may itself be
-            // pickable. Prefer the content card's transformed bounds; use widget ancestry only
-            // when GTK cannot express those bounds in the parent window's coordinate space.
-            let bounds = content.compute_bounds(&parent);
+            // Compare coordinates in the same content-root coordinate space as this gesture.
+            let bounds = content.compute_bounds(&host);
             let inside = if let Some(bounds) = bounds {
                 let left = bounds.x() as f64;
                 let top = bounds.y() as f64;
@@ -401,7 +404,7 @@ impl DetailsSheet {
                     && x <= left + bounds.width() as f64
                     && y >= top
                     && y <= top + bounds.height() as f64
-            } else if let Some(picked) = parent.pick(x, y, gtk4::PickFlags::DEFAULT) {
+            } else if let Some(picked) = host.pick(x, y, gtk4::PickFlags::DEFAULT) {
                 picked == content || picked.is_ancestor(&content)
             } else {
                 false
@@ -412,12 +415,12 @@ impl DetailsSheet {
                 dialog.close();
             }
         });
-        parent_widget.add_controller(outside_click.clone());
+        event_host.add_controller(outside_click.clone());
 
-        let parent_weak = parent_widget.downgrade();
+        let host_weak = event_host.downgrade();
         dialog.connect_closed(move |_| {
-            if let Some(parent) = parent_weak.upgrade() {
-                parent.remove_controller(&outside_click);
+            if let Some(host) = host_weak.upgrade() {
+                host.remove_controller(&outside_click);
             }
         });
         dialog.present(Some(parent));

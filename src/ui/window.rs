@@ -4736,6 +4736,8 @@ impl MainWindow {
                     if let Some(w) = weak_reorder.upgrade() {
                         if w.playlist_store.move_video(&pid, from, to) {
                             w.open_saved_playlist(&pid);
+                            w.highlight_reordered_playlist_row(to);
+                            w.focus_playlist_reorder_row(to);
                         }
                     }
                 },
@@ -4769,6 +4771,38 @@ impl MainWindow {
             self.wire_playlist_track_interactions(&card, vid, idx, &actions);
             self.flow_box.append(&card.container);
         }
+    }
+
+    fn highlight_reordered_playlist_row(&self, index: usize) {
+        let Some(child) = self.flow_box.child_at_index(index as i32) else {
+            return;
+        };
+        let Some(row) = child.child() else {
+            return;
+        };
+        row.add_css_class("reordered");
+        let row_weak = row.downgrade();
+        glib::timeout_add_local_once(Duration::from_millis(420), move || {
+            if let Some(row) = row_weak.upgrade() {
+                row.remove_css_class("reordered");
+            }
+        });
+    }
+
+    fn focus_playlist_reorder_row(self: &Rc<Self>, index: usize) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if let Some(child) = win.flow_box.child_at_index(index as i32) {
+                if let Some(row) = child.child() {
+                    if let Some(handle) = row.first_child() {
+                        handle.grab_focus();
+                    }
+                }
+            }
+        });
     }
 
     pub fn open_remote_playlist(self: &Rc<Self>, playlist_id: &str) {
