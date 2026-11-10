@@ -144,14 +144,35 @@ impl PlaylistStore {
         true
     }
 
-    pub fn remove_video_at(&self, playlist_id: &str, index: usize) {
+    pub fn remove_video_at(&self, playlist_id: &str, index: usize) -> Option<VideoSummary> {
         let mut list = self.load_all();
         if let Some(pl) = list.iter_mut().find(|p| p.id == playlist_id) {
             if index < pl.videos.len() {
-                pl.videos.remove(index);
+                let removed = pl.videos.remove(index);
                 self.save_all(&list);
+                return Some(removed);
             }
         }
+        None
+    }
+
+    /// Restores a removed video at its former position, or at the end if the playlist changed.
+    pub fn insert_video_at(
+        &self,
+        playlist_id: &str,
+        index: usize,
+        video: VideoSummary,
+    ) -> bool {
+        let mut list = self.load_all();
+        let Some(pl) = list.iter_mut().find(|p| p.id == playlist_id) else {
+            return false;
+        };
+        if pl.videos.iter().any(|existing| existing.id == video.id) {
+            return false;
+        }
+        pl.videos.insert(index.min(pl.videos.len()), video);
+        self.save_all(&list);
+        true
     }
 
     pub fn move_video(&self, playlist_id: &str, from_idx: usize, to_idx: usize) -> bool {
@@ -237,8 +258,11 @@ mod tests {
         assert!(store.rename(&pl.id, "Focus Mix"));
         assert_eq!(store.get(&pl.id).unwrap().name, "Focus Mix");
 
-        store.remove_video_at(&pl.id, 0);
+        let removed = store.remove_video_at(&pl.id, 0).unwrap();
+        assert_eq!(removed.id, "v2");
         assert_eq!(store.get(&pl.id).unwrap().videos.len(), 1);
+        assert!(store.insert_video_at(&pl.id, 0, removed));
+        assert_eq!(store.get(&pl.id).unwrap().videos[0].id, "v2");
 
         store.delete(&pl.id);
         assert!(store.load_all().is_empty());

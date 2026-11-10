@@ -4741,8 +4741,27 @@ impl MainWindow {
                 },
                 move || {
                     if let Some(w) = weak_remove.upgrade() {
-                        w.playlist_store.remove_video_at(&pid_remove, idx);
-                        w.open_saved_playlist(&pid_remove);
+                        if let Some(removed_video) = w.playlist_store.remove_video_at(&pid_remove, idx)
+                        {
+                            w.open_saved_playlist(&pid_remove);
+
+                            let toast = adw::Toast::new("Removed video from playlist");
+                            toast.set_button_label(Some("Undo"));
+                            let weak_undo = Rc::downgrade(&w);
+                            let pid_undo = pid_remove.clone();
+                            toast.connect_button_clicked(move |_| {
+                                if let Some(w) = weak_undo.upgrade() {
+                                    if w.playlist_store.insert_video_at(
+                                        &pid_undo,
+                                        idx,
+                                        removed_video.clone(),
+                                    ) {
+                                        w.open_saved_playlist(&pid_undo);
+                                    }
+                                }
+                            });
+                            w.toast_overlay.add_toast(toast);
+                        }
                     }
                 },
             );
