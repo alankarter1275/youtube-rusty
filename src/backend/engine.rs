@@ -1923,6 +1923,7 @@ impl Engine {
         };
 
         let direct_date = match &date_window {
+            UploadDate::Hour => UploadDateFilter::Today,
             UploadDate::Day => UploadDateFilter::Today,
             UploadDate::Week => UploadDateFilter::ThisWeek,
             UploadDate::Month => UploadDateFilter::ThisMonth,
