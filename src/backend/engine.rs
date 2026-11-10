@@ -2496,22 +2496,35 @@ impl Engine {
             return Ok(paged);
         }
 
-        // The Shorts browse endpoint exposes sort chips as continuation tokens. RustyPipe's
-        // tab-order request can return the default order for Oldest on this tab, so prefer the
-        // explicit YouTube chip when it is available.
-        if is_shorts && order == ChannelSortOrder::Oldest {
-            if let Ok(raw) = self
-                .fetch_channel_browse_json(
-                    channel_id,
-                    Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
-                    None,
-                )
-                .await
-            {
-                if let Some(token) = extract_channel_sort_chip_token(&raw, "oldest") {
-                    return self
-                        .continue_channel_shorts_direct(&token, fallback_details)
-                        .await;
+        // Shorts sorting chips carry opaque continuation tokens. Use YouTube's own chip token
+        // for both Popular and Oldest so the request matches the browser's sort selection.
+        if is_shorts {
+            let wanted_label = match order {
+                ChannelSortOrder::Popular => Some("popular"),
+                ChannelSortOrder::Oldest => Some("oldest"),
+                ChannelSortOrder::Newest => None,
+            };
+            if let Some(label) = wanted_label {
+                if let Ok(raw) = self
+                    .fetch_channel_browse_json(
+                        channel_id,
+                        Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
+                        None,
+                    )
+                    .await
+                {
+                    let token = extract_channel_sort_chip_token(&raw, label).or_else(|| {
+                        if order == ChannelSortOrder::Popular {
+                            extract_channel_sort_chip_token(&raw, "most popular")
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(token) = token {
+                        return self
+                            .continue_channel_shorts_direct(&token, fallback_details)
+                            .await;
+                    }
                 }
             }
         }
@@ -6718,7 +6731,7 @@ https://manifest.example/v1080_video.m3u8
     }
 
     #[test]
-    fn test_channel_oldest_chip_token_extraction() {
+    fn test_channel_sort_chip_token_extraction() {
         let response = json!({
             "header": {
                 "chipCloudRenderer": {
@@ -6728,6 +6741,14 @@ https://manifest.example/v1080_video.m3u8
                             "navigationEndpoint": { "continuationCommand": { "token": "LATEST" } }
                         }},
                         { "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Popular" },
+                            "navigationEndpoint": { "continuationCommand": { "token": "POPULAR" } }
+                        }},
+                        { "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Most popular" },
+                            "navigationEndpoint": { "continuationCommand": { "token": "MOST_POPULAR" } }
+                        }},
+                        { "chipCloudChipRenderer": {
                             "text": { "simpleText": "Oldest" },
                             "navigationEndpoint": { "continuationCommand": { "token": "OLDEST" } }
                         }}
@@ -6735,7 +6756,18 @@ https://manifest.example/v1080_video.m3u8
                 }
             }
         });
-        assert_eq!(extract_channel_sort_chip_token(&response, "oldest"), Some("OLDEST".into()));
+        assert_eq!(
+            extract_channel_sort_chip_token(&response, "oldest"),
+            Some("OLDEST".into())
+        );
+        assert_eq!(
+            extract_channel_sort_chip_token(&response, "popular"),
+            Some("POPULAR".into())
+        );
+        assert_eq!(
+            extract_channel_sort_chip_token(&response, "most popular"),
+            Some("MOST_POPULAR".into())
+        );
 
         let service_endpoint = json!({
             "chipCloudChipRenderer": {
