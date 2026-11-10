@@ -26,8 +26,8 @@ use crate::ui::video_card::{
 use adw::prelude::*;
 use gtk4::gdk::{self, Display};
 use gtk4::{
-    gio, glib, Align, Box as GtkBox, Button, CssProvider, Editable, Entry, EntryIconPosition,
-    EventControllerFocus, EventControllerKey, FlowBox, GestureClick, Image, Label, MenuButton,
+    gio, glib, Align, Box as GtkBox, Button, CssProvider, Editable, Entry, EventControllerFocus,
+    EventControllerKey, FlowBox, GestureClick, Image, Label, MenuButton,
     Orientation, Overlay, Popover, PropagationPhase, ScrolledWindow, SelectionMode, Separator,
     Switch,
 };
@@ -90,6 +90,7 @@ pub struct MainWindow {
     back_btn: Button,
     refresh_btn: Button,
     pub search_entry: Entry,
+    search_clear_btn: Button,
     search_dropdown_clamp: adw::Clamp,
     search_suggest_box: GtkBox,
     suggest_items: RefCell<Vec<(String, GtkBox)>>,
@@ -238,7 +239,23 @@ impl MainWindow {
             .hexpand(true)
             .build();
         search_entry.add_css_class("yr-search");
-        search_clamp.set_child(Some(&search_entry));
+        search_entry.add_css_class("yr-main-search");
+        let search_clear_btn = Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Clear search")
+            .visible(false)
+            .build();
+        search_clear_btn.add_css_class("flat");
+        search_clear_btn.add_css_class("yr-search-clear");
+        search_clear_btn.set_halign(Align::End);
+        search_clear_btn.set_valign(Align::Center);
+        search_clear_btn.set_margin_end(8);
+        search_clear_btn.set_focus_on_click(false);
+        set_pointer(&search_clear_btn);
+        let search_overlay = Overlay::new();
+        search_overlay.set_child(Some(&search_entry));
+        search_overlay.add_overlay(&search_clear_btn);
+        search_clamp.set_child(Some(&search_overlay));
         header_bar.set_title_widget(Some(&search_clamp));
 
         // Primary Menu + Refresh Buttons at the top right
@@ -669,6 +686,7 @@ impl MainWindow {
             back_btn,
             refresh_btn,
             search_entry,
+            search_clear_btn,
             search_dropdown_clamp,
             search_suggest_box,
             suggest_items: RefCell::new(Vec::new()),
@@ -1090,17 +1108,8 @@ impl MainWindow {
     }
 
     fn update_search_clear_icon(&self) {
-        if self.search_entry.text().is_empty() {
-            self.search_entry
-                .set_secondary_icon_name(Option::<&str>::None);
-            self.search_entry.set_secondary_icon_activatable(false);
-        } else {
-            self.search_entry
-                .set_secondary_icon_name(Some("window-close-symbolic"));
-            self.search_entry.set_secondary_icon_activatable(true);
-            self.search_entry
-                .set_secondary_icon_tooltip_text(Some("Clear search"));
-        }
+        self.search_clear_btn
+            .set_visible(!self.search_entry.text().is_empty());
     }
 
     fn hide_search_dropdown(&self) {
@@ -1314,16 +1323,14 @@ impl MainWindow {
     }
 
     fn setup_search_suggestions_bar(self: &Rc<Self>) {
-        // Secondary clear icon (`×`) inside Search Entry clears text without hijacking the active page
-        let weak_icon = Rc::downgrade(self);
-        self.search_entry.connect_icon_release(move |_, pos| {
-            if pos == EntryIconPosition::Secondary {
-                if let Some(w) = weak_icon.upgrade() {
-                    w.set_search_text_quietly("");
-                    *w.typed_before_nav.borrow_mut() = String::new();
-                    w.search_entry.grab_focus();
-                    w.refresh_search_dropdown();
-                }
+        // Separate overlay button gives the clear X a precise circular hover target.
+        let weak_clear = Rc::downgrade(self);
+        self.search_clear_btn.connect_clicked(move |_| {
+            if let Some(w) = weak_clear.upgrade() {
+                w.set_search_text_quietly("");
+                *w.typed_before_nav.borrow_mut() = String::new();
+                w.search_entry.grab_focus();
+                w.refresh_search_dropdown();
             }
         });
 

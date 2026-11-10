@@ -221,21 +221,34 @@ entry.yr-search placeholder,
 searchentry.yr-search placeholder {
   color: alpha(@yr_text2, 0.72);
 }
-entry.yr-search image.right {
+entry.yr-main-search {
+  padding-right: 44px;
+}
+button.yr-search-clear {
   min-width: 24px;
   min-height: 24px;
-  padding: 4px;
-  border-radius: 999px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
   background-color: transparent;
   color: alpha(@yr_text, 0.78);
+  box-shadow: none;
   transition: background-color 140ms ease, color 140ms ease;
 }
-entry.yr-search image.right:hover {
+button.yr-search-clear:hover {
+  border-radius: 50%;
   background-color: alpha(#E8DDD5, 0.16);
   color: @yr_text;
+  box-shadow: none;
 }
-entry.yr-search image.right:active {
+button.yr-search-clear:active {
+  border-radius: 50%;
   background-color: alpha(#E8DDD5, 0.23);
+  box-shadow: none;
+}
+button.yr-search-clear image {
+  min-width: 14px;
+  min-height: 14px;
 }
 .yr-chip {
   border-radius: 999px;
