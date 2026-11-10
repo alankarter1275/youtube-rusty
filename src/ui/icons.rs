@@ -9,6 +9,7 @@ pub enum KalamIcon {
     Home,
     Subscriptions,
     Playlists,
+    WatchLater,
     History,
     Settings,
     Menu,
@@ -100,6 +101,22 @@ pub fn make_icon(kind: KalamIcon, size: i32) -> DrawingArea {
                 cr.line_to(14.8, 20.0);
                 cr.close_path();
                 let _ = cr.fill();
+            }
+            KalamIcon::WatchLater => {
+                setup_stroke(cr, w, h);
+                cr.move_to(6.0, 3.5);
+                cr.line_to(18.0, 3.5);
+                cr.line_to(18.0, 20.5);
+                cr.line_to(12.0, 16.5);
+                cr.line_to(6.0, 20.5);
+                cr.close_path();
+                let _ = cr.stroke();
+                cr.arc(16.8, 16.8, 4.0, 0.0, 2.0 * PI);
+                let _ = cr.stroke();
+                cr.move_to(16.8, 14.5);
+                cr.line_to(16.8, 16.8);
+                cr.line_to(18.2, 17.8);
+                let _ = cr.stroke();
             }
             KalamIcon::History => {
                 setup_stroke(cr, w, h);

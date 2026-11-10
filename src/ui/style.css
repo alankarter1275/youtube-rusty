@@ -188,6 +188,31 @@ flowboxchild:hover, flowboxchild:selected, flowboxchild:focus {
   background-color: @yr_accent_hi;
   color: @yr_on_accent;
 }
+menubutton.yr-menu-round,
+menubutton.yr-menu-round > button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+}
+menubutton.yr-menu-round:hover,
+menubutton.yr-menu-round > button:hover,
+menubutton.yr-menu-round:checked,
+menubutton.yr-menu-round > button:checked {
+  border-radius: 999px;
+  background-color: alpha(#E8DDD5, 0.08);
+  box-shadow: none;
+}
+menubutton.yr-menu-round:focus-visible,
+menubutton.yr-menu-round > button:focus-visible {
+  outline: 2px solid alpha(@yr_accent, 0.8);
+  outline-offset: 1px;
+  border-radius: 999px;
+  box-shadow: none;
+}
 
 /* ---------- search + chips + buttons (no double focus ring) ---------- */
 .yr-search, entry.yr-search, searchentry.yr-search {
@@ -412,6 +437,26 @@ progressbar.yr-progress progress {
 }
 .yr-queue-row.drop-target {
   background-color: alpha(#E8DDD5, 0.14);
+}
+.yr-playlist-row {
+  border-radius: 12px;
+  padding: 4px 6px;
+}
+.yr-playlist-row.drop-target {
+  background-color: alpha(@yr_accent, 0.18);
+  outline: 1px solid alpha(@yr_accent, 0.55);
+}
+button.yr-playlist-drag-handle {
+  min-width: 36px;
+  min-height: 44px;
+  padding: 0;
+  border-radius: 10px;
+  color: alpha(@yr_text2, 0.76);
+}
+button.yr-playlist-drag-handle:hover,
+button.yr-playlist-drag-handle:focus-visible {
+  background-color: alpha(#E8DDD5, 0.10);
+  color: @yr_text;
 }
 
 /* ---------- popovers, search dropdown, menus, sheet ---------- */

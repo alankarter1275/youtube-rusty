@@ -4,8 +4,9 @@ use crate::backend::playlists::SavedPlaylist;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use adw::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, EventSequenceState, GestureClick, GestureLongPress, Label,
-    Orientation, Overflow, Overlay, Picture, PropagationPhase,
+    gdk, Align, Box as GtkBox, Button, DragSource, DropTarget, EventControllerKey,
+    EventSequenceState, GestureClick, GestureLongPress, Label, Orientation, Overflow, Overlay,
+    Picture, PropagationPhase,
 };
 use libadwaita as adw;
 use std::rc::Rc;
@@ -469,8 +470,7 @@ impl VideoCard {
         total: usize,
         layout: ListCardLayout,
         editable: bool,
-        on_move_up: impl Fn() + 'static,
-        on_move_down: impl Fn() + 'static,
+        on_reorder: impl Fn(usize, usize) + 'static,
         on_remove: impl Fn() + 'static,
     ) -> Self {
         let (thumb_w, thumb_h, gap) = match layout {
@@ -482,6 +482,7 @@ impl VideoCard {
         let root_box = GtkBox::new(Orientation::Horizontal, 8);
         root_box.set_hexpand(true);
         root_box.add_css_class("yr-history-row");
+        root_box.add_css_class("yr-playlist-row");
 
         let click_target = GtkBox::new(Orientation::Horizontal, gap);
         click_target.set_hexpand(true);
@@ -523,34 +524,83 @@ impl VideoCard {
         }
 
         click_target.append(&info_box);
+
+        if editable {
+            let reorder: Rc<dyn Fn(usize, usize)> = Rc::new(on_reorder);
+            let drag_handle = Button::builder()
+                .icon_name("list-drag-handle-symbolic")
+                .tooltip_text("Drag to reorder · Alt+Up/Down also works")
+                .valign(Align::Center)
+                .build();
+            drag_handle.add_css_class("flat");
+            drag_handle.add_css_class("yr-playlist-drag-handle");
+            set_pointer(&drag_handle);
+            root_box.append(&drag_handle);
+
+            let drag_source = DragSource::new();
+            drag_source.set_actions(gdk::DragAction::MOVE);
+            let drag_index = index as u32;
+            drag_source.connect_prepare(move |_, _, _| {
+                Some(gdk::ContentProvider::for_value(&drag_index.to_value()))
+            });
+            drag_handle.add_controller(drag_source);
+
+            let key_controller = EventControllerKey::new();
+            let reorder_key = Rc::clone(&reorder);
+            key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+                if !modifiers.contains(gdk::ModifierType::ALT_MASK) {
+                    return gtk4::glib::Propagation::Proceed;
+                }
+                let target = if key == gdk::Key::Up && index > 0 {
+                    Some(index - 1)
+                } else if key == gdk::Key::Down && index + 1 < total {
+                    Some(index + 1)
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    reorder_key(index, target);
+                    gtk4::glib::Propagation::Stop
+                } else {
+                    gtk4::glib::Propagation::Proceed
+                }
+            });
+            drag_handle.add_controller(key_controller);
+
+            let drop_target = DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+            let row_enter = root_box.clone();
+            drop_target.connect_enter(move |_, _, _| {
+                row_enter.add_css_class("drop-target");
+                gdk::DragAction::MOVE
+            });
+            let row_leave = root_box.clone();
+            drop_target.connect_leave(move |_| {
+                row_leave.remove_css_class("drop-target");
+            });
+            let row_drop = root_box.clone();
+            let reorder_drop = Rc::clone(&reorder);
+            drop_target.connect_drop(move |_, value, _, _| {
+                row_drop.remove_css_class("drop-target");
+                if let Ok(from) = value.get::<u32>() {
+                    let from = from as usize;
+                    if from < total && from != index {
+                        reorder_drop(from, index);
+                        return true;
+                    }
+                }
+                false
+            });
+            root_box.add_controller(drop_target);
+        }
+
         root_box.append(&click_target);
 
         if editable {
             let controls = GtkBox::new(Orientation::Horizontal, 2);
             controls.set_valign(Align::Center);
 
-            let up_btn = Button::builder()
-                .icon_name("go-up-symbolic")
-                .tooltip_text("Move up")
-                .sensitive(index > 0)
-                .build();
-            up_btn.add_css_class("flat");
-            up_btn.add_css_class("circular");
-            set_pointer(&up_btn);
-            up_btn.connect_clicked(move |_| on_move_up());
-
-            let down_btn = Button::builder()
-                .icon_name("go-down-symbolic")
-                .tooltip_text("Move down")
-                .sensitive(index + 1 < total)
-                .build();
-            down_btn.add_css_class("flat");
-            down_btn.add_css_class("circular");
-            set_pointer(&down_btn);
-            down_btn.connect_clicked(move |_| on_move_down());
-
             let rm_btn = Button::builder()
-                .icon_name("window-close-symbolic")
+                .icon_name("user-trash-symbolic")
                 .tooltip_text("Remove from playlist")
                 .build();
             rm_btn.add_css_class("flat");
@@ -558,8 +608,6 @@ impl VideoCard {
             set_pointer(&rm_btn);
             rm_btn.connect_clicked(move |_| on_remove());
 
-            controls.append(&up_btn);
-            controls.append(&down_btn);
             controls.append(&rm_btn);
             root_box.append(&controls);
         }
