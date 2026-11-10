@@ -1922,31 +1922,69 @@ impl Engine {
             _ => UploadDate::Week,
         };
 
+        let direct_date = match &date_window {
+            UploadDate::Day => UploadDateFilter::Today,
+            UploadDate::Week => UploadDateFilter::ThisWeek,
+            UploadDate::Month => UploadDateFilter::ThisMonth,
+            UploadDate::Year => UploadDateFilter::ThisYear,
+        };
         let filter = SearchFilter::new()
             .item_type(ItemType::Video)
             .date(date_window);
+        let direct_params = encode_direct_search_params(
+            SearchSortOrder::Relevance,
+            direct_date,
+            DurationFilter::AnyLength,
+            Some(1),
+        );
 
-        let paginator = match self.rp_query().await
-            .search_filter::<VideoItem, _>(chosen_query, &filter)
-            .await
-        {
-            Ok(res) if !res.items.items.is_empty() => res.items,
-            _ => {
-                self.rp_query().await
+        // RustyPipe's VideoItem model drops YouTube's collaborator list. In parallel, inspect
+        // the raw WEB search response and merge those channel credits onto the stable result list.
+        let rustypipe_search = async {
+            match self
+                .rp_query()
+                .await
+                .search_filter::<VideoItem, _>(chosen_query, &filter)
+                .await
+            {
+                Ok(res) if !res.items.items.is_empty() => Ok(res.items),
+                _ => self
+                    .rp_query()
+                    .await
                     .search::<VideoItem, _>(chosen_query)
                     .await
-                    .map_err(|e| format!("Category error: {e}"))?
-                    .items
+                    .map(|result| result.items)
+                    .map_err(|error| format!("Category error: {error}")),
             }
         };
+        let (paginator, direct_json) = tokio::join!(
+            rustypipe_search,
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                self.fetch_search_json(Some(chosen_query), Some(&direct_params), None),
+            ),
+        );
+        let paginator = paginator?;
 
         let next = cursor_from_paginator(&paginator);
-        let all_mapped: Vec<VideoSummary> = paginator
+        let mut all_mapped: Vec<VideoSummary> = paginator
             .items
             .into_iter()
             .filter(|it| !it.is_short)
             .map(|it| map_video_item(it, None, false))
             .collect();
+        if let Ok(Ok(raw)) = direct_json {
+            let direct = parse_direct_search_response(&raw, DirectSearchMode::All);
+            let direct_videos: Vec<VideoSummary> = direct
+                .items
+                .into_iter()
+                .filter_map(|item| match item {
+                    SearchItem::Video(video) => Some(video),
+                    SearchItem::Channel(_) | SearchItem::Playlist(_) => None,
+                })
+                .collect();
+            fill_missing_channel_metadata(&mut all_mapped, &direct_videos);
+        }
 
         let prev_seen: HashSet<String> = if force_refresh {
             self.seen_category_ids.read().await.iter().cloned().collect()
@@ -5185,6 +5223,15 @@ fn fill_missing_channel_metadata(target: &mut [VideoSummary], source: &[VideoSum
         if video.published_text.is_empty() {
             video.published_text = details.published_text.clone();
         }
+        if video.channel_id.is_empty() {
+            video.channel_id = details.channel_id.clone();
+        }
+        if video.channel_name.is_empty() {
+            video.channel_name = details.channel_name.clone();
+        }
+        if video.channel_avatar_url.is_empty() {
+            video.channel_avatar_url = details.channel_avatar_url.clone();
+        }
         if video.collaborators.is_empty() && !details.collaborators.is_empty() {
             video.collaborators = details.collaborators.clone();
         }
@@ -6202,13 +6249,32 @@ mod tests {
             duration_test_video("missing", None, ""),
             duration_test_video("known", Some(60), "1:00"),
         ];
-        let direct = vec![
+        let mut direct = vec![
             duration_test_video("missing", Some(754), "12:34"),
             duration_test_video("known", Some(99), "1:39"),
+        ];
+        direct[0].channel_id = "UC-primary".to_string();
+        direct[0].channel_name = "Primary Channel".to_string();
+        direct[0].channel_avatar_url = "https://img/primary.jpg".to_string();
+        direct[0].collaborators = vec![
+            VideoCollaborator {
+                id: "UC-primary".to_string(),
+                name: "Primary Channel".to_string(),
+                ..VideoCollaborator::default()
+            },
+            VideoCollaborator {
+                id: "UC-second".to_string(),
+                name: "Second Channel".to_string(),
+                ..VideoCollaborator::default()
+            },
         ];
         fill_missing_channel_metadata(&mut from_rustypipe, &direct);
         assert_eq!(from_rustypipe[0].duration_seconds, Some(754));
         assert_eq!(from_rustypipe[0].duration_text, "12:34");
+        assert_eq!(from_rustypipe[0].channel_id, "UC-primary");
+        assert_eq!(from_rustypipe[0].channel_name, "Primary Channel");
+        assert_eq!(from_rustypipe[0].channel_avatar_url, "https://img/primary.jpg");
+        assert_eq!(from_rustypipe[0].collaborators.len(), 2);
         assert_eq!(from_rustypipe[1].duration_seconds, Some(60));
         assert_eq!(from_rustypipe[1].duration_text, "1:00");
     }
