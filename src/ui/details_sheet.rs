@@ -393,7 +393,7 @@ impl DetailsSheet {
             // The dialog widget may cover the whole overlay. Use its content card to distinguish
             // clicks inside from clicks on the backdrop; pick also handles child popovers/buttons.
             let inside = if let Some(picked) = parent.pick(x, y, gtk4::PickFlags::DEFAULT) {
-                picked == *content || picked.is_ancestor(&content)
+                picked == content || picked.is_ancestor(&content)
             } else if let Some(bounds) = content.compute_bounds(&parent) {
                 let left = bounds.x() as f64;
                 let top = bounds.y() as f64;
