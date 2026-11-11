@@ -1,11 +1,14 @@
 use crate::backend::history::HistoryEntry;
-use crate::backend::models::{ChannelSearchSummary, PlaylistSearchSummary, VideoSummary};
+use crate::backend::models::{
+    ChannelSearchSummary, PlaylistSearchSummary, VideoCollaborator, VideoSummary,
+};
 use crate::backend::playlists::SavedPlaylist;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use adw::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, EventSequenceState, GestureClick, GestureLongPress, Label,
-    Orientation, Overflow, Overlay, Picture, PropagationPhase,
+    gdk, Align, Box as GtkBox, Button, DragSource, DropTarget, EventControllerKey,
+    EventSequenceState, GestureClick, GestureLongPress, Label, Orientation, Overflow, Overlay,
+    Picture, PropagationPhase,
 };
 use libadwaita as adw;
 use std::rc::Rc;
@@ -22,8 +25,86 @@ pub struct VideoCard {
     pub highlight_target: GtkBox,
     pub click_target: GtkBox,
     pub channel_target: Option<GtkBox>,
+    pub extra_channel_avatars: Vec<(String, String, adw::Avatar)>,
     pub picture: Picture,
     pub avatar: adw::Avatar,
+}
+
+/// Build YouTube-style collaboration avatars. Two channels share one row; three
+/// form a compact triangle; larger groups use a +N badge in the third position.
+pub(crate) fn build_collaborator_avatar_stack(
+    primary: &adw::Avatar,
+    credits: &[VideoCollaborator],
+    diameter: i32,
+) -> (Overlay, Vec<(String, String, adw::Avatar)>) {
+    let count = credits.len();
+    let overlap = (diameter * 5 / 12).max(5);
+    let width = if count > 1 {
+        diameter * 2 - overlap
+    } else {
+        diameter
+    };
+    let height = if count > 2 {
+        diameter * 2 - overlap
+    } else {
+        diameter
+    };
+
+    let stack = Overlay::new();
+    stack.set_size_request(width, height);
+    stack.set_halign(Align::Start);
+    stack.set_overflow(Overflow::Visible);
+    stack.set_child(Some(primary));
+    primary.set_halign(Align::Start);
+    primary.set_valign(Align::Start);
+    if count > 1 {
+        primary.add_css_class("yr-collaborator-avatar");
+    }
+
+    let real_avatar_count = if count >= 4 { 2 } else { count.min(3) };
+    let mut extra_avatars = Vec::new();
+    for index in 1..real_avatar_count {
+        let channel = &credits[index];
+        let avatar = adw::Avatar::new(diameter, Some(&channel.name), true);
+        avatar.set_size_request(diameter, diameter);
+        avatar.set_halign(Align::Start);
+        avatar.set_valign(Align::Start);
+        avatar.add_css_class("yr-collaborator-avatar");
+        let (x, y) = if index == 1 {
+            (diameter - overlap, 0)
+        } else {
+            (width.saturating_sub(diameter) / 2, diameter - overlap)
+        };
+        avatar.set_margin_start(x);
+        avatar.set_margin_top(y);
+        stack.add_overlay(&avatar);
+        extra_avatars.push((
+            channel.id.clone(),
+            channel.avatar_url.clone(),
+            avatar,
+        ));
+    }
+
+    if count >= 4 {
+        let more_count = count - 2;
+        let badge = GtkBox::new(Orientation::Vertical, 0);
+        badge.set_size_request(diameter, diameter);
+        badge.set_halign(Align::Start);
+        badge.set_valign(Align::Start);
+        badge.set_margin_start(width.saturating_sub(diameter) / 2);
+        badge.set_margin_top(diameter - overlap);
+        badge.add_css_class("yr-collaborator-overflow");
+        if diameter < 30 {
+            badge.add_css_class("small");
+        }
+        let label = Label::new(Some(&format!("+{more_count}")));
+        label.set_halign(Align::Center);
+        label.set_valign(Align::Center);
+        badge.append(&label);
+        stack.add_overlay(&badge);
+    }
+
+    (stack, extra_avatars)
 }
 
 impl VideoCard {
@@ -51,31 +132,36 @@ impl VideoCard {
         let details_box = GtkBox::new(Orientation::Horizontal, 10);
         details_box.set_valign(Align::Start);
 
-        let avatar_label = if !summary.channel_name.is_empty() {
-            &summary.channel_name
-        } else {
-            &summary.title
-        };
-        let avatar = adw::Avatar::new(36, Some(avatar_label), true);
-        avatar.set_valign(Align::Start);
+        let channel_credits = summary.channel_credits();
+        let avatar_label = channel_credits
+            .first()
+            .map(|channel| channel.name.as_str())
+            .filter(|name| !name.is_empty());
+        let avatar_size = if channel_credits.len() > 1 { 28 } else { 36 };
+        let avatar = adw::Avatar::new(avatar_size, avatar_label, true);
+        avatar.set_size_request(28, 28);
+        avatar.set_valign(Align::Center);
+        let (avatar_stack, extra_channel_avatars) =
+            build_collaborator_avatar_stack(&avatar, &channel_credits, 28);
 
         let avatar_wrap = GtkBox::new(Orientation::Vertical, 0);
         avatar_wrap.set_valign(Align::Start);
-        avatar_wrap.append(&avatar);
-        let channel_target = if !summary.channel_id.is_empty() {
+        avatar_wrap.append(&avatar_stack);
+        let channel_target = channel_credits.first().and_then(|channel| {
+            if channel.id.is_empty() {
+                return None;
+            }
             avatar_wrap.set_tooltip_text(Some(&format!(
                 "Open channel: {}",
-                if summary.channel_name.is_empty() {
+                if channel.name.is_empty() {
                     "Channel"
                 } else {
-                    &summary.channel_name
+                    &channel.name
                 }
             )));
             set_pointer(&avatar_wrap);
             Some(avatar_wrap.clone())
-        } else {
-            None
-        };
+        });
 
         let text_col = GtkBox::new(Orientation::Vertical, 3);
         text_col.set_hexpand(true);
@@ -89,8 +175,9 @@ impl VideoCard {
         title_label.set_xalign(0.0);
         title_label.add_css_class("yr-title");
 
+        let byline = summary.channel_byline().unwrap_or_default();
         let meta_text = join_non_empty(&[
-            &summary.channel_name,
+            &byline,
             &summary.view_count_text,
             &summary.published_text,
         ]);
@@ -121,6 +208,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
+            extra_channel_avatars,
             picture,
             avatar,
         }
@@ -247,33 +335,40 @@ impl VideoCard {
             info_box.append(&stats_label);
         }
 
-        let avatar_label = if !summary.channel_name.is_empty() {
-            &summary.channel_name
-        } else {
-            &summary.title
-        };
+        let channel_credits = summary.channel_credits();
+        let avatar_label = channel_credits
+            .first()
+            .map(|channel| channel.name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&summary.title);
         let avatar = adw::Avatar::new(24, Some(avatar_label), true);
-        avatar.set_valign(Align::Center);
+        avatar.set_size_request(24, 24);
+        let (avatar_stack, extra_channel_avatars) =
+            build_collaborator_avatar_stack(&avatar, &channel_credits, 24);
 
         let mut channel_target = None;
-        if !summary.channel_name.is_empty() {
+        let byline = summary.channel_byline().unwrap_or_default();
+        if !byline.is_empty() {
             let channel_row = GtkBox::new(Orientation::Horizontal, 8);
             channel_row.set_halign(Align::Start);
             channel_row.set_valign(Align::Center);
             channel_row.set_margin_top(2);
             channel_row.set_margin_bottom(2);
 
-            let channel_label = Label::new(Some(&summary.channel_name));
+            let channel_label = Label::new(Some(&byline));
             channel_label.add_css_class("yr-meta");
-            if !summary.channel_id.is_empty() {
+            if let Some(channel) = channel_credits
+                .first()
+                .filter(|channel| !channel.id.is_empty())
+            {
                 channel_label.add_css_class("yr-chan-hover");
-                channel_row.set_tooltip_text(Some(&format!("Open {}", summary.channel_name)));
+                channel_row.set_tooltip_text(Some(&format!("Open {}", channel.name)));
                 set_pointer(&channel_row);
                 channel_target = Some(channel_row.clone());
             }
             channel_label.set_halign(Align::Start);
             channel_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            channel_row.append(&avatar);
+            channel_row.append(&avatar_stack);
             channel_row.append(&channel_label);
             info_box.append(&channel_row);
         }
@@ -303,6 +398,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
+            extra_channel_avatars,
             picture,
             avatar,
         }
@@ -456,6 +552,7 @@ impl VideoCard {
             highlight_target: root_box,
             click_target,
             channel_target: None,
+            extra_channel_avatars: Vec::new(),
             picture,
             avatar,
         }
@@ -469,8 +566,7 @@ impl VideoCard {
         total: usize,
         layout: ListCardLayout,
         editable: bool,
-        on_move_up: impl Fn() + 'static,
-        on_move_down: impl Fn() + 'static,
+        on_reorder: impl Fn(usize, usize) + 'static,
         on_remove: impl Fn() + 'static,
     ) -> Self {
         let (thumb_w, thumb_h, gap) = match layout {
@@ -482,10 +578,20 @@ impl VideoCard {
         let root_box = GtkBox::new(Orientation::Horizontal, 8);
         root_box.set_hexpand(true);
         root_box.add_css_class("yr-history-row");
+        root_box.add_css_class("yr-playlist-row");
 
         let click_target = GtkBox::new(Orientation::Horizontal, gap);
         click_target.set_hexpand(true);
+        click_target.set_focusable(true);
+        click_target.set_tooltip_text(Some("Click or focus this row, then press Alt+Up or Alt+Down to reorder"));
         set_pointer(&click_target);
+        let focus_click = GestureClick::new();
+        focus_click.set_button(1);
+        let click_focus = click_target.clone();
+        focus_click.connect_pressed(move |_, _, _, _| {
+            click_focus.grab_focus();
+        });
+        click_target.add_controller(focus_click);
 
         let idx_lbl = Label::new(Some(&format!("{}", index + 1)));
         idx_lbl.add_css_class("yr-meta");
@@ -512,45 +618,141 @@ impl VideoCard {
         title_label.add_css_class("yr-title");
         info_box.append(&title_label);
 
-        let meta_text = join_non_empty(&[&video.channel_name, &video.view_count_text]);
+        let credits = video.channel_credits();
+        let avatar = adw::Avatar::new(24, credits.first().map(|c| c.name.as_str()), true);
+        let (avatar_stack, extra_channel_avatars) = build_collaborator_avatar_stack(&avatar, &credits, 24);
+        let meta_row = GtkBox::new(Orientation::Horizontal, 8);
+        let byline = video.channel_byline().unwrap_or_default();
+        let meta_text = join_non_empty(&[&byline, &video.view_count_text]);
+        if video.is_collaboration() {
+            meta_row.append(&avatar_stack);
+        }
         if !meta_text.is_empty() {
             let meta_label = Label::new(Some(&meta_text));
             meta_label.add_css_class("yr-meta");
             meta_label.set_halign(Align::Start);
             meta_label.set_xalign(0.0);
             meta_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            info_box.append(&meta_label);
+            meta_row.append(&meta_label);
+            info_box.append(&meta_row);
         }
 
         click_target.append(&info_box);
+
+        if editable {
+            let reorder: Rc<dyn Fn(usize, usize)> = Rc::new(on_reorder);
+            let drag_handle = Button::builder()
+                .icon_name("list-drag-handle-symbolic")
+                .tooltip_text("Drag to reorder; focus this handle and press Alt+Up or Alt+Down")
+                .valign(Align::Center)
+                .build();
+            drag_handle.add_css_class("flat");
+            drag_handle.add_css_class("yr-playlist-drag-handle");
+            set_pointer(&drag_handle);
+            root_box.append(&drag_handle);
+
+            let drag_source = DragSource::new();
+            drag_source.set_actions(gdk::DragAction::MOVE);
+            let drag_index = index as u32;
+            drag_source.connect_prepare(move |_, _, _| {
+                Some(gdk::ContentProvider::for_value(&drag_index.to_value()))
+            });
+            drag_handle.add_controller(drag_source);
+
+            let reorder_key_action: Rc<dyn Fn(gdk::Key, gdk::ModifierType) -> bool> = {
+                let reorder = Rc::clone(&reorder);
+                Rc::new(move |key, modifiers| {
+                    if !modifiers.contains(gdk::ModifierType::ALT_MASK) {
+                        return false;
+                    }
+                    let target = if key == gdk::Key::Up && index > 0 {
+                        Some(index - 1)
+                    } else if key == gdk::Key::Down && index + 1 < total {
+                        Some(index + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        reorder(index, target);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            };
+            let handle_keys = EventControllerKey::new();
+            let action = Rc::clone(&reorder_key_action);
+            handle_keys.connect_key_pressed(move |_, key, _, modifiers| {
+                if action(key, modifiers) {
+                    gtk4::glib::Propagation::Stop
+                } else {
+                    gtk4::glib::Propagation::Proceed
+                }
+            });
+            drag_handle.add_controller(handle_keys);
+
+            let row_keys = EventControllerKey::new();
+            row_keys.connect_key_pressed(move |_, key, _, modifiers| {
+                if reorder_key_action(key, modifiers) {
+                    gtk4::glib::Propagation::Stop
+                } else {
+                    gtk4::glib::Propagation::Proceed
+                }
+            });
+            click_target.add_controller(row_keys);
+
+            let drop_target = DropTarget::new(u32::static_type(), gdk::DragAction::MOVE);
+            let row_motion = root_box.clone();
+            drop_target.connect_motion(move |_, _, y| {
+                row_motion.remove_css_class("drop-before");
+                row_motion.remove_css_class("drop-after");
+                if y < row_motion.height() as f64 / 2.0 {
+                    row_motion.add_css_class("drop-before");
+                } else {
+                    row_motion.add_css_class("drop-after");
+                }
+                gdk::DragAction::MOVE
+            });
+            let row_leave = root_box.clone();
+            drop_target.connect_leave(move |_| {
+                row_leave.remove_css_class("drop-before");
+                row_leave.remove_css_class("drop-after");
+            });
+            let row_drop = root_box.clone();
+            let reorder_drop = Rc::clone(&reorder);
+            drop_target.connect_drop(move |_, value, _, y| {
+                row_drop.remove_css_class("drop-before");
+                row_drop.remove_css_class("drop-after");
+                if let Ok(from) = value.get::<u32>() {
+                    let from = from as usize;
+                    let insertion = if y < row_drop.height() as f64 / 2.0 {
+                        index
+                    } else {
+                        index + 1
+                    };
+                    let to = if from < insertion {
+                        insertion.saturating_sub(1)
+                    } else {
+                        insertion
+                    };
+                    if from < total && to < total && from != to {
+                        reorder_drop(from, to);
+                        return true;
+                    }
+                }
+                false
+            });
+            root_box.add_controller(drop_target);
+        }
+
         root_box.append(&click_target);
 
         if editable {
             let controls = GtkBox::new(Orientation::Horizontal, 2);
             controls.set_valign(Align::Center);
 
-            let up_btn = Button::builder()
-                .icon_name("go-up-symbolic")
-                .tooltip_text("Move up")
-                .sensitive(index > 0)
-                .build();
-            up_btn.add_css_class("flat");
-            up_btn.add_css_class("circular");
-            set_pointer(&up_btn);
-            up_btn.connect_clicked(move |_| on_move_up());
-
-            let down_btn = Button::builder()
-                .icon_name("go-down-symbolic")
-                .tooltip_text("Move down")
-                .sensitive(index + 1 < total)
-                .build();
-            down_btn.add_css_class("flat");
-            down_btn.add_css_class("circular");
-            set_pointer(&down_btn);
-            down_btn.connect_clicked(move |_| on_move_down());
-
             let rm_btn = Button::builder()
-                .icon_name("window-close-symbolic")
+                .icon_name("user-trash-symbolic")
                 .tooltip_text("Remove from playlist")
                 .build();
             rm_btn.add_css_class("flat");
@@ -558,8 +760,6 @@ impl VideoCard {
             set_pointer(&rm_btn);
             rm_btn.connect_clicked(move |_| on_remove());
 
-            controls.append(&up_btn);
-            controls.append(&down_btn);
             controls.append(&rm_btn);
             root_box.append(&controls);
         }
@@ -569,13 +769,12 @@ impl VideoCard {
         container.set_child(Some(&root_box));
         container.set_hexpand(true);
 
-        let avatar = adw::Avatar::new(24, Some(&video.channel_name), true);
-
         Self {
             container,
             highlight_target: root_box,
             click_target,
             channel_target: None,
+            extra_channel_avatars,
             picture,
             avatar,
         }
@@ -662,6 +861,7 @@ impl VideoCard {
             highlight_target: root_box.clone(),
             click_target: root_box,
             channel_target,
+            extra_channel_avatars: Vec::new(),
             picture,
             avatar,
         }

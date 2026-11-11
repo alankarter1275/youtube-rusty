@@ -5,7 +5,8 @@ use crate::backend::engine::{
 use crate::backend::history::HistoryStore;
 use crate::backend::models::{
     format_queue_total_duration, looks_like_youtube_url, ChannelDetails, DurationFilter,
-    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoSummary,
+    PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab, UploadDateFilter,
+    VideoCollaborator, VideoSummary,
 };
 use crate::backend::playlists::PlaylistStore;
 use crate::backend::search_history::SearchHistoryStore;
@@ -102,6 +103,7 @@ pub struct MainWindow {
     bottom_home: Button,
     bottom_subs: Button,
     bottom_playlists: Button,
+    bottom_watch_later: Button,
     bottom_hist: Button,
     bottom_settings: Button,
     pub nav_view: adw::NavigationView,
@@ -148,7 +150,8 @@ pub struct MainWindow {
     chip_gaming: Button,
     chip_music: Button,
     chip_news: Button,
-    chip_watch_later: Button,
+    add_category_btn: Button,
+    custom_category_buttons: RefCell<Vec<(String, Button)>>,
     pub subs_strip_box: GtkBox,
     pub subs_avatars_row: GtkBox,
     pub history_header_box: GtkBox,
@@ -262,7 +265,10 @@ impl MainWindow {
         let menu_btn = MenuButton::new();
         menu_btn.set_child(Some(&make_icon(KalamIcon::Menu, 22)));
         menu_btn.set_tooltip_text(Some("Main menu"));
+        menu_btn.set_has_frame(false);
+        menu_btn.set_size_request(44, 44);
         menu_btn.add_css_class("yr-rail-btn");
+        menu_btn.add_css_class("yr-menu-round");
         set_pointer(&menu_btn);
 
         let refresh_btn = Button::new();
@@ -296,13 +302,13 @@ impl MainWindow {
         let chip_gaming = create_chip("Gaming", false);
         let chip_music = create_chip("Music", false);
         let chip_news = create_chip("News", false);
-        let chip_watch_later = create_chip("Watch later", false);
+        let add_category_btn = create_chip("+ Add category", false);
+        add_category_btn.set_tooltip_text(Some("Add a saved topic search to Home"));
 
         chips_box.append(&chip_trending);
         chips_box.append(&chip_gaming);
         chips_box.append(&chip_music);
         chips_box.append(&chip_news);
-        chips_box.append(&chip_watch_later);
 
         let chips_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Automatic)
@@ -636,12 +642,14 @@ impl MainWindow {
         let bottom_home = create_bottom_nav_btn(KalamIcon::Home, "Home", true);
         let bottom_subs = create_bottom_nav_btn(KalamIcon::Subscriptions, "Subscriptions", false);
         let bottom_playlists = create_bottom_nav_btn(KalamIcon::Playlists, "Playlists", false);
+        let bottom_watch_later = create_bottom_nav_btn(KalamIcon::WatchLater, "Watch Later", false);
         let bottom_hist = create_bottom_nav_btn(KalamIcon::History, "History", false);
         let bottom_settings = create_bottom_nav_btn(KalamIcon::Settings, "Preferences", false);
 
         bottom_bar.append(&bottom_home);
         bottom_bar.append(&bottom_subs);
         bottom_bar.append(&bottom_playlists);
+        bottom_bar.append(&bottom_watch_later);
         bottom_bar.append(&bottom_hist);
         bottom_bar.append(&bottom_settings);
 
@@ -680,6 +688,7 @@ impl MainWindow {
 
         let initial_settings = settings_store.load();
         let initial_quality = Quality::from_setting(&initial_settings.default_quality);
+        let initial_home_categories = initial_settings.custom_home_categories.clone();
 
         let this = Rc::new(Self {
             window,
@@ -698,6 +707,7 @@ impl MainWindow {
             bottom_home,
             bottom_subs,
             bottom_playlists,
+            bottom_watch_later,
             bottom_hist,
             bottom_settings,
             nav_view,
@@ -744,7 +754,8 @@ impl MainWindow {
             chip_gaming,
             chip_music,
             chip_news,
-            chip_watch_later,
+            add_category_btn,
+            custom_category_buttons: RefCell::new(Vec::new()),
             subs_strip_box,
             subs_avatars_row,
             history_header_box,
@@ -799,6 +810,10 @@ impl MainWindow {
             engine,
             runtime,
         });
+
+        this.load_custom_home_categories(initial_home_categories);
+        this.chips_box.append(&this.add_category_btn);
+        this.setup_home_categories_popover();
 
         this.apply_appearance(&initial_settings);
         this.sync_preferences_ui(&initial_settings);
@@ -914,8 +929,7 @@ impl MainWindow {
         act_wl.connect_activate(move |_, _| {
             if let Some(w) = weak.upgrade() {
                 w.clear_search_bar_quietly();
-                w.set_active_nav(Some(RailTab::Home));
-                w.highlight_chip(Some(&w.chip_watch_later));
+                w.set_active_nav(Some(RailTab::WatchLater));
                 w.load_watch_later();
             }
         });
@@ -1062,6 +1076,7 @@ impl MainWindow {
         self.bottom_home.remove_css_class("active");
         self.bottom_subs.remove_css_class("active");
         self.bottom_playlists.remove_css_class("active");
+        self.bottom_watch_later.remove_css_class("active");
         self.bottom_hist.remove_css_class("active");
         self.bottom_settings.remove_css_class("active");
 
@@ -1070,10 +1085,206 @@ impl MainWindow {
                 RailTab::Home => self.bottom_home.add_css_class("active"),
                 RailTab::Subscriptions => self.bottom_subs.add_css_class("active"),
                 RailTab::Playlists => self.bottom_playlists.add_css_class("active"),
+                RailTab::WatchLater => self.bottom_watch_later.add_css_class("active"),
                 RailTab::History => self.bottom_hist.add_css_class("active"),
                 RailTab::Settings => self.bottom_settings.add_css_class("active"),
             }
         }
+    }
+
+    fn load_custom_home_categories(self: &Rc<Self>, categories: Vec<String>) {
+        let mut seen = HashSet::new();
+        for category in categories {
+            let category = category.trim().to_string();
+            let key = category.to_ascii_lowercase();
+            if category.is_empty()
+                || category.chars().count() > 40
+                || ["trending", "gaming", "music", "news"]
+                    .iter()
+                    .any(|builtin| builtin.eq_ignore_ascii_case(&category))
+                || !seen.insert(key)
+            {
+                continue;
+            }
+            self.add_custom_home_category_chip(category);
+        }
+    }
+
+    fn add_custom_home_category_chip(self: &Rc<Self>, category: String) {
+        if self
+            .custom_category_buttons
+            .borrow()
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(&category))
+        {
+            return;
+        }
+
+        let button = create_chip(&category, false);
+        button.set_tooltip_text(Some(
+            "Search this topic; right-click to remove the custom category",
+        ));
+        let after = self
+            .custom_category_buttons
+            .borrow()
+            .last()
+            .map(|(_, button)| button.clone())
+            .unwrap_or_else(|| self.chip_news.clone());
+        self.chips_box.insert_child_after(&button, Some(&after));
+
+        let category_for_search = category.clone();
+        let weak = Rc::downgrade(self);
+        button.connect_clicked(move |btn| {
+            if let Some(win) = weak.upgrade() {
+                win.highlight_chip(Some(btn));
+                win.search_category(&category_for_search);
+            }
+        });
+
+        let remove_popover = Popover::new();
+        remove_popover.set_parent(&button);
+        remove_popover.set_has_arrow(false);
+        let remove_btn = Button::with_label("Remove category");
+        remove_btn.add_css_class("flat");
+        remove_btn.add_css_class("yr-menu-item");
+        set_pointer(&remove_btn);
+        remove_popover.set_child(Some(&remove_btn));
+        let right_click = GestureClick::new();
+        right_click.set_button(3);
+        let remove_popover_weak = remove_popover.downgrade();
+        right_click.connect_pressed(move |_, _, _, _| {
+            if let Some(popover) = remove_popover_weak.upgrade() {
+                popover.popup();
+            }
+        });
+        button.add_controller(right_click);
+
+        let category_for_remove = category.clone();
+        let weak = Rc::downgrade(self);
+        let remove_popover_weak = remove_popover.downgrade();
+        remove_btn.connect_clicked(move |_| {
+            if let Some(popover) = remove_popover_weak.upgrade() {
+                popover.popdown();
+            }
+            if let Some(win) = weak.upgrade() {
+                win.remove_custom_home_category(&category_for_remove);
+            }
+        });
+
+        self.custom_category_buttons
+            .borrow_mut()
+            .push((category, button));
+    }
+
+    fn remove_custom_home_category(self: &Rc<Self>, category: &str) {
+        let button = self
+            .custom_category_buttons
+            .borrow()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(category))
+            .map(|(_, button)| button.clone());
+        if let Some(button) = button {
+            self.chips_box.remove(&button);
+        }
+        self.custom_category_buttons
+            .borrow_mut()
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(category));
+
+        let mut settings = self.settings_store.load();
+        settings
+            .custom_home_categories
+            .retain(|name| !name.eq_ignore_ascii_case(category));
+        self.settings_store.save(&settings);
+        self.highlight_chip(None);
+    }
+
+    fn setup_home_categories_popover(self: &Rc<Self>) {
+        let popover = Popover::new();
+        popover.set_parent(&self.add_category_btn);
+        popover.set_has_arrow(false);
+
+        let content = GtkBox::new(Orientation::Vertical, 8);
+        content.set_width_request(280);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+
+        let heading = Label::new(Some("Add a topic search"));
+        heading.add_css_class("yr-popover-head");
+        heading.set_halign(Align::Start);
+        content.append(&heading);
+
+        let explanation = Label::new(Some("This adds a saved YouTube search to your Home topics."));
+        explanation.add_css_class("yr-meta");
+        explanation.set_wrap(true);
+        explanation.set_halign(Align::Start);
+        explanation.set_xalign(0.0);
+        content.append(&explanation);
+
+        let entry = Entry::builder()
+            .placeholder_text("For example: Science")
+            .build();
+        entry.add_css_class("yr-search");
+        content.append(&entry);
+
+        let add_btn = Button::with_label("Add category");
+        add_btn.add_css_class("yr-btn");
+        add_btn.add_css_class("primary");
+        set_pointer(&add_btn);
+        content.append(&add_btn);
+        popover.set_child(Some(&content));
+        let popover_weak = popover.downgrade();
+        self.add_category_btn.connect_clicked(move |_| {
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popup();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        let popover_weak = popover.downgrade();
+        let entry_for_add = entry.clone();
+        let add_category = Rc::new(move || {
+            let category = entry_for_add.text().trim().to_string();
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if category.is_empty() {
+                win.toast_overlay
+                    .add_toast(adw::Toast::new("Enter a topic first"));
+                return;
+            }
+            if category.chars().count() > 40 {
+                win.toast_overlay
+                    .add_toast(adw::Toast::new("Keep home topic names under 40 characters"));
+                return;
+            }
+            let duplicate = ["Trending", "Gaming", "Music", "News"]
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&category))
+                || win
+                    .custom_category_buttons
+                    .borrow()
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(&category));
+            if duplicate {
+                win.toast_overlay
+                    .add_toast(adw::Toast::new("That home topic already exists"));
+                return;
+            }
+
+            let mut settings = win.settings_store.load();
+            settings.custom_home_categories.push(category.clone());
+            win.settings_store.save(&settings);
+            win.add_custom_home_category_chip(category);
+            entry_for_add.set_text("");
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
+        });
+        let add_click = add_category.clone();
+        add_btn.connect_clicked(move |_| add_click());
+        entry.connect_activate(move |_| add_category());
     }
 
     fn highlight_chip(&self, target: Option<&Button>) {
@@ -1082,9 +1293,11 @@ impl MainWindow {
             &self.chip_gaming,
             &self.chip_music,
             &self.chip_news,
-            &self.chip_watch_later,
         ] {
             c.remove_css_class("active");
+        }
+        for (_, button) in self.custom_category_buttons.borrow().iter() {
+            button.remove_css_class("active");
         }
         if let Some(btn) = target {
             btn.add_css_class("active");
@@ -1249,17 +1462,23 @@ impl MainWindow {
                 self.with_suppressed_nav_push(|| match view {
                     ActiveView::HomeCategory(cat) => {
                         this.set_active_nav(Some(RailTab::Home));
-                        match cat.as_str() {
-                            "Gaming" => this.highlight_chip(Some(&this.chip_gaming)),
-                            "Music" => this.highlight_chip(Some(&this.chip_music)),
-                            "News" => this.highlight_chip(Some(&this.chip_news)),
-                            _ => this.highlight_chip(Some(&this.chip_trending)),
-                        }
+                        let button = match cat.as_str() {
+                            "Gaming" => Some(this.chip_gaming.clone()),
+                            "Music" => Some(this.chip_music.clone()),
+                            "News" => Some(this.chip_news.clone()),
+                            _ => this
+                                .custom_category_buttons
+                                .borrow()
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case(&cat))
+                                .map(|(_, button)| button.clone())
+                                .or_else(|| Some(this.chip_trending.clone())),
+                        };
+                        this.highlight_chip(button.as_ref());
                         this.search_category(&cat);
                     }
                     ActiveView::WatchLater => {
-                        this.set_active_nav(Some(RailTab::Home));
-                        this.highlight_chip(Some(&this.chip_watch_later));
+                        this.set_active_nav(Some(RailTab::WatchLater));
                         this.load_watch_later();
                     }
                     ActiveView::Subscriptions => {
@@ -2298,6 +2517,13 @@ impl MainWindow {
         });
 
         let weak = Rc::downgrade(self);
+        self.rail.watch_later_btn.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.navigate_to_watch_later();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
         self.rail.hist_btn.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
                 let win = w.clone();
@@ -2358,6 +2584,13 @@ impl MainWindow {
         });
 
         let weak = Rc::downgrade(self);
+        self.bottom_watch_later.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.navigate_to_watch_later();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
         self.bottom_hist.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
                 let win = w.clone();
@@ -2409,14 +2642,6 @@ impl MainWindow {
             if let Some(w) = weak.upgrade() {
                 w.highlight_chip(Some(btn));
                 w.search_category("News");
-            }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.chip_watch_later.connect_clicked(move |btn| {
-            if let Some(w) = weak.upgrade() {
-                w.highlight_chip(Some(btn));
-                w.load_watch_later();
             }
         });
 
@@ -3019,6 +3244,45 @@ impl MainWindow {
             }
         });
 
+        let subscription_store = self.subscription_store.clone();
+        let is_subscribed: Rc<dyn Fn(&str) -> bool> = Rc::new(move |channel_id| {
+            !channel_id.is_empty() && subscription_store.is_subscribed(channel_id)
+        });
+
+        let weak = Rc::downgrade(self);
+        let on_toggle_subscription: Rc<dyn Fn(VideoCollaborator) -> bool> =
+            Rc::new(move |channel| {
+                let Some(w) = weak.upgrade() else {
+                    return false;
+                };
+                if channel.id.is_empty() {
+                    return false;
+                }
+                let subscribed = w.subscription_store.is_subscribed(&channel.id);
+                if subscribed {
+                    w.subscription_store.unsubscribe(&channel.id);
+                    w.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Unsubscribed from {}",
+                        if channel.name.is_empty() { "channel" } else { channel.name.as_str() }
+                    )));
+                } else {
+                    w.subscription_store.subscribe(SubscribedChannel {
+                        id: channel.id.clone(),
+                        name: channel.name.clone(),
+                        handle: channel.handle.clone(),
+                        avatar_url: channel.avatar_url.clone(),
+                    });
+                    w.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Subscribed to {}",
+                        if channel.name.is_empty() { "channel" } else { channel.name.as_str() }
+                    )));
+                }
+                if *w.active_view.borrow() == ActiveView::Subscriptions {
+                    w.load_subscriptions();
+                }
+                !subscribed
+            });
+
         let weak = Rc::downgrade(self);
         let on_playlists_changed: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(w) = weak.upgrade() {
@@ -3039,6 +3303,8 @@ impl MainWindow {
         });
 
         CardActions {
+            engine: self.engine.clone(),
+            runtime: self.runtime.clone(),
             image_loader: self.image_loader.clone(),
             playlist_store: self.playlist_store.clone(),
             default_quality,
@@ -3048,6 +3314,8 @@ impl MainWindow {
             on_toggle_watch_later,
             on_download,
             on_open_channel,
+            is_subscribed,
+            on_toggle_subscription,
             on_playlists_changed,
             on_toast,
         }
@@ -4207,7 +4475,7 @@ impl MainWindow {
         for item in items {
             match &item {
                 SearchItem::Video(summary) => {
-                    self.append_single_video_card(summary, mode, layout, &actions);
+                    self.append_single_video_card(summary, mode, layout, &actions, None, true);
                     self.current_videos.borrow_mut().push(summary.clone());
                 }
                 SearchItem::Channel(ch) => {
@@ -4497,44 +4765,98 @@ impl MainWindow {
         let total = pl.videos.len();
 
         for (idx, vid) in pl.videos.iter().enumerate() {
-            let pid_up = pl.id.clone();
-            let weak_up = Rc::downgrade(self);
-            let pid_down = pl.id.clone();
-            let weak_down = Rc::downgrade(self);
-            let pid_rm = pl.id.clone();
-            let weak_rm = Rc::downgrade(self);
-
-            let card = VideoCard::new_playlist_track(
-                vid,
-                idx,
-                total,
-                layout,
-                true,
-                move || {
-                    if let Some(w) = weak_up.upgrade() {
-                        if idx > 0 && w.playlist_store.move_video(&pid_up, idx, idx - 1) {
-                            w.open_saved_playlist(&pid_up);
-                        }
-                    }
-                },
-                move || {
-                    if let Some(w) = weak_down.upgrade() {
-                        if w.playlist_store.move_video(&pid_down, idx, idx + 1) {
-                            w.open_saved_playlist(&pid_down);
-                        }
-                    }
-                },
-                move || {
-                    if let Some(w) = weak_rm.upgrade() {
-                        w.playlist_store.remove_video_at(&pid_rm, idx);
-                        w.open_saved_playlist(&pid_rm);
-                    }
-                },
-            );
-
-            self.wire_playlist_track_interactions(&card, vid, idx, &actions);
-            self.flow_box.append(&card.container);
+            self.append_saved_playlist_track(&pl.id, vid, idx, total, layout, &actions, None, true);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_saved_playlist_track(self: &Rc<Self>, playlist_id: &str, vid: &VideoSummary,
+        idx: usize, total: usize, layout: ListCardLayout, actions: &CardActions,
+        position: Option<i32>, hydrate: bool) {
+        let pid = playlist_id.to_string();
+        let weak_reorder = Rc::downgrade(self);
+        let weak_remove = Rc::downgrade(self);
+        let pid_remove = playlist_id.to_string();
+
+        let card = VideoCard::new_playlist_track(
+            vid,
+            idx,
+            total,
+            layout,
+            true,
+            move |from, to| {
+                if let Some(w) = weak_reorder.upgrade() {
+                    if w.playlist_store.move_video(&pid, from, to) {
+                        w.open_saved_playlist(&pid);
+                        w.highlight_reordered_playlist_row(to);
+                        w.focus_playlist_reorder_row(to);
+                    }
+                }
+            },
+            move || {
+                if let Some(w) = weak_remove.upgrade() {
+                    if let Some(removed_video) = w.playlist_store.remove_video_at(&pid_remove, idx)
+                    {
+                        w.open_saved_playlist(&pid_remove);
+
+                        let toast = adw::Toast::new("Removed video from playlist");
+                        toast.set_button_label(Some("Undo"));
+                        let weak_undo = Rc::downgrade(&w);
+                        let pid_undo = pid_remove.clone();
+                        toast.connect_button_clicked(move |_| {
+                            if let Some(w) = weak_undo.upgrade() {
+                                if w.playlist_store.insert_video_at(
+                                    &pid_undo,
+                                    idx,
+                                    removed_video.clone(),
+                                ) {
+                                    w.open_saved_playlist(&pid_undo);
+                                }
+                            }
+                        });
+                        w.toast_overlay.add_toast(toast);
+                    }
+                }
+            },
+        );
+
+        self.wire_playlist_track_interactions(&card, vid, idx, actions);
+
+        if let Some(position) = position { self.flow_box.insert(&card.container, position); }
+        else { self.flow_box.append(&card.container); }
+        if hydrate { self.hydrate_playlist_track(&card, vid, idx, total, layout, actions, Some(playlist_id.to_string())); }
+    }
+
+    fn highlight_reordered_playlist_row(&self, index: usize) {
+        let Some(child) = self.flow_box.child_at_index(index as i32) else {
+            return;
+        };
+        let Some(row) = child.child() else {
+            return;
+        };
+        row.add_css_class("reordered");
+        let row_weak = row.downgrade();
+        glib::timeout_add_local_once(Duration::from_millis(420), move || {
+            if let Some(row) = row_weak.upgrade() {
+                row.remove_css_class("reordered");
+            }
+        });
+    }
+
+    fn focus_playlist_reorder_row(self: &Rc<Self>, index: usize) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            if let Some(child) = win.flow_box.child_at_index(index as i32) {
+                if let Some(row) = child.child() {
+                    if let Some(handle) = row.first_child() {
+                        handle.grab_focus();
+                    }
+                }
+            }
+        });
     }
 
     pub fn open_remote_playlist(self: &Rc<Self>, playlist_id: &str) {
@@ -4637,11 +4959,50 @@ impl MainWindow {
 
         for (offset, vid) in videos.iter().enumerate() {
             let idx = start_idx + offset;
-            let card = VideoCard::new_playlist_track(vid, idx, 0, layout, false, || {}, || {}, || {});
+            let card = VideoCard::new_playlist_track(vid, idx, 0, layout, false, |_, _| {}, || {});
             self.wire_playlist_track_interactions(&card, vid, idx, &actions);
             self.flow_box.append(&card.container);
             self.current_videos.borrow_mut().push(vid.clone());
+            self.hydrate_playlist_track(&card, vid, idx, 0, layout, &actions, None);
         }
+    }
+
+    fn hydrate_playlist_track(self: &Rc<Self>, card: &VideoCard, video: &VideoSummary,
+        idx: usize, total: usize, layout: ListCardLayout, actions: &CardActions, saved_id: Option<String>) {
+        if video.is_collaboration() || video.is_short { return; }
+        let (tx, rx) = async_channel::bounded(1);
+        let engine = self.engine.clone();
+        let original = video.clone();
+        let lookup = self.runtime.spawn(async move {
+            let _ = tx.send(engine.enrich_video_attribution(original).await).await;
+        });
+        card.container.connect_notify_local(Some("parent"), move |widget, _| {
+            if widget.parent().is_none() { lookup.abort(); }
+        });
+        let weak = Rc::downgrade(self);
+        let card_weak = card.container.downgrade();
+        let original = video.clone();
+        let actions = actions.clone();
+        let request = self.request_seq.get();
+        glib::spawn_future_local(async move {
+            let Ok(updated) = rx.recv().await else { return };
+            if updated == original { return; }
+            let (Some(w), Some(old)) = (weak.upgrade(), card_weak.upgrade()) else { return };
+            if w.request_seq.get() != request || old.parent().is_none() { return; }
+            let position = old.index();
+            if position < 0 { return; }
+            for video in w.current_videos.borrow_mut().iter_mut() {
+                if video.id == updated.id { *video = updated.clone(); }
+            }
+            w.flow_box.remove(&old);
+            if let Some(id) = saved_id {
+                w.append_saved_playlist_track(&id, &updated, idx, total, layout, &actions, Some(position), false);
+            } else {
+                let card = VideoCard::new_playlist_track(&updated, idx, 0, layout, false, |_, _| {}, || {});
+                w.wire_playlist_track_interactions(&card, &updated, idx, &actions);
+                w.flow_box.insert(&card.container, position);
+            }
+        });
     }
 
     fn wire_playlist_track_interactions(
@@ -4652,6 +5013,14 @@ impl MainWindow {
         actions: &CardActions,
     ) {
         self.bind_home_picture(&vid.id, &vid.thumbnail_url, &card.picture);
+        if vid.is_collaboration() {
+            if !vid.channel_avatar_url.is_empty() {
+                self.bind_home_avatar(&vid.channel_id, &vid.channel_avatar_url, &card.avatar);
+            }
+            for (id, url, avatar) in &card.extra_channel_avatars {
+                if !url.is_empty() { self.bind_home_avatar(id, url, avatar); }
+            }
+        }
 
         let vid_id = vid.id.clone();
         let vid_id_det = vid.id.clone();
@@ -4977,13 +5346,22 @@ impl MainWindow {
         });
     }
 
+    fn navigate_to_watch_later(self: &Rc<Self>) {
+        let win = self.clone();
+        self.reset_nav_root(|| {
+            win.clear_search_bar_quietly();
+            win.set_active_nav(Some(RailTab::WatchLater));
+            win.load_watch_later();
+        });
+    }
+
     pub fn load_watch_later(self: &Rc<Self>) {
         let _req_id = self.next_request_id();
         let saved = self.watch_later_store.load_all();
         self.prepare_view_shell(
             ActiveView::WatchLater,
             ViewMode::Grid,
-            true,
+            false,
             false,
             false,
             Some("Watch Later"),
@@ -5446,7 +5824,7 @@ impl MainWindow {
         let layout = self.list_card_layout();
 
         for summary in videos {
-            self.append_single_video_card(&summary, mode, layout, &actions);
+            self.append_single_video_card(&summary, mode, layout, &actions, None, true);
             self.current_videos.borrow_mut().push(summary);
         }
     }
@@ -5457,6 +5835,8 @@ impl MainWindow {
         mode: ViewMode,
         layout: ListCardLayout,
         actions: &CardActions,
+        position: Option<i32>,
+        hydrate: bool,
     ) {
         let card = match mode {
             ViewMode::Grid => VideoCard::new_grid(summary),
@@ -5515,9 +5895,54 @@ impl MainWindow {
                     &card.avatar,
                 );
             }
+            for (channel_id, avatar_url, avatar) in &card.extra_channel_avatars {
+                if !avatar_url.is_empty() {
+                    self.bind_home_avatar(channel_id, avatar_url, avatar);
+                }
+            }
         }
 
-        self.flow_box.append(&card.container);
+        if let Some(position) = position {
+            self.flow_box.insert(&card.container, position);
+        } else {
+            self.flow_box.append(&card.container);
+        }
+
+        if hydrate && !summary.is_collaboration() && !summary.is_short {
+            let (tx, rx) = async_channel::bounded(1);
+            let engine = self.engine.clone();
+            let original = summary.clone();
+            let lookup = self.runtime.spawn(async move {
+                let updated = engine.enrich_video_attribution(original).await;
+                let _ = tx.send(updated).await;
+            });
+            card.container.connect_notify_local(Some("parent"), move |widget, _| {
+                if widget.parent().is_none() { lookup.abort(); }
+            });
+            let weak = Rc::downgrade(self);
+            let card_weak = card.container.downgrade();
+            let actions = actions.clone();
+            let original = summary.clone();
+            let request = self.request_seq.get();
+            glib::spawn_future_local(async move {
+                let Ok(updated) = rx.recv().await else { return };
+                if updated == original { return; }
+                let (Some(w), Some(old)) = (weak.upgrade(), card_weak.upgrade()) else { return };
+                if w.request_seq.get() != request || old.parent().is_none() { return; }
+                let index = old.index();
+                if index < 0 { return; }
+                for video in w.current_videos.borrow_mut().iter_mut() {
+                    if video.id == updated.id { *video = updated.clone(); }
+                }
+                for item in w.current_search_items.borrow_mut().iter_mut() {
+                    if let SearchItem::Video(video) = item {
+                        if video.id == updated.id { *video = updated.clone(); }
+                    }
+                }
+                w.flow_box.remove(&old);
+                w.append_single_video_card(&updated, mode, layout, &actions, Some(index), false);
+            });
+        }
     }
 
     pub fn present(&self) {

@@ -188,6 +188,31 @@ flowboxchild:hover, flowboxchild:selected, flowboxchild:focus {
   background-color: @yr_accent_hi;
   color: @yr_on_accent;
 }
+menubutton.yr-menu-round,
+menubutton.yr-menu-round > button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: none;
+}
+menubutton.yr-menu-round:hover,
+menubutton.yr-menu-round > button:hover,
+menubutton.yr-menu-round:checked,
+menubutton.yr-menu-round > button:checked {
+  border-radius: 999px;
+  background-color: alpha(#E8DDD5, 0.08);
+  box-shadow: none;
+}
+menubutton.yr-menu-round:focus-visible,
+menubutton.yr-menu-round > button:focus-visible {
+  outline: 2px solid alpha(@yr_accent, 0.8);
+  outline-offset: 1px;
+  border-radius: 999px;
+  box-shadow: none;
+}
 
 /* ---------- search + chips + buttons (no double focus ring) ---------- */
 .yr-search, entry.yr-search, searchentry.yr-search {
@@ -413,6 +438,32 @@ progressbar.yr-progress progress {
 .yr-queue-row.drop-target {
   background-color: alpha(#E8DDD5, 0.14);
 }
+.yr-playlist-row {
+  border-radius: 12px;
+  padding: 4px 6px;
+  transition: background-color 180ms ease;
+}
+.yr-playlist-row.drop-before {
+  box-shadow: inset 0 3px 0 alpha(@yr_accent_hi, 0.9);
+}
+.yr-playlist-row.drop-after {
+  box-shadow: inset 0 -3px 0 alpha(@yr_accent_hi, 0.9);
+}
+.yr-playlist-row.reordered {
+  background-color: alpha(@yr_accent, 0.20);
+}
+button.yr-playlist-drag-handle {
+  min-width: 36px;
+  min-height: 44px;
+  padding: 0;
+  border-radius: 10px;
+  color: alpha(@yr_text2, 0.76);
+}
+button.yr-playlist-drag-handle:hover,
+button.yr-playlist-drag-handle:focus-visible {
+  background-color: alpha(#E8DDD5, 0.10);
+  color: @yr_text;
+}
 
 /* ---------- popovers, search dropdown, menus, sheet ---------- */
 popover > contents,
@@ -445,6 +496,59 @@ popover modelbutton:hover, .yr-menu-item:hover {
 .yr-suggest-row.active {
   background-color: alpha(#E8DDD5, 0.10);
 }
+/* AdwDialog fills the host window; paint only its sheet, not the full-screen
+   dialog widget, so the dimmed content beneath remains visible. */
+dialog.yr-sheet, dialog.yr-collaborators-dialog {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+dialog.yr-sheet floating-sheet > dimming,
+dialog.yr-sheet bottom-sheet > dimming,
+dialog.yr-collaborators-dialog floating-sheet > dimming,
+dialog.yr-collaborators-dialog bottom-sheet > dimming {
+  background-color: alpha(black, 0.25);
+}
+dialog.yr-collaborators-dialog floating-sheet > sheet,
+dialog.yr-collaborators-dialog bottom-sheet > sheet {
+  background-color: @yr_surface;
+  border: 1px solid alpha(#E8DDD5, 0.16);
+  border-radius: 18px;
+  box-shadow: 0 16px 40px alpha(black, 0.35);
+}
+button.yr-channel-link-button {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  min-height: 0;
+  min-width: 0;
+}
+button.yr-channel-link-button:hover label {
+  text-decoration: underline;
+}
+.yr-collaborator-avatar {
+  border: 2px solid @yr_bg;
+  border-radius: 999px;
+}
+.yr-collaborator-overflow {
+  background-color: @yr_surface;
+  color: @yr_text;
+  border: 2px solid @yr_bg;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.yr-collaborator-overflow.small {
+  font-size: 8px;
+}
+.yr-collaborator-row {
+  border-radius: 12px;
+  padding: 5px 4px;
+}
+.yr-collaborator-row:hover {
+  background-color: alpha(#E8DDD5, 0.06);
+}
 .yr-popover-head {
   font-size: 11px;
   font-weight: 700;
@@ -452,8 +556,9 @@ popover modelbutton:hover, .yr-menu-item:hover {
   color: @yr_text2;
   margin: 8px 14px 2px 14px;
 }
-dialog.yr-sheet, .yr-sheet {
-  background-color: alpha(@yr_surface, 0.90);
+dialog.yr-sheet floating-sheet > sheet,
+dialog.yr-sheet bottom-sheet > sheet {
+  background-color: @yr_surface;
   border: 1px solid alpha(#E8DDD5, 0.14);
   border-radius: 22px;
   box-shadow: 0 24px 72px alpha(black, 0.55);

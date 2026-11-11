@@ -2177,6 +2177,13 @@ impl ChannelPage {
                 &item.channel_avatar_url,
                 &card.avatar,
             );
+            for (channel_id, avatar_url, avatar) in &card.extra_channel_avatars {
+                if !avatar_url.is_empty() {
+                    self.actions
+                        .image_loader
+                        .load_into_avatar(channel_id, avatar_url, avatar);
+                }
+            }
 
             let sum_play = item.clone();
             let vid_id_sel = item.id.clone();
@@ -2212,6 +2219,43 @@ impl ChannelPage {
                 },
             );
 
+            if !item.is_collaboration() {
+                let (tx, rx) = async_channel::bounded(1);
+                let engine = self.engine.clone();
+                let original = item.clone();
+                let lookup = self.runtime.spawn(async move {
+                    let updated = engine.enrich_video_attribution(original).await;
+                    let _ = tx.send(updated).await;
+                });
+                card.container.connect_notify_local(Some("parent"), move |widget, _| {
+                    if widget.parent().is_none() { lookup.abort(); }
+                });
+                let cp_weak = Rc::downgrade(self);
+                let card_weak = card.container.downgrade();
+                let initial = item.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(updated) = rx.recv().await else { return };
+                    if updated == initial { return; }
+                    let (Some(cp), Some(old)) = (cp_weak.upgrade(), card_weak.upgrade()) else { return };
+                    if old.parent().is_none() || cp.active_tab.get() != ChannelTab::Videos { return; }
+                    let index = old.index();
+                    if index < 0 { return; }
+                    for video in cp.videos_list.borrow_mut().iter_mut() {
+                        if video.id == updated.id { *video = updated.clone(); }
+                    }
+                    if let Some(results) = cp.search_results.borrow_mut().as_mut() {
+                        for video in results.iter_mut() {
+                            if video.id == updated.id { *video = updated.clone(); }
+                        }
+                    }
+                    for video in cp.rendered_items.borrow_mut().iter_mut() {
+                        if video.id == updated.id { *video = updated.clone(); }
+                    }
+                    let replacement = cp.build_single_item_card(&updated, false, idx);
+                    cp.flow_box.remove(&old);
+                    cp.flow_box.insert(&replacement.container, index);
+                });
+            }
             card
         }
     }

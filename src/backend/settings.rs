@@ -12,6 +12,8 @@ pub struct AppSettings {
     pub save_history: bool,
     pub color_scheme: String,
     pub accent_color: String,
+    /// User-added home topic chips; each string is also its YouTube search phrase.
+    pub custom_home_categories: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -23,6 +25,7 @@ impl Default for AppSettings {
             save_history: true,
             color_scheme: "dark".to_string(),
             accent_color: "terracotta".to_string(),
+            custom_home_categories: Vec::new(),
         }
     }
 }
@@ -92,11 +95,39 @@ mod tests {
 
         s.default_quality = "720p".to_string();
         s.accent_color = "forest".to_string();
+        s.custom_home_categories = vec!["Science".to_string(), "Woodworking".to_string()];
         store.save(&s);
 
         let loaded = store.load();
         assert_eq!(loaded.default_quality, "720p");
         assert_eq!(loaded.accent_color, "forest");
+        assert_eq!(
+            loaded.custom_home_categories,
+            vec!["Science".to_string(), "Woodworking".to_string()]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn older_settings_without_custom_categories_still_load() {
+        let path = std::env::temp_dir().join("yr_settings_old_schema_test.json");
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
+            r#"{
+                "default_quality":"720p",
+                "hardware_decoding":true,
+                "external_player":"mpv",
+                "save_history":true,
+                "color_scheme":"dark",
+                "accent_color":"terracotta"
+            }"#,
+        )
+        .expect("write legacy settings fixture");
+
+        let loaded = SettingsStore::with_path(path.clone()).load();
+        assert_eq!(loaded.default_quality, "720p");
+        assert!(loaded.custom_home_categories.is_empty());
         let _ = fs::remove_file(&path);
     }
 }

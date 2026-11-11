@@ -1,8 +1,11 @@
-use crate::backend::models::VideoSummary;
+use crate::backend::models::{VideoCollaborator, VideoSummary};
+use crate::backend::engine::Engine;
+use tokio::runtime::Runtime;
 use crate::backend::playlists::PlaylistStore;
 use crate::player::mpv::Quality;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
 use crate::ui::image_loader::ImageLoader;
+use crate::ui::video_card::build_collaborator_avatar_stack;
 use adw::prelude::*;
 use gtk4::{
     Align, Box as GtkBox, Button, Entry, EventSequenceState, GestureClick, Label, Orientation,
@@ -14,6 +17,8 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct CardActions {
+    pub engine: Arc<Engine>,
+    pub runtime: Arc<Runtime>,
     pub image_loader: Rc<ImageLoader>,
     pub playlist_store: Arc<PlaylistStore>,
     pub default_quality: Rc<dyn Fn() -> Quality>,
@@ -23,6 +28,8 @@ pub struct CardActions {
     pub on_toggle_watch_later: Rc<dyn Fn(VideoSummary) -> bool>,
     pub on_download: Rc<dyn Fn(VideoSummary, Quality)>,
     pub on_open_channel: Rc<dyn Fn(String, String)>,
+    pub is_subscribed: Rc<dyn Fn(&str) -> bool>,
+    pub on_toggle_subscription: Rc<dyn Fn(VideoCollaborator) -> bool>,
     pub on_playlists_changed: Rc<dyn Fn()>,
     pub on_toast: Rc<dyn Fn(String)>,
 }
@@ -111,74 +118,35 @@ impl DetailsSheet {
         title_label.set_xalign(0.0);
         content_box.append(&title_label);
 
-        // Channel row (Avatar + Name + Views/Age + Open Channel button)
-        let channel_row = GtkBox::new(Orientation::Horizontal, 12);
-        channel_row.set_valign(Align::Center);
-
-        let avatar_label = if !summary.channel_name.is_empty() {
-            &summary.channel_name
-        } else {
-            &summary.title
-        };
-        let avatar = adw::Avatar::new(36, Some(avatar_label), true);
-        if !summary.channel_avatar_url.is_empty() {
-            actions.image_loader.load_into_avatar(
-                &summary.channel_id,
-                &summary.channel_avatar_url,
-                &avatar,
-            );
-        }
-        channel_row.append(&avatar);
-
-        let channel_info = GtkBox::new(Orientation::Vertical, 2);
-        channel_info.set_hexpand(true);
-        if !summary.channel_name.is_empty() {
-            let channel_name = Label::new(Some(&summary.channel_name));
-            channel_name.set_halign(Align::Start);
-            channel_name.set_xalign(0.0);
-            channel_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            channel_name.add_css_class("yr-title");
-            channel_info.append(&channel_name);
-        }
-
-        let stats_text = [
-            (!summary.is_short && !summary.duration_text.is_empty())
-                .then_some(summary.duration_text.as_str()),
-            (!summary.view_count_text.is_empty()).then_some(summary.view_count_text.as_str()),
-            (!summary.published_text.is_empty()).then_some(summary.published_text.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
-        if !stats_text.is_empty() {
-            let stats_label = Label::new(Some(&stats_text));
-            stats_label.add_css_class("yr-meta");
-            stats_label.set_halign(Align::Start);
-            stats_label.set_xalign(0.0);
-            stats_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            channel_info.append(&stats_label);
-        }
-        channel_row.append(&channel_info);
-
-        if !summary.channel_id.is_empty() {
-            let open_channel_btn = Button::with_label("Open channel");
-            open_channel_btn.add_css_class("yr-btn");
-            set_pointer(&open_channel_btn);
-            let cid = summary.channel_id.clone();
-            let cname = summary.channel_name.clone();
-            let dlg_weak = dialog.downgrade();
-            let on_open_channel = actions.on_open_channel.clone();
-            open_channel_btn.connect_clicked(move |_| {
-                if let Some(dlg) = dlg_weak.upgrade() {
-                    dlg.close();
-                }
-                on_open_channel(cid.clone(), cname.clone());
-            });
-            channel_row.append(&open_channel_btn);
-        }
-
+        let channel_row = build_channel_row(summary, actions, &dialog);
         content_box.append(&channel_row);
+        // Saved and feed summaries can be incomplete. Refresh the attribution without
+        // delaying the dialog or replacing the user's saved data.
+        if !summary.is_collaboration() && !summary.is_short {
+            let (tx, rx) = async_channel::bounded(1);
+            let engine = actions.engine.clone();
+            let original = summary.clone();
+            actions.runtime.spawn(async move {
+                let result = engine.enrich_video_attribution_priority(original).await;
+                let _ = tx.send(result).await;
+            });
+            let row_weak = channel_row.downgrade();
+            let box_weak = content_box.downgrade();
+            let title_weak = title_label.downgrade();
+            let dialog_weak = dialog.downgrade();
+            let actions = actions.clone();
+            let initial = summary.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let Ok(updated) = rx.recv().await else { return };
+                if updated == initial { return; }
+                let (Some(row), Some(content), Some(title), Some(dialog)) =
+                    (row_weak.upgrade(), box_weak.upgrade(), title_weak.upgrade(), dialog_weak.upgrade()) else { return };
+                if row.parent().is_none() { return; }
+                let replacement = build_channel_row(&updated, &actions, &dialog);
+                content.remove(&row);
+                content.insert_child_after(&replacement, Some(&title));
+            });
+        }
 
         // Two-line description snippet
         if !summary.description_snippet.is_empty() {
@@ -372,32 +340,36 @@ impl DetailsSheet {
             on_dl(sum_dl.clone(), q);
         });
 
-        // AdwDialog does not dismiss on outside clicks by default. Observe clicks in the
-        // capture phase and close only when the click lands outside the presented dialog.
-        let parent_widget = parent.upcast_ref::<gtk4::Widget>().clone();
+        // AdwDialog does not dismiss on outside clicks by default. Its own widget fills the
+        // presentation host, so capture clicks there and compare them with the actual content
+        // card. This sees backdrop clicks without depending on the native window's event routing.
+        let dialog_widget = dialog.upcast_ref::<gtk4::Widget>().clone();
+        let content_widget = content_box.upcast_ref::<gtk4::Widget>().clone();
         let outside_click = GestureClick::new();
         outside_click.set_button(1);
         outside_click.set_propagation_phase(PropagationPhase::Capture);
         let dialog_weak = dialog.downgrade();
-        let parent_weak = parent_widget.downgrade();
+        let surface_weak = dialog_widget.downgrade();
+        let content_weak = content_widget.downgrade();
         outside_click.connect_pressed(move |gesture, _, x, y| {
-            let (Some(dialog), Some(parent)) = (dialog_weak.upgrade(), parent_weak.upgrade()) else {
+            let (Some(dialog), Some(surface), Some(content)) = (
+                dialog_weak.upgrade(),
+                surface_weak.upgrade(),
+                content_weak.upgrade(),
+            ) else {
                 return;
             };
 
-            // Pick the widget under the click rather than relying only on coordinate bounds:
-            // AdwDialog can be hosted in an internal overlay, where its bounds aren't always
-            // expressed in the same coordinate space as the parent window.
-            let dialog_widget = dialog.upcast_ref::<gtk4::Widget>();
-            let inside = if let Some(picked) = parent.pick(x, y, gtk4::PickFlags::DEFAULT) {
-                picked == *dialog_widget || picked.is_ancestor(dialog_widget)
-            } else if let Some(bounds) = dialog.compute_bounds(&parent) {
+            // Gesture coordinates and bounds are both local to the dialog's full-screen surface.
+            let inside = if let Some(bounds) = content.compute_bounds(&surface) {
                 let left = bounds.x() as f64;
                 let top = bounds.y() as f64;
                 x >= left
                     && x <= left + bounds.width() as f64
                     && y >= top
                     && y <= top + bounds.height() as f64
+            } else if let Some(picked) = surface.pick(x, y, gtk4::PickFlags::DEFAULT) {
+                picked == content || picked.is_ancestor(&content)
             } else {
                 false
             };
@@ -407,16 +379,323 @@ impl DetailsSheet {
                 dialog.close();
             }
         });
-        parent_widget.add_controller(outside_click.clone());
+        dialog_widget.add_controller(outside_click.clone());
 
-        let parent_weak = parent_widget.downgrade();
+        let surface_weak = dialog_widget.downgrade();
         dialog.connect_closed(move |_| {
-            if let Some(parent) = parent_weak.upgrade() {
-                parent.remove_controller(&outside_click);
+            if let Some(surface) = surface_weak.upgrade() {
+                surface.remove_controller(&outside_click);
             }
         });
         dialog.present(Some(parent));
     }
+}
+
+fn build_channel_row(summary: &VideoSummary, actions: &CardActions, dialog: &adw::Dialog) -> GtkBox {
+    let channel_row = GtkBox::new(Orientation::Horizontal, 12);
+    channel_row.set_valign(Align::Center);
+    let collaborators = summary.channel_credits();
+
+    let primary = collaborators.first();
+    let avatar_label = primary
+        .map(|channel| channel.name.as_str())
+        .filter(|name| !name.is_empty());
+    let avatar = adw::Avatar::new(36, avatar_label, true);
+    avatar.set_size_request(36, 36);
+    if let Some(primary) = primary {
+        if !primary.avatar_url.is_empty() {
+            actions
+                .image_loader
+                .load_into_avatar(&primary.id, &primary.avatar_url, &avatar);
+        }
+    }
+    let (avatar_stack, extra_avatars) =
+        build_collaborator_avatar_stack(&avatar, &collaborators, 36);
+    for (channel_id, avatar_url, extra) in extra_avatars {
+        if !avatar_url.is_empty() {
+            actions
+                .image_loader
+                .load_into_avatar(&channel_id, &avatar_url, &extra);
+        }
+    }
+    // For an ordinary video the avatar and name both navigate to its channel.
+    // Collaboration attribution remains separate from the per-channel dialog.
+    if !summary.is_collaboration() {
+        if let Some(channel) = primary.filter(|channel| !channel.id.is_empty()) {
+            let avatar_link = Button::new();
+            avatar_link.add_css_class("yr-channel-link-button");
+            avatar_link.set_tooltip_text(Some("Open channel"));
+            avatar_link.set_child(Some(&avatar_stack));
+            set_pointer(&avatar_link);
+            connect_open_channel(&avatar_link, channel, actions, dialog);
+            channel_row.append(&avatar_link);
+        } else {
+            channel_row.append(&avatar_stack);
+        }
+    } else {
+        channel_row.append(&avatar_stack);
+    }
+
+    let channel_info = GtkBox::new(Orientation::Vertical, 2);
+    channel_info.set_hexpand(true);
+    if let Some(byline) = summary.channel_byline() {
+        let channel_name = Label::new(Some(&byline));
+        channel_name.set_halign(Align::Start);
+        channel_name.set_xalign(0.0);
+        channel_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        channel_name.add_css_class("yr-title");
+        if !summary.is_collaboration() {
+            if let Some(channel) = primary.filter(|channel| !channel.id.is_empty()) {
+                let name_link = Button::new();
+                name_link.add_css_class("yr-channel-link-button");
+                name_link.set_halign(Align::Start);
+                name_link.set_tooltip_text(Some("Open channel"));
+                name_link.set_child(Some(&channel_name));
+                set_pointer(&name_link);
+                connect_open_channel(&name_link, channel, actions, dialog);
+                channel_info.append(&name_link);
+            } else {
+                channel_info.append(&channel_name);
+            }
+        } else {
+            channel_info.append(&channel_name);
+        }
+    }
+
+    let stats_text = [
+        (!summary.view_count_text.is_empty()).then_some(summary.view_count_text.as_str()),
+        (!summary.published_text.is_empty()).then_some(summary.published_text.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    if !stats_text.is_empty() {
+        let stats_label = Label::new(Some(&stats_text));
+        stats_label.add_css_class("yr-meta");
+        stats_label.set_halign(Align::Start);
+        stats_label.set_xalign(0.0);
+        stats_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        channel_info.append(&stats_label);
+    }
+    channel_row.append(&channel_info);
+
+    if summary.is_collaboration() {
+        let subscribe_btn = Button::with_label("Subscribe");
+        subscribe_btn.set_valign(Align::Center);
+        subscribe_btn.add_css_class("yr-btn");
+        subscribe_btn.add_css_class("primary");
+        set_pointer(&subscribe_btn);
+        let channels = summary.collaborators.clone();
+        let dialog_weak = dialog.downgrade();
+        let actions = actions.clone();
+        subscribe_btn.connect_clicked(move |_| {
+            if let Some(details_dialog) = dialog_weak.upgrade() {
+                show_collaborators_dialog(
+                    &details_dialog,
+                    &details_dialog,
+                    &channels,
+                    &actions,
+                );
+            }
+        });
+        channel_row.append(&subscribe_btn);
+    } else if let Some(channel) = collaborators
+        .first()
+        .filter(|channel| !channel.id.is_empty())
+    {
+        let subscribe_btn = make_channel_subscribe_button(channel, actions);
+        subscribe_btn.add_css_class("primary");
+        channel_row.append(&subscribe_btn);
+    }
+
+    channel_row
+}
+
+fn connect_open_channel(button: &Button, channel: &VideoCollaborator, actions: &CardActions, dialog: &adw::Dialog) {
+    let id = channel.id.clone();
+    let name = channel.name.clone();
+    let on_open = actions.on_open_channel.clone();
+    let dialog_weak = dialog.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(dialog) = dialog_weak.upgrade() {
+            dialog.close();
+        }
+        on_open(id.clone(), name.clone());
+    });
+}
+
+fn make_channel_subscribe_button(channel: &VideoCollaborator, actions: &CardActions) -> Button {
+    let subscribed = (actions.is_subscribed)(&channel.id);
+    let button = Button::with_label(if subscribed { "Subscribed" } else { "Subscribe" });
+    button.set_valign(Align::Center);
+    button.add_css_class("yr-btn");
+    button.set_sensitive(!channel.id.is_empty());
+    set_pointer(&button);
+    let toggle = actions.on_toggle_subscription.clone();
+    let channel = channel.clone();
+    button.connect_clicked(move |button| {
+        let subscribed = toggle(channel.clone());
+        button.set_label(if subscribed { "Subscribed" } else { "Subscribe" });
+    });
+    button
+}
+
+fn show_collaborators_dialog(
+    parent: &adw::Dialog,
+    details_dialog: &adw::Dialog,
+    collaborators: &[VideoCollaborator],
+    actions: &CardActions,
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Collaborators")
+        .content_width(440)
+        .build();
+    dialog.add_css_class("yr-collaborators-dialog");
+    dialog.set_can_close(true);
+
+    let root = GtkBox::new(Orientation::Vertical, 10);
+    root.set_width_request(400);
+    root.set_margin_top(18);
+    root.set_margin_bottom(18);
+    root.set_margin_start(18);
+    root.set_margin_end(18);
+
+    let heading = Label::new(Some("Collaborators"));
+    heading.add_css_class("yr-popover-head");
+    heading.set_halign(Align::Start);
+    root.append(&heading);
+
+    let rows = GtkBox::new(Orientation::Vertical, 8);
+    for channel in collaborators {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        row.set_valign(Align::Center);
+        row.add_css_class("yr-collaborator-row");
+
+        let avatar = adw::Avatar::new(
+            40,
+            (!channel.name.is_empty()).then_some(channel.name.as_str()),
+            true,
+        );
+        if !channel.avatar_url.is_empty() {
+            actions
+                .image_loader
+                .load_into_avatar(&channel.id, &channel.avatar_url, &avatar);
+        }
+        row.append(&avatar);
+
+        let info = GtkBox::new(Orientation::Vertical, 2);
+        info.set_hexpand(true);
+        let name = Label::new(Some(if channel.name.is_empty() {
+            "Channel"
+        } else {
+            channel.name.as_str()
+        }));
+        name.set_halign(Align::Start);
+        name.set_xalign(0.0);
+        name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        name.add_css_class("yr-title");
+        if !channel.id.is_empty() {
+            name.add_css_class("yr-chan-hover");
+            set_pointer(&name);
+            let channel_id = channel.id.clone();
+            let channel_name = channel.name.clone();
+            let on_open_channel = actions.on_open_channel.clone();
+            let collaborators_weak = dialog.downgrade();
+            let details_weak = details_dialog.downgrade();
+            let open_channel = GestureClick::new();
+            open_channel.set_button(1);
+            open_channel.connect_released(move |_, _, _, _| {
+                if let Some(dialog) = collaborators_weak.upgrade() {
+                    dialog.close();
+                }
+                if let Some(dialog) = details_weak.upgrade() {
+                    dialog.close();
+                }
+                on_open_channel(channel_id.clone(), channel_name.clone());
+            });
+            name.add_controller(open_channel);
+        }
+        info.append(&name);
+
+        let metadata = [
+            channel.handle.as_str(),
+            channel.subscriber_count_text.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        if !metadata.is_empty() {
+            let subtitle = Label::new(Some(&metadata));
+            subtitle.set_halign(Align::Start);
+            subtitle.set_xalign(0.0);
+            subtitle.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            subtitle.add_css_class("yr-meta");
+            info.append(&subtitle);
+        }
+        row.append(&info);
+
+        let subscribe_btn = make_channel_subscribe_button(channel, actions);
+        row.append(&subscribe_btn);
+        rows.append(&row);
+    }
+
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .child(&rows)
+        .build();
+    scrolled.add_css_class("yr-no-scrollbar");
+    root.append(&scrolled);
+    dialog.set_child(Some(&root));
+    add_dialog_outside_click_dismissal(&dialog, &root);
+    dialog.present(Some(parent));
+}
+
+fn add_dialog_outside_click_dismissal(dialog: &adw::Dialog, content: &GtkBox) {
+    let surface = dialog.upcast_ref::<gtk4::Widget>().clone();
+    let content_widget = content.upcast_ref::<gtk4::Widget>().clone();
+    let outside_click = GestureClick::new();
+    outside_click.set_button(1);
+    outside_click.set_propagation_phase(PropagationPhase::Capture);
+    let dialog_weak = dialog.downgrade();
+    let surface_weak = surface.downgrade();
+    let content_weak = content_widget.downgrade();
+    outside_click.connect_pressed(move |gesture, _, x, y| {
+        let (Some(dialog), Some(surface), Some(content)) = (
+            dialog_weak.upgrade(),
+            surface_weak.upgrade(),
+            content_weak.upgrade(),
+        ) else {
+            return;
+        };
+        let inside = if let Some(bounds) = content.compute_bounds(&surface) {
+            let left = bounds.x() as f64;
+            let top = bounds.y() as f64;
+            x >= left
+                && x <= left + bounds.width() as f64
+                && y >= top
+                && y <= top + bounds.height() as f64
+        } else if let Some(picked) = surface.pick(x, y, gtk4::PickFlags::DEFAULT) {
+            picked == content || picked.is_ancestor(&content)
+        } else {
+            false
+        };
+        if !inside {
+            gesture.set_state(EventSequenceState::Claimed);
+            dialog.close();
+        }
+    });
+    surface.add_controller(outside_click.clone());
+    let surface_weak = surface.downgrade();
+    dialog.connect_closed(move |_| {
+        if let Some(surface) = surface_weak.upgrade() {
+            surface.remove_controller(&outside_click);
+        }
+    });
 }
 
 fn attach_playlist_picker_popover(

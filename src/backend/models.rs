@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VideoCollaborator {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub handle: String,
+    #[serde(default)]
+    pub subscriber_count_text: String,
+    #[serde(default)]
+    pub avatar_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoSummary {
     pub id: String,
@@ -21,6 +33,50 @@ pub struct VideoSummary {
     pub thumbnail_url: String,
     #[serde(default)]
     pub description_snippet: String,
+    /// All channels credited on a YouTube collaboration video, in display order.
+    #[serde(default)]
+    pub collaborators: Vec<VideoCollaborator>,
+}
+
+impl VideoSummary {
+    /// Returns every known credited channel, falling back to the legacy single-channel fields.
+    pub fn channel_credits(&self) -> Vec<VideoCollaborator> {
+        if !self.collaborators.is_empty() {
+            return self.collaborators.clone();
+        }
+        if self.channel_id.is_empty() && self.channel_name.is_empty() {
+            return Vec::new();
+        }
+        vec![VideoCollaborator {
+            id: self.channel_id.clone(),
+            name: self.channel_name.clone(),
+            avatar_url: self.channel_avatar_url.clone(),
+            ..VideoCollaborator::default()
+        }]
+    }
+
+    /// True only when YouTube identifies more than one credited channel.
+    /// The legacy channel fields are deliberately not used for this check.
+    pub fn is_collaboration(&self) -> bool {
+        self.collaborators.len() > 1
+    }
+
+    /// Compact YouTube-style byline: the first credited channel plus an overflow count.
+    pub fn channel_byline(&self) -> Option<String> {
+        let credits = self.channel_credits();
+        let first = credits.first()?;
+        let name = if first.name.is_empty() {
+            "Channel"
+        } else {
+            first.name.as_str()
+        };
+        let more = credits.len().saturating_sub(1);
+        Some(if more == 0 {
+            name.to_string()
+        } else {
+            format!("{name} and {more} more")
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,6 +401,51 @@ mod tests {
     }
 
     #[test]
+    fn test_channel_credits_format_collaboration_byline_and_single_channel_fallback() {
+        let mut video = VideoSummary {
+            id: "test".to_string(),
+            title: "test".to_string(),
+            channel_id: "UC-primary".to_string(),
+            channel_name: "Primary Channel".to_string(),
+            channel_avatar_url: "https://img/primary.jpg".to_string(),
+            duration_seconds: None,
+            duration_text: String::new(),
+            view_count_text: String::new(),
+            view_count: None,
+            published_text: String::new(),
+            published_unix: None,
+            is_short: false,
+            thumbnail_url: String::new(),
+            description_snippet: String::new(),
+            collaborators: vec![
+                VideoCollaborator {
+                    id: "UC-primary".to_string(),
+                    name: "Primary Channel".to_string(),
+                    ..VideoCollaborator::default()
+                },
+                VideoCollaborator {
+                    id: "UC-two".to_string(),
+                    name: "Second Channel".to_string(),
+                    ..VideoCollaborator::default()
+                },
+                VideoCollaborator {
+                    id: "UC-three".to_string(),
+                    name: "Third Channel".to_string(),
+                    ..VideoCollaborator::default()
+                },
+            ],
+        };
+        assert_eq!(video.channel_byline().as_deref(), Some("Primary Channel and 2 more"));
+        assert_eq!(video.channel_credits().len(), 3);
+        assert!(video.is_collaboration());
+
+        video.collaborators.clear();
+        assert_eq!(video.channel_byline().as_deref(), Some("Primary Channel"));
+        assert_eq!(video.channel_credits().len(), 1);
+        assert!(!video.is_collaboration());
+    }
+
+    #[test]
     fn test_format_queue_total_duration() {
         assert_eq!(format_queue_total_duration(0), "");
         assert_eq!(format_queue_total_duration(45), "45 sec");
@@ -368,6 +469,7 @@ mod tests {
             is_short: false,
             thumbnail_url: String::new(),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         };
         assert!(matches_local_filters(
             &video,
@@ -422,6 +524,7 @@ mod tests {
             is_short: false,
             thumbnail_url: String::new(),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         };
         assert!(matches_local_filters(
             &video,

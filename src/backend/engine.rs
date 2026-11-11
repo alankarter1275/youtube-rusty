@@ -1,8 +1,7 @@
 use super::models::{
     format_count, format_duration, format_relative_published_text, relative_published_timestamp,
-    ChannelDetails, ChannelSearchSummary,
-    ChannelSortOrder, DurationFilter, PlaylistSearchSummary, SearchItem, SearchSortOrder, SearchTab,
-    UploadDateFilter, VideoSummary,
+    ChannelDetails, ChannelSearchSummary, ChannelSortOrder, DurationFilter, PlaylistSearchSummary,
+    SearchItem, SearchSortOrder, SearchTab, UploadDateFilter, VideoCollaborator, VideoSummary,
 };
 use super::subscriptions::SubscribedChannel;
 use crate::player::mpv::{Quality, ResolvedPlayback};
@@ -256,6 +255,14 @@ fn synthesize_visitor_data() -> String {
     encode_base64_url_safe_pct(&proto)
 }
 
+#[derive(Clone, Default)]
+struct VideoAttribution {
+    channel_id: String,
+    channel_name: String,
+    channel_avatar_url: String,
+    collaborators: Vec<VideoCollaborator>,
+}
+
 pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
@@ -267,6 +274,8 @@ pub struct Engine {
     seen_home_ids: RwLock<Vec<String>>,
     category_seed: AtomicU64,
     seen_category_ids: RwLock<Vec<String>>,
+    attribution_cache: RwLock<HashMap<String, VideoAttribution>>,
+    attribution_limit: Semaphore,
 }
 
 impl Engine {
@@ -310,6 +319,8 @@ impl Engine {
             seen_home_ids: RwLock::new(Vec::new()),
             category_seed: AtomicU64::new(init_seed.wrapping_add(3)),
             seen_category_ids: RwLock::new(Vec::new()),
+            attribution_cache: RwLock::new(HashMap::new()),
+            attribution_limit: Semaphore::new(4),
         }
     }
 
@@ -1751,6 +1762,70 @@ impl Engine {
         }
     }
 
+    /// Enrich any video using the watch page's owner, independent of the feed it came from.
+    /// Errors leave the original summary untouched and are not cached, so a later attempt can retry.
+    pub async fn enrich_video_attribution(&self, video: VideoSummary) -> VideoSummary {
+        self.enrich_video_attribution_inner(video, false).await
+    }
+
+    // A details dialog must not wait behind a long list of background card lookups.
+    pub async fn enrich_video_attribution_priority(&self, video: VideoSummary) -> VideoSummary {
+        self.enrich_video_attribution_inner(video, true).await
+    }
+
+    async fn enrich_video_attribution_inner(&self, mut video: VideoSummary, priority: bool) -> VideoSummary {
+        if video.id.is_empty() || video.is_collaboration() {
+            return video;
+        }
+        let cached = self.attribution_cache.read().await.get(&video.id).cloned();
+        let attribution = if let Some(cached) = cached {
+            Some(cached)
+        } else {
+            let _permit = if priority {
+                None
+            } else {
+                let Ok(permit) = self.attribution_limit.acquire().await else { return video };
+                Some(permit)
+            };
+            let cached = self.attribution_cache.read().await.get(&video.id).cloned();
+            if cached.is_some() {
+                cached
+            } else {
+                let result = tokio::time::timeout(Duration::from_secs(8), async {
+                    let body = json!({"context": {"client": {
+                        "clientName": "WEB", "clientVersion": "2.20260728.01.00",
+                        "hl": "en", "gl": "US"
+                    }}, "videoId": video.id});
+                    let response = self.http.post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+                        .header("User-Agent", RP_DESKTOP_UA)
+                        .header("Origin", "https://www.youtube.com")
+                        .header("Referer", "https://www.youtube.com/")
+                        .json(&body).send().await.ok()?;
+                    if !response.status().is_success() { return None; }
+                    let json = response.json::<Value>().await.ok()?;
+                    parse_watch_attribution(&json)
+                }).await.ok().flatten();
+                if let Some(ref value) = result {
+                    self.attribution_cache.write().await.insert(video.id.clone(), value.clone());
+                }
+                result
+            }
+        };
+        if let Some(data) = attribution {
+            if data.collaborators.len() > 1 {
+                video.channel_id = data.channel_id;
+                video.channel_name = data.channel_name;
+                video.channel_avatar_url = data.channel_avatar_url;
+                video.collaborators = data.collaborators;
+            } else {
+                if video.channel_id.is_empty() { video.channel_id = data.channel_id; }
+                if video.channel_name.is_empty() { video.channel_name = data.channel_name; }
+                if video.channel_avatar_url.is_empty() { video.channel_avatar_url = data.channel_avatar_url; }
+            }
+        }
+        video
+    }
+
     pub async fn fetch_video_summary(&self, video_id: &str) -> Result<VideoSummary, String> {
         if let Ok(pool) = self.fetch_candidate_pool(video_id).await {
             if let Some(title) = pool.title.filter(|t| !t.is_empty()) {
@@ -1781,6 +1856,7 @@ impl Engine {
                     is_short: false,
                     thumbnail_url: thumb,
                     description_snippet: String::new(),
+            collaborators: Vec::new(),
                 });
             }
         }
@@ -1808,6 +1884,7 @@ impl Engine {
             is_short: false,
             thumbnail_url: format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         })
     }
 
@@ -1921,31 +1998,70 @@ impl Engine {
             _ => UploadDate::Week,
         };
 
+        let direct_date = match &date_window {
+            UploadDate::Hour => UploadDateFilter::Today,
+            UploadDate::Day => UploadDateFilter::Today,
+            UploadDate::Week => UploadDateFilter::ThisWeek,
+            UploadDate::Month => UploadDateFilter::ThisMonth,
+            UploadDate::Year => UploadDateFilter::ThisYear,
+        };
         let filter = SearchFilter::new()
             .item_type(ItemType::Video)
             .date(date_window);
+        let direct_params = encode_direct_search_params(
+            SearchSortOrder::Relevance,
+            direct_date,
+            DurationFilter::AnyLength,
+            Some(1),
+        );
 
-        let paginator = match self.rp_query().await
-            .search_filter::<VideoItem, _>(chosen_query, &filter)
-            .await
-        {
-            Ok(res) if !res.items.items.is_empty() => res.items,
-            _ => {
-                self.rp_query().await
+        // RustyPipe's VideoItem model drops YouTube's collaborator list. In parallel, inspect
+        // the raw WEB search response and merge those channel credits onto the stable result list.
+        let rustypipe_search = async {
+            match self
+                .rp_query()
+                .await
+                .search_filter::<VideoItem, _>(chosen_query, &filter)
+                .await
+            {
+                Ok(res) if !res.items.items.is_empty() => Ok(res.items),
+                _ => self
+                    .rp_query()
+                    .await
                     .search::<VideoItem, _>(chosen_query)
                     .await
-                    .map_err(|e| format!("Category error: {e}"))?
-                    .items
+                    .map(|result| result.items)
+                    .map_err(|error| format!("Category error: {error}")),
             }
         };
+        let (paginator, direct_json) = tokio::join!(
+            rustypipe_search,
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                self.fetch_search_json(Some(chosen_query), Some(&direct_params), None),
+            ),
+        );
+        let paginator = paginator?;
 
         let next = cursor_from_paginator(&paginator);
-        let all_mapped: Vec<VideoSummary> = paginator
+        let mut all_mapped: Vec<VideoSummary> = paginator
             .items
             .into_iter()
             .filter(|it| !it.is_short)
             .map(|it| map_video_item(it, None, false))
             .collect();
+        if let Ok(Ok(raw)) = direct_json {
+            let direct = parse_direct_search_response(&raw, DirectSearchMode::All);
+            let direct_videos: Vec<VideoSummary> = direct
+                .items
+                .into_iter()
+                .filter_map(|item| match item {
+                    SearchItem::Video(video) => Some(video),
+                    SearchItem::Channel(_) | SearchItem::Playlist(_) => None,
+                })
+                .collect();
+            fill_missing_channel_metadata(&mut all_mapped, &direct_videos);
+        }
 
         let prev_seen: HashSet<String> = if force_refresh {
             self.seen_category_ids.read().await.iter().cloned().collect()
@@ -4022,6 +4138,7 @@ fn parse_short_lockup_item(
         is_short: true,
         thumbnail_url,
         description_snippet: String::new(),
+            collaborators: Vec::new(),
     })
 }
 
@@ -4075,6 +4192,7 @@ fn parse_reel_item(
         is_short: true,
         thumbnail_url,
         description_snippet: String::new(),
+            collaborators: Vec::new(),
     })
 }
 
@@ -4426,6 +4544,7 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoSummary> {
         is_short,
         thumbnail_url,
         description_snippet: String::new(),
+            collaborators: Vec::new(),
     })
 }
 
@@ -4439,18 +4558,31 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
         .get("ownerText")
         .or_else(|| vr.get("longBylineText"))
         .or_else(|| vr.get("shortBylineText"));
-    let channel_name = extract_yt_text(byline).unwrap_or_default();
-    let channel_id = byline
+    let mut channel_name = extract_yt_text(byline).unwrap_or_default();
+    let mut channel_id = byline
         .and_then(|b| b.pointer("/runs/0/navigationEndpoint/browseEndpoint/browseId"))
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let channel_avatar_url = pick_json_sources_url(
+    let mut channel_avatar_url = pick_json_sources_url(
         vr.pointer("/channelThumbnailSupportedRenderers/channelThumbnailWithLinkRenderer/thumbnail/thumbnails")
             .and_then(|v| v.as_array()),
         64,
     )
     .unwrap_or_default();
+
+    let collaborators = parse_video_collaborators(vr);
+    if let Some(primary) = collaborators.first() {
+        if !primary.id.is_empty() {
+            channel_id = primary.id.clone();
+        }
+        if !primary.name.is_empty() {
+            channel_name = primary.name.clone();
+        }
+        if !primary.avatar_url.is_empty() {
+            channel_avatar_url = primary.avatar_url.clone();
+        }
+    }
 
     let mut duration_text = extract_yt_text(vr.get("lengthText")).unwrap_or_default();
     let mut is_short = vr
@@ -4528,6 +4660,7 @@ fn parse_video_renderer_json(vr: &Value) -> Option<VideoSummary> {
         is_short,
         thumbnail_url,
         description_snippet,
+        collaborators,
     })
 }
 
@@ -4821,6 +4954,164 @@ fn shuffle_videos_seeded(items: &mut [VideoSummary], mut state: u64) {
     }
 }
 
+fn find_list_items_in_avatar_stack(value: &Value) -> Option<&[Value]> {
+    let path = "/rendererContext/commandContext/onTap/innertubeCommand/showDialogCommand/\
+        panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems";
+    if let Some(items) = value.pointer(path).and_then(Value::as_array) {
+        return Some(items.as_slice());
+    }
+
+    fn find_list_items(value: &Value) -> Option<&[Value]> {
+        match value {
+            Value::Array(values) => values.iter().find_map(find_list_items),
+            Value::Object(map) => {
+                if let Some(items) = map
+                    .get("listViewModel")
+                    .and_then(|list| list.get("listItems"))
+                    .and_then(Value::as_array)
+                {
+                    return Some(items.as_slice());
+                }
+                map.values().find_map(find_list_items)
+            }
+            _ => None,
+        }
+    }
+
+    find_list_items(value)
+}
+
+fn find_collaboration_items(value: &Value) -> Option<&[Value]> {
+    match value {
+        Value::Array(values) => values.iter().find_map(find_collaboration_items),
+        Value::Object(map) => {
+            if let Some(stack) = map.get("avatarStackViewModel") {
+                if let Some(items) = find_list_items_in_avatar_stack(stack) {
+                    return Some(items);
+                }
+            }
+            map.values().find_map(find_collaboration_items)
+        }
+        _ => None,
+    }
+}
+
+fn parse_video_collaborators(lockup: &Value) -> Vec<VideoCollaborator> {
+    let Some(items) = find_collaboration_items(lockup) else {
+        return Vec::new();
+    };
+
+    parse_collaborator_items(items)
+}
+
+fn parse_collaborator_items(items: &[Value]) -> Vec<VideoCollaborator> {
+    let mut collaborators = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for item in items {
+        let Some(view) = item.get("listItemViewModel") else {
+            continue;
+        };
+        let name = extract_yt_text(view.get("title")).unwrap_or_default();
+        let browse_id = view
+            .pointer("/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .or_else(|| view.pointer("/title/commandRuns").and_then(Value::as_array)
+                .and_then(|runs| runs.iter().find_map(|run| run.pointer("/onTap/innertubeCommand/browseEndpoint/browseId").and_then(Value::as_str))))
+            .unwrap_or_default()
+            .to_string();
+        let id = if !browse_id.is_empty() {
+            browse_id
+        } else {
+            view.pointer("/rendererContext/commandContext/onTap/innertubeCommand/commandMetadata/webCommandMetadata/url")
+                .and_then(Value::as_str)
+                .and_then(|url| url.strip_prefix("/channel/"))
+                .unwrap_or_default()
+                .to_string()
+        };
+        if name.is_empty() && id.is_empty() {
+            continue;
+        }
+        if !id.is_empty() && !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let subtitle = extract_yt_text(view.get("subtitle")).unwrap_or_default();
+        let subtitle: String = subtitle
+            .chars()
+            .filter(|ch| !matches!(*ch, '\u{200e}' | '\u{200f}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{2069}'))
+            .collect();
+        let metadata_parts: Vec<&str> = subtitle
+            .split(['•', '·'])
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        let handle = metadata_parts
+            .iter()
+            .find(|part| part.starts_with('@'))
+            .copied()
+            .unwrap_or_default()
+            .to_string();
+        let subscriber_count_text = metadata_parts
+            .iter()
+            .find(|part| part.to_ascii_lowercase().contains("subscriber"))
+            .copied()
+            .unwrap_or_default()
+            .to_string();
+        let avatar_url = pick_json_sources_url(
+            view.pointer("/leadingAccessory/avatarViewModel/image/sources")
+                .and_then(Value::as_array),
+            48,
+        )
+        .unwrap_or_default();
+
+        collaborators.push(VideoCollaborator {
+            id,
+            name,
+            handle,
+            subscriber_count_text,
+            avatar_url,
+        });
+    }
+    collaborators
+}
+
+/// Only inspect the current video's secondary-info owner, never suggested videos.
+fn parse_watch_attribution(json: &Value) -> Option<VideoAttribution> {
+    fn find_owner(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Array(items) => items.iter().find_map(find_owner),
+            Value::Object(map) => {
+                if let Some(owner) = map.get("videoSecondaryInfoRenderer")
+                    .and_then(|v| v.pointer("/owner/videoOwnerRenderer")) {
+                    return Some(owner);
+                }
+                map.values().find_map(find_owner)
+            }
+            _ => None,
+        }
+    }
+    let owner = find_owner(json.get("contents")?)?;
+    let items = owner.pointer("/navigationEndpoint/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
+        .and_then(Value::as_array);
+    let collaborators = items.map(|items| parse_collaborator_items(items)).unwrap_or_default();
+    // Only verified distinct channel IDs count as formal credits.
+    let collaborators = if collaborators.len() > 1 && collaborators.iter().all(|c| c.id.starts_with("UC")) {
+        collaborators
+    } else { Vec::new() };
+    if let Some(primary) = collaborators.first() {
+        return Some(VideoAttribution { channel_id: primary.id.clone(), channel_name: primary.name.clone(),
+            channel_avatar_url: primary.avatar_url.clone(), collaborators });
+    }
+    let title = owner.get("title");
+    let channel_name = extract_yt_text(title).unwrap_or_default();
+    let channel_id = title.and_then(|t| t.pointer("/runs/0/navigationEndpoint/browseEndpoint/browseId"))
+        .or_else(|| owner.pointer("/navigationEndpoint/browseEndpoint/browseId"))
+        .and_then(Value::as_str).unwrap_or_default().to_string();
+    let channel_avatar_url = pick_json_sources_url(owner.pointer("/thumbnail/thumbnails").and_then(Value::as_array), 88).unwrap_or_default();
+    if channel_id.is_empty() && channel_name.is_empty() { return None; }
+    Some(VideoAttribution { channel_id, channel_name, channel_avatar_url, collaborators })
+}
+
 fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
     let content_type = lockup
         .get("contentType")
@@ -4906,6 +5197,7 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
     }
     let duration_seconds = parse_mmss_to_seconds(&duration_text);
 
+    let collaborators = parse_video_collaborators(lockup);
     let mut channel_name = String::new();
     let mut channel_id = lockup
         .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
@@ -4913,13 +5205,24 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
         .filter(|s| s.starts_with("UC"))
         .unwrap_or_default()
         .to_string();
-    let channel_avatar_url = pick_json_sources_url(
+    let mut channel_avatar_url = pick_json_sources_url(
         lockup
             .pointer("/metadata/lockupMetadataViewModel/image/decoratedAvatarViewModel/avatar/avatarViewModel/image/sources")
             .and_then(|v| v.as_array()),
         64,
     )
     .unwrap_or_default();
+    if let Some(primary) = collaborators.first() {
+        if !primary.id.is_empty() {
+            channel_id = primary.id.clone();
+        }
+        if !primary.name.is_empty() {
+            channel_name = primary.name.clone();
+        }
+        if !primary.avatar_url.is_empty() {
+            channel_avatar_url = primary.avatar_url.clone();
+        }
+    }
 
     let mut view_count_text = String::new();
     let mut published_text = String::new();
@@ -5002,6 +5305,7 @@ fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
         is_short,
         thumbnail_url,
         description_snippet: String::new(),
+        collaborators,
     })
 }
 
@@ -5038,6 +5342,18 @@ fn fill_missing_channel_metadata(target: &mut [VideoSummary], source: &[VideoSum
         }
         if video.published_text.is_empty() {
             video.published_text = details.published_text.clone();
+        }
+        if video.channel_id.is_empty() {
+            video.channel_id = details.channel_id.clone();
+        }
+        if video.channel_name.is_empty() {
+            video.channel_name = details.channel_name.clone();
+        }
+        if video.channel_avatar_url.is_empty() {
+            video.channel_avatar_url = details.channel_avatar_url.clone();
+        }
+        if video.collaborators.is_empty() && !details.collaborators.is_empty() {
+            video.collaborators = details.collaborators.clone();
         }
     }
 }
@@ -5861,12 +6177,55 @@ fn map_video_item(
         is_short,
         thumbnail_url,
         description_snippet,
+        collaborators: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_owner_collaboration_reads_dialog_title_commands_and_ignores_recommendations() {
+        // Structure documented from a live watch response by moderntube/innertube-rs PR #7.
+        let channel = |name: &str, id: &str| json!({ "listItemViewModel": {
+            "title": { "content": name, "commandRuns": [{"onTap": {"innertubeCommand": {
+                "browseEndpoint": {"browseId": id}
+            }}}]},
+            "subtitle": { "content": "@creator • 1M subscribers" },
+            "leadingAccessory": {"avatarViewModel": {"image": {"sources": [{"url": "https://img/avatar.jpg", "width": 88}]}}}
+        }});
+        let data = json!({"contents": {"items": [
+            {"videoSecondaryInfoRenderer": {"owner": {"videoOwnerRenderer": {
+                "attributedTitle": {"content": "Alpha and Beta"},
+                "navigationEndpoint": {"showDialogCommand": {"panelLoadingStrategy": {"inlineContent": {
+                    "dialogViewModel": {"customContent": {"listViewModel": {"listItems": [
+                        channel("Alpha", "UCalpha"), channel("Beta", "UCbeta")
+                    ]}}}
+                }}}}
+            }}}},
+            {"videoRenderer": {"ownerText": {"simpleText": "Unrelated recommendation"}}}
+        ]}});
+        let actual = parse_watch_attribution(&data).unwrap();
+        assert_eq!(actual.channel_id, "UCalpha");
+        assert_eq!(actual.channel_name, "Alpha");
+        assert_eq!(actual.collaborators.len(), 2);
+        assert_eq!(actual.collaborators[1].id, "UCbeta");
+        assert_eq!(actual.collaborators[1].handle, "@creator");
+        assert_eq!(actual.collaborators[1].avatar_url, "https://img/avatar.jpg");
+    }
+
+    #[test]
+    fn watch_owner_single_channel_does_not_create_collaboration() {
+        let data = json!({"contents": {"videoSecondaryInfoRenderer": {"owner": {"videoOwnerRenderer": {
+            "title": {"runs": [{"text": "Solo", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCsolo"}}}]},
+            "thumbnail": {"thumbnails": [{"url": "https://img/solo.jpg", "width": 88}]}
+        }}}}});
+        let actual = parse_watch_attribution(&data).unwrap();
+        assert_eq!(actual.channel_id, "UCsolo");
+        assert_eq!(actual.channel_name, "Solo");
+        assert!(actual.collaborators.is_empty());
+    }
 
     fn duration_test_video(id: &str, seconds: Option<u64>, text: &str) -> VideoSummary {
         VideoSummary {
@@ -5884,6 +6243,7 @@ mod tests {
             is_short: false,
             thumbnail_url: String::new(),
             description_snippet: String::new(),
+            collaborators: Vec::new(),
         }
     }
 
@@ -5897,6 +6257,152 @@ mod tests {
         let parsed = parse_video_renderer_json(&renderer).unwrap();
         assert_eq!(parsed.duration_seconds, Some(754));
         assert_eq!(parsed.duration_text, "12:34");
+        assert!(!parsed.is_collaboration());
+    }
+
+    #[test]
+    fn test_video_lockup_parses_all_collaboration_channels() {
+        let collaborator = |id: &str, name: &str, handle: &str, subs: &str, avatar: &str| {
+            json!({
+                "listItemViewModel": {
+                    "title": { "content": name },
+                    "subtitle": { "content": format!("\u{200e}\u{2068}{handle}\u{2069} • \u{2068}{subs}\u{2069}") },
+                    "leadingAccessory": {
+                        "avatarViewModel": {
+                            "image": { "sources": [{ "url": avatar, "width": 68, "height": 68 }] }
+                        }
+                    },
+                    "rendererContext": {
+                        "commandContext": {
+                            "onTap": {
+                                "innertubeCommand": {
+                                    "browseEndpoint": { "browseId": id }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let lockup = json!({
+            "contentId": "abc123XYZ89",
+            "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+            "metadata": {
+                "lockupMetadataViewModel": {
+                    "title": { "content": "A collaboration video" },
+                    "image": {
+                        "avatarStackViewModel": {
+                            "rendererContext": {
+                                "commandContext": {
+                                    "onTap": {
+                                        "innertubeCommand": {
+                                            "showDialogCommand": {
+                                                "panelLoadingStrategy": {
+                                                    "inlineContent": {
+                                                        "dialogViewModel": {
+                                                            "customContent": {
+                                                                "listViewModel": {
+                                                                    "listItems": [
+                                                                        collaborator("UC-one", "Channel One", "@one", "1.2M subscribers", "https://img/one.jpg"),
+                                                                        collaborator("UC-two", "Channel Two", "@two", "345K subscribers", "https://img/two.jpg"),
+                                                                        collaborator("UC-three", "Channel Three", "@three", "89K subscribers", "https://img/three.jpg")
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "metadata": {
+                        "contentMetadataViewModel": {
+                            "metadataRows": [{
+                                "metadataParts": [
+                                    { "text": { "content": "Channel One" } },
+                                    { "text": { "content": "and 2 more" } }
+                                ]
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_video_lockup_json(&lockup).unwrap();
+        assert_eq!(parsed.collaborators.len(), 3);
+        assert_eq!(parsed.channel_id, "UC-one");
+        assert_eq!(parsed.channel_name, "Channel One");
+        assert_eq!(parsed.channel_avatar_url, "https://img/one.jpg");
+        assert_eq!(parsed.collaborators[1].handle, "@two");
+        assert_eq!(parsed.collaborators[1].subscriber_count_text, "345K subscribers");
+        assert_eq!(parsed.channel_byline().as_deref(), Some("Channel One and 2 more"));
+    }
+
+    #[test]
+    fn test_video_renderer_finds_nested_collaboration_avatar_stack() {
+        let list_item = |id: &str, name: &str| {
+            json!({
+                "listItemViewModel": {
+                    "title": { "content": name },
+                    "rendererContext": {
+                        "commandContext": {
+                            "onTap": {
+                                "innertubeCommand": {
+                                    "browseEndpoint": { "browseId": id }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let renderer = json!({
+            "videoId": "video-collab",
+            "ownerText": { "simpleText": "Lead channel" },
+            "newRendererWrapper": {
+                "metadata": {
+                    "image": {
+                        "avatarStackViewModel": {
+                            "rendererContext": {
+                                "commandContext": {
+                                    "onTap": {
+                                        "innertubeCommand": {
+                                            "showDialogCommand": {
+                                                "panelLoadingStrategy": {
+                                                    "inlineContent": {
+                                                        "dialogViewModel": {
+                                                            "customContent": {
+                                                                "listViewModel": {
+                                                                    "listItems": [
+                                                                        list_item("UC-first", "First channel"),
+                                                                        list_item("UC-second", "Second channel")
+                                                                    ]
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_video_renderer_json(&renderer).unwrap();
+        assert!(parsed.is_collaboration());
+        assert_eq!(parsed.collaborators.len(), 2);
+        assert_eq!(parsed.channel_name, "First channel");
+        assert_eq!(parsed.channel_id, "UC-first");
     }
 
     #[test]
@@ -5905,13 +6411,32 @@ mod tests {
             duration_test_video("missing", None, ""),
             duration_test_video("known", Some(60), "1:00"),
         ];
-        let direct = vec![
+        let mut direct = vec![
             duration_test_video("missing", Some(754), "12:34"),
             duration_test_video("known", Some(99), "1:39"),
+        ];
+        direct[0].channel_id = "UC-primary".to_string();
+        direct[0].channel_name = "Primary Channel".to_string();
+        direct[0].channel_avatar_url = "https://img/primary.jpg".to_string();
+        direct[0].collaborators = vec![
+            VideoCollaborator {
+                id: "UC-primary".to_string(),
+                name: "Primary Channel".to_string(),
+                ..VideoCollaborator::default()
+            },
+            VideoCollaborator {
+                id: "UC-second".to_string(),
+                name: "Second Channel".to_string(),
+                ..VideoCollaborator::default()
+            },
         ];
         fill_missing_channel_metadata(&mut from_rustypipe, &direct);
         assert_eq!(from_rustypipe[0].duration_seconds, Some(754));
         assert_eq!(from_rustypipe[0].duration_text, "12:34");
+        assert_eq!(from_rustypipe[0].channel_id, "UC-primary");
+        assert_eq!(from_rustypipe[0].channel_name, "Primary Channel");
+        assert_eq!(from_rustypipe[0].channel_avatar_url, "https://img/primary.jpg");
+        assert_eq!(from_rustypipe[0].collaborators.len(), 2);
         assert_eq!(from_rustypipe[1].duration_seconds, Some(60));
         assert_eq!(from_rustypipe[1].duration_text, "1:00");
     }
