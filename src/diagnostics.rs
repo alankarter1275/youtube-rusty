@@ -396,8 +396,8 @@ mod tests {
         assert_eq!(s.rss_kib, None); assert_eq!(s.cpu_ticks, None); assert_eq!(s.read_bytes, None);
     }
     // A display is required; CI runs this separately under Xvfb. The control
-    // ensures the probe does not itself keep widgets alive. The interaction
-    // result is printed, not assumed, so it remains useful after a future fix.
+    // verifies both the probe and a card with real interaction handlers release
+    // their widgets. It also exercises each handler before removing the card.
     #[test]
     #[ignore = "requires a GTK display"]
     fn inspect_real_card_lifetimes() {
@@ -425,6 +425,39 @@ mod tests {
             drop(card);
             probe
         };
+        // Emit the GTK signals on a live card to verify selection, play, and
+        // details callbacks still work without strong widget captures.
+        let live = crate::ui::video_card::VideoCard::new_grid(&summary);
+        let selections = Rc::new(Cell::new(0));
+        let plays = Rc::new(Cell::new(0));
+        let details = Rc::new(Cell::new(0));
+        let s = selections.clone();
+        let p = plays.clone();
+        let d = details.clone();
+        live.connect_card_interactions(move |_| s.set(s.get() + 1), move || p.set(p.get() + 1), move || d.set(d.get() + 1));
+        let controllers = live.click_target.observe_controllers();
+        for i in 0..controllers.n_items() {
+            let Some(controller) = controllers.item(i) else { continue; };
+            if let Ok(gesture) = controller.clone().downcast::<gtk4::GestureClick>() {
+                match gesture.button() {
+                    1 => {
+                        gesture.emit_by_name::<()>("pressed", &[&1i32, &0f64, &0f64]);
+                        gesture.emit_by_name::<()>("pressed", &[&2i32, &0f64, &0f64]);
+                    }
+                    2 => gesture.emit_by_name::<()>("released", &[&1i32, &0f64, &0f64]),
+                    3 => gesture.emit_by_name::<()>("pressed", &[&1i32, &0f64, &0f64]),
+                    _ => {}
+                }
+            } else if let Ok(gesture) = controller.downcast::<gtk4::GestureLongPress>() {
+                gesture.emit_by_name::<()>("pressed", &[&0f64, &0f64]);
+            }
+        }
+        assert_eq!(selections.get(), 5);
+        assert_eq!(plays.get(), 2);
+        assert_eq!(details.get(), 2);
+        drop(controllers);
+        drop(live);
+
         let control = sample(false);
         let interactions = sample(true);
         assert_eq!(card_counts(std::slice::from_ref(&control)), CardCounts::default(),
@@ -436,6 +469,7 @@ mod tests {
         let control = card_counts(&[control]);
         let with_interactions = card_counts(&[interactions]);
         assert_eq!(control, CardCounts::default(), "control must stay released after GTK events run");
+        assert_eq!(with_interactions, CardCounts::default(), "removed interactive cards must release their widgets");
         eprintln!("CARD_LIFETIME_AFTER_5S_CONTROL={control:?} CARD_LIFETIME_AFTER_5S_WITH_INTERACTIONS={with_interactions:?}");
     }
 

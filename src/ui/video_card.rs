@@ -929,11 +929,13 @@ impl VideoCard {
         // Button 1: single-click highlights, double-click plays in MPV
         let left_click = GestureClick::new();
         left_click.set_button(1);
-        let hl_left = self.highlight_target.clone();
+        let hl_left = self.highlight_target.downgrade();
         let sel_left = on_select_rc.clone();
         let play_left = on_play_rc.clone();
         left_click.connect_pressed(move |gesture, n_press, _, _| {
-            sel_left(&hl_left);
+            if let Some(highlight) = hl_left.upgrade() {
+                sel_left(&highlight);
+            }
             if n_press == 2 {
                 gesture.set_state(EventSequenceState::Claimed);
                 play_left();
@@ -944,12 +946,14 @@ impl VideoCard {
         // Button 2 (middle-click): play immediately in MPV
         let mid_click = GestureClick::new();
         mid_click.set_button(2);
-        let hl_mid = self.highlight_target.clone();
+        let hl_mid = self.highlight_target.downgrade();
         let sel_mid = on_select_rc.clone();
         let play_mid = on_play_rc;
         mid_click.connect_released(move |gesture, _, _, _| {
             gesture.set_state(EventSequenceState::Claimed);
-            sel_mid(&hl_mid);
+            if let Some(highlight) = hl_mid.upgrade() {
+                sel_mid(&highlight);
+            }
             play_mid();
         });
         self.click_target.add_controller(mid_click);
@@ -957,24 +961,28 @@ impl VideoCard {
         // Button 3 (right-click): select + open DetailsSheet popup
         let right_click = GestureClick::new();
         right_click.set_button(3);
-        let hl_right = self.highlight_target.clone();
+        let hl_right = self.highlight_target.downgrade();
         let sel_right = on_select_rc.clone();
         let det_right = on_details_rc.clone();
         right_click.connect_pressed(move |gesture, _, _, _| {
             gesture.set_state(EventSequenceState::Claimed);
-            sel_right(&hl_right);
+            if let Some(highlight) = hl_right.upgrade() {
+                sel_right(&highlight);
+            }
             det_right();
         });
         self.click_target.add_controller(right_click);
 
         // Long-press (touchscreens): open DetailsSheet popup
         let long_press = GestureLongPress::new();
-        let hl_lp = self.highlight_target.clone();
+        let hl_lp = self.highlight_target.downgrade();
         let sel_lp = on_select_rc;
         let det_lp = on_details_rc;
         long_press.connect_pressed(move |gesture, _, _| {
             gesture.set_state(EventSequenceState::Claimed);
-            sel_lp(&hl_lp);
+            if let Some(highlight) = hl_lp.upgrade() {
+                sel_lp(&highlight);
+            }
             det_lp();
         });
         self.click_target.add_controller(long_press);
