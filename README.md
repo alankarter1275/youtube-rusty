@@ -41,3 +41,7 @@ cargo run --release
 - **`Esc`**: Close dropdowns or leave the search bar
 - **`Alt + Left`**: Go back
 - **`Space`**: Pause or resume when the player card is selected
+
+## Performance diagnostics
+
+Optional terminal measurements for troubleshooting are described in [docs/diagnostics.md](docs/diagnostics.md).

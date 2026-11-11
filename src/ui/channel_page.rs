@@ -1389,6 +1389,8 @@ impl ChannelPage {
     }
 
     pub fn reload(self: &Rc<Self>) {
+        let _activity = crate::diagnostics::Activity::new("channel_reload");
+        crate::diagnostics::next_frame("channel_reload");
         let seq = self.reload_seq.get().wrapping_add(1);
         self.reload_seq.set(seq);
         let req_seq = self.request_seq.get().wrapping_add(1);
@@ -1417,14 +1419,18 @@ impl ChannelPage {
         let engine = self.engine.clone();
         let cid = self.channel_id.clone();
         self.runtime.spawn(async move {
+            let span = crate::diagnostics::Span::new("channel_videos_backend");
             let res = engine.channel_videos(&cid).await;
+            span.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = ch_tx.send(res).await;
         });
 
         let engine = self.engine.clone();
         let cid2 = self.channel_id.clone();
         self.runtime.spawn(async move {
+            let span = crate::diagnostics::Span::new("channel_shorts_backend");
             let res = engine.channel_shorts_with_stats(&cid2, None).await;
+            span.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sh_tx.send(res).await;
         });
 
@@ -1435,6 +1441,8 @@ impl ChannelPage {
                     if cp.reload_seq.get() != seq {
                         return;
                     }
+                    let _activity = crate::diagnostics::Activity::new("channel_videos_build");
+                    crate::diagnostics::next_frame("channel_videos_result");
                     match res {
                         Ok((details, paged)) => {
                             cp.set_channel_details(details);

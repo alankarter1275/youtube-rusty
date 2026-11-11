@@ -1,4 +1,5 @@
 mod backend;
+mod diagnostics;
 mod player;
 mod ui;
 
@@ -67,6 +68,7 @@ fn configure_glib_log_filter() {
 }
 
 fn main() {
+    diagnostics::start();
     configure_low_memory_allocator();
     configure_glib_log_filter();
 
@@ -83,13 +85,20 @@ fn main() {
             return;
         }
 
+        diagnostics::milestone("activate");
+        let _build = diagnostics::Activity::new("window_construct");
         let window = MainWindow::new(app);
+        drop(_build);
         let slot_clear = win_slot.clone();
         window.window.connect_destroy(move |_| {
             *slot_clear.borrow_mut() = None;
         });
 
         window.present();
+        diagnostics::milestone("window_present_requested");
+        diagnostics::install_frame_probe(window.window.upcast_ref());
+        diagnostics::install_monitor(window.window.upcast_ref());
+        window.install_diagnostics();
         *win_slot.borrow_mut() = Some(window);
     });
 

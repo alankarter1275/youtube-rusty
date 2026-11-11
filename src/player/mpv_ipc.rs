@@ -400,6 +400,7 @@ impl MpvSession {
         let running_for_task = is_running.clone();
         let quality_for_task = default_quality.clone();
 
+        let spawn_to_ipc = crate::diagnostics::Span::new("mpv_spawn_to_ipc");
         runtime.spawn(async move {
             let _ = std::fs::remove_file(&sock_path);
 
@@ -421,6 +422,7 @@ impl MpvSession {
             let child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
+                    spawn_to_ipc.finish("spawn_error");
                     running_for_task.store(false, Ordering::SeqCst);
                     let _ = std::fs::remove_dir_all(&ipc_dir_for_task);
                     let _ = event_sender
@@ -433,6 +435,8 @@ impl MpvSession {
                 }
             };
 
+            let _diagnostic_process = crate::diagnostics::MpvProcess::set(child.id());
+            crate::diagnostics::milestone("mpv_child_spawned");
             if let Ok(mut guard) = proc_for_task.lock() {
                 *guard = Some(child);
             }
@@ -462,8 +466,9 @@ impl MpvSession {
             }
 
             let stream = match stream_opt {
-                Some(s) => s,
+                Some(s) => { spawn_to_ipc.finish("ok"); s },
                 None => {
+                    spawn_to_ipc.finish("ipc_unavailable");
                     running_for_task.store(false, Ordering::SeqCst);
                     if let Ok(mut guard) = proc_for_task.lock() {
                         if let Some(mut c) = guard.take() {
@@ -586,6 +591,7 @@ impl MpvSession {
                             match tag {
                                 "yr-bridge-ready" => {
                                     if !ready_for_read.swap(true, Ordering::SeqCst) {
+                                        crate::diagnostics::milestone("mpv_bridge_ready");
                                         notify_for_read.notify_waiters();
                                     }
                                 }
@@ -658,10 +664,10 @@ impl MpvSession {
                                             Some(ytdl_fmt.as_str())
                                         };
 
-                                        match eng
-                                            .resolve_playback_for_mpv(&vid_id, def_q, fmt_opt)
-                                            .await
-                                        {
+                                        let span = crate::diagnostics::Span::new("mpv_resolve_stream");
+                                        let result = eng.resolve_playback_for_mpv(&vid_id, def_q, fmt_opt).await;
+                                        span.finish(if result.is_ok() { "ok" } else { "error" });
+                                        match result {
                                             Ok(resolved) => {
                                                 if let Some(d) = resolved.duration_secs {
                                                     let _ = ev_resolve
@@ -734,9 +740,11 @@ impl MpvSession {
                             }
                         }
                         Some("start-file") => {
+                            crate::diagnostics::milestone("mpv_start_file");
                             let _ = ev_tx.send(MpvEvent::Loading).await;
                         }
                         Some("file-loaded") => {
+                            crate::diagnostics::milestone("mpv_file_loaded");
                             let _ = ev_tx.send(MpvEvent::Loaded).await;
                         }
                         Some("end-file") => {

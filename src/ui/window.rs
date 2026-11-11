@@ -841,6 +841,29 @@ impl MainWindow {
         this
     }
 
+    pub fn install_diagnostics(self: &Rc<Self>) {
+        if !crate::diagnostics::enabled() { return; }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_secs(30), move || {
+            let Some(w) = weak.upgrade() else { return glib::ControlFlow::Break; };
+            let view = match &*w.active_view.borrow() {
+                ActiveView::HomeTrending => "trending", ActiveView::HomeCategory(_) => "category",
+                ActiveView::WatchLater => "watch_later", ActiveView::Search(_) => "search",
+                ActiveView::Subscriptions => "subscriptions", ActiveView::Playlists => "playlists",
+                ActiveView::SavedPlaylistDetail(_) => "saved_playlist", ActiveView::RemotePlaylist(_) => "remote_playlist",
+                ActiveView::History => "history", ActiveView::Preferences => "preferences",
+            };
+            let mut cards = 0;
+            let mut child = w.flow_box.first_child();
+            while let Some(widget) = child { cards += 1; child = widget.next_sibling(); }
+            w.image_loader.diagnostics_summary();
+            crate::diagnostics::ui_summary(view, cards, w.current_videos.borrow().len(),
+                w.current_search_items.borrow().len(), w.home_pictures.borrow().len(),
+                w.home_avatars.borrow().len(), w.open_channels.borrow().len(), w.engine.attribution_cache_len());
+            glib::ControlFlow::Continue
+        });
+    }
+
     fn apply_appearance(&self, settings: &AppSettings) {
         let style_manager = adw::StyleManager::default();
         let is_light = match settings.color_scheme.as_str() {
@@ -3403,6 +3426,7 @@ impl MainWindow {
         if items.is_empty() {
             return;
         }
+        let _activity = crate::diagnostics::Activity::new("play_queue_handoff");
         let clamped_start = start_index.min(items.len() - 1);
         self.playback_quality.set(quality);
         *self.queue_continuation.borrow_mut() = continuation;
@@ -4021,6 +4045,8 @@ impl MainWindow {
         channel_id: &str,
         channel_name: &str,
     ) -> Option<Rc<ChannelPage>> {
+        let _activity = crate::diagnostics::Activity::new("open_channel");
+        crate::diagnostics::next_frame("open_channel");
         if channel_id.is_empty() {
             return None;
         }
@@ -4126,6 +4152,8 @@ impl MainWindow {
         show_history_header: bool,
         section_heading: Option<&str>,
     ) {
+        let _activity = crate::diagnostics::Activity::new("prepare_view_shell");
+        crate::diagnostics::next_frame("navigation");
         self.defocus_search_bar();
         let was_on_subpage = self
             .nav_view
@@ -4309,6 +4337,7 @@ impl MainWindow {
     }
 
     pub fn search(self: &Rc<Self>, query: &str) {
+        let action = crate::diagnostics::Span::new("search_action");
         let req_id = self.next_request_id();
         self.set_active_nav(None);
         let tab = self.search_tab.get();
@@ -4342,7 +4371,9 @@ impl MainWindow {
         let sf = self.search_sort_order.get();
 
         self.runtime.spawn(async move {
+            let backend = crate::diagnostics::Span::new("search_backend");
             let res = engine.search_items(&q, tab, df, duf, sf).await;
+            backend.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sender.send(res).await;
         });
 
@@ -4355,8 +4386,10 @@ impl MainWindow {
                 return;
             };
             if w.request_seq.get() != req_id {
+                action.finish("stale");
                 return;
             }
+            let status = if res.is_ok() { "ok" } else { "error" };
             match res {
                 Ok(paged) => {
                     if paged.items.is_empty() {
@@ -4409,10 +4442,14 @@ impl MainWindow {
                     );
                 }
             }
+            action.finish(status);
+            crate::diagnostics::next_frame("search_result");
         });
     }
 
     fn populate_search_items(self: &Rc<Self>, items: Vec<SearchItem>) {
+        let _activity = crate::diagnostics::Activity::new("build_search");
+        crate::diagnostics::next_frame("build_search");
         self.clear_card_selection();
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);
@@ -4629,6 +4666,8 @@ impl MainWindow {
     }
 
     pub fn load_playlists_overview(self: &Rc<Self>) {
+        let _activity = crate::diagnostics::Activity::new("playlists");
+        crate::diagnostics::next_frame("playlists");
         let _req_id = self.next_request_id();
         let playlists = self.playlist_store.load_all();
 
@@ -4715,6 +4754,8 @@ impl MainWindow {
     }
 
     pub fn open_saved_playlist(self: &Rc<Self>, playlist_id: &str) {
+        let _activity = crate::diagnostics::Activity::new("saved_playlist");
+        crate::diagnostics::next_frame("saved_playlist");
         let _req_id = self.next_request_id();
         let Some(pl) = self.playlist_store.get(playlist_id) else {
             self.load_playlists_overview();
@@ -4860,6 +4901,8 @@ impl MainWindow {
     }
 
     pub fn open_remote_playlist(self: &Rc<Self>, playlist_id: &str) {
+        let _activity = crate::diagnostics::Activity::new("remote_playlist");
+        crate::diagnostics::next_frame("remote_playlist");
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::RemotePlaylist(playlist_id.to_string()),
@@ -5082,6 +5125,7 @@ impl MainWindow {
     }
 
     pub fn search_category_opts(self: &Rc<Self>, category: &str, force_refresh: bool) {
+        let action = crate::diagnostics::Span::new("category_action");
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::HomeCategory(category.to_string()),
@@ -5099,7 +5143,9 @@ impl MainWindow {
         let cat_ui = category.to_string();
 
         self.runtime.spawn(async move {
+            let backend = crate::diagnostics::Span::new("category_backend");
             let res = engine.category_feed(&cat, force_refresh).await;
+            backend.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sender.send(res).await;
         });
 
@@ -5112,8 +5158,10 @@ impl MainWindow {
                 return;
             };
             if w.request_seq.get() != req_id {
+                action.finish("stale");
                 return;
             }
+            let status = if res.is_ok() { "ok" } else { "error" };
             match res {
                 Ok(paged) => {
                     if paged.items.is_empty() {
@@ -5146,6 +5194,8 @@ impl MainWindow {
                     );
                 }
             }
+            action.finish(status);
+            crate::diagnostics::next_frame("category_result");
         });
     }
 
@@ -5274,6 +5324,7 @@ impl MainWindow {
     }
 
     pub fn load_trending_opts(self: &Rc<Self>, force_refresh: bool) {
+        let action = crate::diagnostics::Span::new("trending_action");
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::HomeTrending,
@@ -5289,7 +5340,9 @@ impl MainWindow {
         let engine = self.engine.clone();
 
         self.runtime.spawn(async move {
+            let backend = crate::diagnostics::Span::new("trending_backend");
             let res = engine.trending_initial(force_refresh).await;
+            backend.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sender.send(res).await;
         });
 
@@ -5302,8 +5355,10 @@ impl MainWindow {
                 return;
             };
             if w.request_seq.get() != req_id {
+                action.finish("stale");
                 return;
             }
+            let status = if res.is_ok() { "ok" } else { "error" };
             match res {
                 Ok(paged) => {
                     if paged.items.is_empty() {
@@ -5343,6 +5398,8 @@ impl MainWindow {
                     );
                 }
             }
+            action.finish(status);
+            crate::diagnostics::next_frame("trending_result");
         });
     }
 
@@ -5356,6 +5413,8 @@ impl MainWindow {
     }
 
     pub fn load_watch_later(self: &Rc<Self>) {
+        let _activity = crate::diagnostics::Activity::new("watch_later");
+        crate::diagnostics::next_frame("watch_later");
         let _req_id = self.next_request_id();
         let saved = self.watch_later_store.load_all();
         self.prepare_view_shell(
@@ -5382,6 +5441,8 @@ impl MainWindow {
     }
 
     pub fn load_subscriptions(self: &Rc<Self>) {
+        let _activity = crate::diagnostics::Activity::new("subscriptions");
+        crate::diagnostics::next_frame("subscriptions");
         let req_id = self.next_request_id();
         let subs = self.subscription_store.load_all();
 
@@ -5525,6 +5586,8 @@ impl MainWindow {
     }
 
     pub fn load_history(self: &Rc<Self>) {
+        let _activity = crate::diagnostics::Activity::new("history");
+        crate::diagnostics::next_frame("history");
         let _req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::History,
@@ -5808,6 +5871,8 @@ impl MainWindow {
     }
 
     pub fn populate_videos(self: &Rc<Self>, videos: Vec<VideoSummary>, mode: ViewMode) {
+        let _activity = crate::diagnostics::Activity::new("build_videos");
+        crate::diagnostics::next_frame("build_videos");
         self.clear_card_selection();
         self.status_box.set_visible(false);
         self.flow_box.set_visible(true);

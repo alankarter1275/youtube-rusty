@@ -291,6 +291,11 @@ impl ImageLoader {
         })
     }
 
+    pub fn diagnostics_summary(&self) {
+        let bytes = self.compressed_lru.try_lock().map(|c| c.used_bytes).ok();
+        crate::diagnostics::image_summary(self.textures.borrow().map.len(), bytes, self.inflight.borrow().len(), self.ready_queue.borrow().len());
+    }
+
     pub fn clear_all(self: &Rc<Self>) {
         self.textures.borrow_mut().clear();
         if let Ok(mut guard) = self.compressed_lru.lock() {
@@ -356,6 +361,7 @@ impl ImageLoader {
         let mem_key = format!("{}_{}", target.cache_prefix(), disk_key);
 
         if let Some(tex) = self.textures.borrow_mut().get(&mem_key) {
+            crate::diagnostics::image_event(crate::diagnostics::ImageEvent::TextureHit, 1);
             on_done(Some(tex));
             return;
         }
@@ -363,6 +369,7 @@ impl ImageLoader {
         let cancelled = {
             let mut inflight = self.inflight.borrow_mut();
             if let Some(entry) = inflight.get_mut(&mem_key) {
+                crate::diagnostics::image_event(crate::diagnostics::ImageEvent::Coalesced, 1);
                 entry.waiters.push(WaiterEntry {
                     is_alive: Box::new(is_alive),
                     on_done: Box::new(on_done),
@@ -406,6 +413,8 @@ impl ImageLoader {
                 .ok()
                 .and_then(|mut lru| lru.get(&disk_key_owned));
 
+            if compressed_opt.is_some() { crate::diagnostics::image_event(crate::diagnostics::ImageEvent::CompressedHit, 1); }
+
             // 2. Cold miss: check disk cache or fetch over HTTP
             if compressed_opt.is_none() {
                 let _permit = net_sem.acquire_owned().await.ok();
@@ -414,6 +423,7 @@ impl ImageLoader {
                     return;
                 }
 
+                let disk_timer = crate::diagnostics::AggregateTimer::new(crate::diagnostics::ImageEvent::DiskTimeUs);
                 let from_disk = if cache.has_thumbnail(&disk_key_owned) {
                     tokio::fs::read(cache.get_thumbnail_path(&disk_key_owned))
                         .await
@@ -424,25 +434,31 @@ impl ImageLoader {
                     None
                 };
 
+                drop(disk_timer);
                 if let Some(arc_bytes) = from_disk {
+                    crate::diagnostics::image_event(crate::diagnostics::ImageEvent::DiskHit, 1);
                     if let Ok(mut lru) = compressed_lru.lock() {
                         lru.insert(disk_key_owned.clone(), arc_bytes.clone());
                     }
                     compressed_opt = Some(arc_bytes);
-                } else if let Ok(resp) = http.get(&url_owned).send().await {
-                    if cancelled.load(Ordering::Relaxed) {
-                        let _ = tx.send((None, None)).await;
-                        return;
-                    }
-                    if let Ok(ok_resp) = resp.error_for_status() {
-                        if let Ok(bytes) = ok_resp.bytes().await {
-                            if !bytes.is_empty() {
-                                let arc_bytes: Arc<[u8]> = Arc::from(bytes.as_ref());
-                                if let Ok(mut lru) = compressed_lru.lock() {
-                                    lru.insert(disk_key_owned.clone(), arc_bytes.clone());
+                } else {
+                    crate::diagnostics::image_event(crate::diagnostics::ImageEvent::Network, 1);
+                    let _network_timer = crate::diagnostics::AggregateTimer::new(crate::diagnostics::ImageEvent::NetworkTimeUs);
+                    if let Ok(resp) = http.get(&url_owned).send().await {
+                        if cancelled.load(Ordering::Relaxed) {
+                            let _ = tx.send((None, None)).await;
+                            return;
+                        }
+                        if let Ok(ok_resp) = resp.error_for_status() {
+                            if let Ok(bytes) = ok_resp.bytes().await {
+                                if !bytes.is_empty() {
+                                    let arc_bytes: Arc<[u8]> = Arc::from(bytes.as_ref());
+                                    if let Ok(mut lru) = compressed_lru.lock() {
+                                        lru.insert(disk_key_owned.clone(), arc_bytes.clone());
+                                    }
+                                    let _ = disk_save_tx.try_send((disk_key_owned, arc_bytes.clone()));
+                                    compressed_opt = Some(arc_bytes);
                                 }
-                                let _ = disk_save_tx.try_send((disk_key_owned, arc_bytes.clone()));
-                                compressed_opt = Some(arc_bytes);
                             }
                         }
                     }
@@ -472,7 +488,11 @@ impl ImageLoader {
                 return;
             }
 
-            let decoded = tokio::task::spawn_blocking(move || decode_and_scale_rgba(&bytes_arc, target))
+            let decoded = tokio::task::spawn_blocking(move || {
+                crate::diagnostics::image_event(crate::diagnostics::ImageEvent::Decode, 1);
+                let _timer = crate::diagnostics::AggregateTimer::new(crate::diagnostics::ImageEvent::DecodeTimeUs);
+                decode_and_scale_rgba(&bytes_arc, target)
+            })
                 .await
                 .ok()
                 .flatten();
@@ -556,6 +576,7 @@ impl ImageLoader {
             });
 
             for waiter in live_waiters {
+                crate::diagnostics::image_event(crate::diagnostics::ImageEvent::Delivered, 1);
                 (waiter.on_done)(texture_opt.clone());
             }
         }

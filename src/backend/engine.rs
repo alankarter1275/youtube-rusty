@@ -1762,6 +1762,10 @@ impl Engine {
         }
     }
 
+    pub fn attribution_cache_len(&self) -> Option<usize> {
+        self.attribution_cache.try_read().ok().map(|cache| cache.len())
+    }
+
     /// Enrich any video using the watch page's owner, independent of the feed it came from.
     /// Errors leave the original summary untouched and are not cached, so a later attempt can retry.
     pub async fn enrich_video_attribution(&self, video: VideoSummary) -> VideoSummary {
@@ -1779,6 +1783,7 @@ impl Engine {
         }
         let cached = self.attribution_cache.read().await.get(&video.id).cloned();
         let attribution = if let Some(cached) = cached {
+            crate::diagnostics::attribution_cache_hit();
             Some(cached)
         } else {
             let _permit = if priority {
@@ -1789,8 +1794,10 @@ impl Engine {
             };
             let cached = self.attribution_cache.read().await.get(&video.id).cloned();
             if cached.is_some() {
+                crate::diagnostics::attribution_cache_hit();
                 cached
             } else {
+                let _request = crate::diagnostics::AttributionRequest::new();
                 let result = tokio::time::timeout(Duration::from_secs(8), async {
                     let body = json!({"context": {"client": {
                         "clientName": "WEB", "clientVersion": "2.20260728.01.00",
