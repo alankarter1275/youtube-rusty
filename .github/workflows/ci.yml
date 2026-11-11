@@ -57,7 +57,7 @@ jobs:
           steps = [
               ("cargo check", ["cargo", "check", "-q", "--all-targets"]),
               ("cargo test", ["cargo", "test", "-q"]),
-              ("GTK card lifetime probe", ["xvfb-run", "-a", "cargo", "test", "-q", "inspect_real_card_lifetimes", "--", "--ignored", "--nocapture"]),
+              ("GTK card lifetime probe", ["xvfb-run", "-a", "env", "GTK_A11Y=none", "GSK_RENDERER=cairo", "cargo", "test", "-q", "inspect_real_card_lifetimes", "--", "--ignored", "--nocapture"]),
               ("cargo build", ["cargo", "build", "-q"]),
           ]
 

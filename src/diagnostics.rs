@@ -423,12 +423,20 @@ mod tests {
             flow.append(&card.container);
             flow.remove(&card.container);
             drop(card);
-            card_counts(&[probe])
+            probe
         };
         let control = sample(false);
-        assert_eq!(control, CardCounts::default(), "the weak probe must not retain a removed card");
-        let with_interactions = sample(true);
-        eprintln!("CARD_LIFETIME_CONTROL={control:?} CARD_LIFETIME_WITH_INTERACTIONS={with_interactions:?}");
+        let interactions = sample(true);
+        assert_eq!(card_counts(std::slice::from_ref(&control)), CardCounts::default(),
+            "the weak probe must not retain a removed card");
+        let main_loop = gtk4::glib::MainLoop::new(None, false);
+        let quit = main_loop.clone();
+        gtk4::glib::timeout_add_local_once(Duration::from_secs(5), move || quit.quit());
+        main_loop.run();
+        let control = card_counts(&[control]);
+        let with_interactions = card_counts(&[interactions]);
+        assert_eq!(control, CardCounts::default(), "control must stay released after GTK events run");
+        eprintln!("CARD_LIFETIME_AFTER_5S_CONTROL={control:?} CARD_LIFETIME_AFTER_5S_WITH_INTERACTIONS={with_interactions:?}");
     }
 
 }
