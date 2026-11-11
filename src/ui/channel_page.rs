@@ -2223,9 +2223,12 @@ impl ChannelPage {
                 let (tx, rx) = async_channel::bounded(1);
                 let engine = self.engine.clone();
                 let original = item.clone();
-                self.runtime.spawn(async move {
+                let lookup = self.runtime.spawn(async move {
                     let updated = engine.enrich_video_attribution(original).await;
                     let _ = tx.send(updated).await;
+                });
+                card.container.connect_notify_local(Some("parent"), move |widget, _| {
+                    if widget.parent().is_none() { lookup.abort(); }
                 });
                 let cp_weak = Rc::downgrade(self);
                 let card_weak = card.container.downgrade();
