@@ -715,11 +715,11 @@ impl Engine {
                 async move { probe_media_url(&http, &url, &ua, &referer).await }
             }
         };
-        let limit = Arc::new(Semaphore::new(8));
+        // Separate limits prevent a slow video group from starving audio checks.
         let (muxed, adaptive, audio, hls_manifest) = tokio::join!(
-            probe_candidates(&muxed_urls, limit.clone(), make_probe()),
-            probe_candidates(&adap_urls, limit.clone(), make_probe()),
-            probe_candidates(&aud_urls, limit.clone(), make_probe()),
+            probe_candidates(&muxed_urls, Arc::new(Semaphore::new(4)), make_probe()),
+            probe_candidates(&adap_urls, Arc::new(Semaphore::new(4)), make_probe()),
+            probe_candidates(&aud_urls, Arc::new(Semaphore::new(4)), make_probe()),
             async {
                 match hls_url {
                     Some(ref u) => self.fetch_text_checked(u, &ua, &referer).await,
@@ -6417,8 +6417,14 @@ mod tests {
         // An Audio-prefetched pool cannot satisfy a later video request, while a
         // deliberate audio format override remains valid even at 360p.
         let mut audio_pool = playback_test_pool();
+        audio_pool.muxed.push(playback_test_video(18, format!("{base}/bad-mux"), 360));
+        audio_pool.adaptive_video.push(playback_test_video(136, format!("{base}/bad-video"), 720));
         audio_pool.audio.push(playback_test_audio(251, format!("{base}/good-audio")));
         let audio_entry = engine.probe_pool_into_verified("test", audio_pool).await.unwrap();
+        assert!(audio_entry.pool.muxed.is_empty());
+        assert!(audio_entry.pool.adaptive_video.is_empty());
+        assert!(!entry_matches_request(&audio_entry, Quality::P360, None));
+        assert!(entry_matches_request(&audio_entry, Quality::AudioOnly, None));
         engine.store_verified_pool(audio_entry).await;
         let guard = engine.verified_pools.read().await;
         assert!(!entry_matches_request(&guard[0], Quality::P360, None));
