@@ -3303,6 +3303,8 @@ impl MainWindow {
         });
 
         CardActions {
+            engine: self.engine.clone(),
+            runtime: self.runtime.clone(),
             image_loader: self.image_loader.clone(),
             playlist_store: self.playlist_store.clone(),
             default_quality,
@@ -4473,7 +4475,7 @@ impl MainWindow {
         for item in items {
             match &item {
                 SearchItem::Video(summary) => {
-                    self.append_single_video_card(summary, mode, layout, &actions);
+                    self.append_single_video_card(summary, mode, layout, &actions, None, true);
                     self.current_videos.borrow_mut().push(summary.clone());
                 }
                 SearchItem::Channel(ch) => {
@@ -5302,7 +5304,7 @@ impl MainWindow {
         self.prepare_view_shell(
             ActiveView::WatchLater,
             ViewMode::Grid,
-            true,
+            false,
             false,
             false,
             Some("Watch Later"),
@@ -5765,7 +5767,7 @@ impl MainWindow {
         let layout = self.list_card_layout();
 
         for summary in videos {
-            self.append_single_video_card(&summary, mode, layout, &actions);
+            self.append_single_video_card(&summary, mode, layout, &actions, None, true);
             self.current_videos.borrow_mut().push(summary);
         }
     }
@@ -5776,6 +5778,8 @@ impl MainWindow {
         mode: ViewMode,
         layout: ListCardLayout,
         actions: &CardActions,
+        position: Option<i32>,
+        hydrate: bool,
     ) {
         let card = match mode {
             ViewMode::Grid => VideoCard::new_grid(summary),
@@ -5841,7 +5845,44 @@ impl MainWindow {
             }
         }
 
-        self.flow_box.append(&card.container);
+        if let Some(position) = position {
+            self.flow_box.insert(&card.container, position);
+        } else {
+            self.flow_box.append(&card.container);
+        }
+
+        if hydrate && !summary.is_collaboration() && !summary.is_short {
+            let (tx, rx) = async_channel::bounded(1);
+            let engine = self.engine.clone();
+            let original = summary.clone();
+            self.runtime.spawn(async move {
+                let updated = engine.enrich_video_attribution(original).await;
+                let _ = tx.send(updated).await;
+            });
+            let weak = Rc::downgrade(self);
+            let card_weak = card.container.downgrade();
+            let actions = actions.clone();
+            let original = summary.clone();
+            let request = self.request_seq.get();
+            glib::spawn_future_local(async move {
+                let Ok(updated) = rx.recv().await else { return };
+                if updated == original { return; }
+                let (Some(w), Some(old)) = (weak.upgrade(), card_weak.upgrade()) else { return };
+                if w.request_seq.get() != request || old.parent().is_none() { return; }
+                let index = old.index();
+                if index < 0 { return; }
+                for video in w.current_videos.borrow_mut().iter_mut() {
+                    if video.id == updated.id { *video = updated.clone(); }
+                }
+                for item in w.current_search_items.borrow_mut().iter_mut() {
+                    if let SearchItem::Video(video) = item {
+                        if video.id == updated.id { *video = updated.clone(); }
+                    }
+                }
+                w.flow_box.remove(&old);
+                w.append_single_video_card(&updated, mode, layout, &actions, Some(index), false);
+            });
+        }
     }
 
     pub fn present(&self) {

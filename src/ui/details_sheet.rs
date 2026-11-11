@@ -1,4 +1,6 @@
 use crate::backend::models::{VideoCollaborator, VideoSummary};
+use crate::backend::engine::Engine;
+use tokio::runtime::Runtime;
 use crate::backend::playlists::PlaylistStore;
 use crate::player::mpv::Quality;
 use crate::ui::icons::{make_icon, set_pointer, KalamIcon};
@@ -15,6 +17,8 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct CardActions {
+    pub engine: Arc<Engine>,
+    pub runtime: Arc<Runtime>,
     pub image_loader: Rc<ImageLoader>,
     pub playlist_store: Arc<PlaylistStore>,
     pub default_quality: Rc<dyn Fn() -> Quality>,
@@ -114,106 +118,35 @@ impl DetailsSheet {
         title_label.set_xalign(0.0);
         content_box.append(&title_label);
 
-        // Channel attribution row: show the lead channel and a count for the rest, with
-        // overlapping avatars just like YouTube's collaboration byline.
-        let channel_row = GtkBox::new(Orientation::Horizontal, 12);
-        channel_row.set_valign(Align::Center);
-        let collaborators = summary.channel_credits();
-
-        let primary = collaborators.first();
-        let avatar_label = primary
-            .map(|channel| channel.name.as_str())
-            .filter(|name| !name.is_empty());
-        let avatar = adw::Avatar::new(36, avatar_label, true);
-        avatar.set_size_request(36, 36);
-        if let Some(primary) = primary {
-            if !primary.avatar_url.is_empty() {
-                actions
-                    .image_loader
-                    .load_into_avatar(&primary.id, &primary.avatar_url, &avatar);
-            }
-        }
-        let (avatar_stack, extra_avatars) =
-            build_collaborator_avatar_stack(&avatar, &collaborators, 36);
-        for (channel_id, avatar_url, extra) in extra_avatars {
-            if !avatar_url.is_empty() {
-                actions
-                    .image_loader
-                    .load_into_avatar(&channel_id, &avatar_url, &extra);
-            }
-        }
-        channel_row.append(&avatar_stack);
-
-        let channel_info = GtkBox::new(Orientation::Vertical, 2);
-        channel_info.set_hexpand(true);
-        if let Some(byline) = summary.channel_byline() {
-            let channel_name = Label::new(Some(&byline));
-            channel_name.set_halign(Align::Start);
-            channel_name.set_xalign(0.0);
-            channel_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            channel_name.add_css_class("yr-title");
-            channel_info.append(&channel_name);
-        }
-
-        let stats_text = [
-            (!summary.view_count_text.is_empty()).then_some(summary.view_count_text.as_str()),
-            (!summary.published_text.is_empty()).then_some(summary.published_text.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ");
-        if !stats_text.is_empty() {
-            let stats_label = Label::new(Some(&stats_text));
-            stats_label.add_css_class("yr-meta");
-            stats_label.set_halign(Align::Start);
-            stats_label.set_xalign(0.0);
-            stats_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            channel_info.append(&stats_label);
-        }
-        channel_row.append(&channel_info);
-
-        if summary.is_collaboration() {
-            let subscribe_btn = Button::with_label("Subscribe");
-            subscribe_btn.add_css_class("yr-btn");
-            subscribe_btn.add_css_class("primary");
-            set_pointer(&subscribe_btn);
-            let channels = summary.collaborators.clone();
+        let channel_row = build_channel_row(summary, actions, &dialog);
+        content_box.append(&channel_row);
+        // Saved and feed summaries can be incomplete. Refresh the attribution without
+        // delaying the dialog or replacing the user's saved data.
+        if !summary.is_collaboration() && !summary.is_short {
+            let (tx, rx) = async_channel::bounded(1);
+            let engine = actions.engine.clone();
+            let original = summary.clone();
+            actions.runtime.spawn(async move {
+                let result = engine.enrich_video_attribution(original).await;
+                let _ = tx.send(result).await;
+            });
+            let row_weak = channel_row.downgrade();
+            let box_weak = content_box.downgrade();
+            let title_weak = title_label.downgrade();
             let dialog_weak = dialog.downgrade();
             let actions = actions.clone();
-            subscribe_btn.connect_clicked(move |_| {
-                if let Some(details_dialog) = dialog_weak.upgrade() {
-                    show_collaborators_dialog(
-                        &details_dialog,
-                        &details_dialog,
-                        &channels,
-                        &actions,
-                    );
-                }
+            let initial = summary.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let Ok(updated) = rx.recv().await else { return };
+                if updated == initial { return; }
+                let (Some(row), Some(content), Some(title), Some(dialog)) =
+                    (row_weak.upgrade(), box_weak.upgrade(), title_weak.upgrade(), dialog_weak.upgrade()) else { return };
+                if row.parent().is_none() { return; }
+                let replacement = build_channel_row(&updated, &actions, &dialog);
+                content.remove(&row);
+                content.insert_child_after(&replacement, Some(&title));
             });
-            channel_row.append(&subscribe_btn);
-        } else if let Some(channel) = collaborators
-            .first()
-            .filter(|channel| !channel.id.is_empty())
-        {
-            // Keep the original single-channel action; only real collaborations open the list.
-            let open_channel_btn = Button::with_label("Open channel");
-            open_channel_btn.add_css_class("yr-btn");
-            set_pointer(&open_channel_btn);
-            let channel_id = channel.id.clone();
-            let channel_name = channel.name.clone();
-            let dialog_weak = dialog.downgrade();
-            let on_open_channel = actions.on_open_channel.clone();
-            open_channel_btn.connect_clicked(move |_| {
-                if let Some(dialog) = dialog_weak.upgrade() {
-                    dialog.close();
-                }
-                on_open_channel(channel_id.clone(), channel_name.clone());
-            });
-            channel_row.append(&open_channel_btn);
         }
-
-        content_box.append(&channel_row);
 
         // Two-line description snippet
         if !summary.description_snippet.is_empty() {
@@ -456,6 +389,107 @@ impl DetailsSheet {
         });
         dialog.present(Some(parent));
     }
+}
+
+fn build_channel_row(summary: &VideoSummary, actions: &CardActions, dialog: &adw::Dialog) -> GtkBox {
+    let channel_row = GtkBox::new(Orientation::Horizontal, 12);
+    channel_row.set_valign(Align::Center);
+    let collaborators = summary.channel_credits();
+
+    let primary = collaborators.first();
+    let avatar_label = primary
+        .map(|channel| channel.name.as_str())
+        .filter(|name| !name.is_empty());
+    let avatar = adw::Avatar::new(36, avatar_label, true);
+    avatar.set_size_request(36, 36);
+    if let Some(primary) = primary {
+        if !primary.avatar_url.is_empty() {
+            actions
+                .image_loader
+                .load_into_avatar(&primary.id, &primary.avatar_url, &avatar);
+        }
+    }
+    let (avatar_stack, extra_avatars) =
+        build_collaborator_avatar_stack(&avatar, &collaborators, 36);
+    for (channel_id, avatar_url, extra) in extra_avatars {
+        if !avatar_url.is_empty() {
+            actions
+                .image_loader
+                .load_into_avatar(&channel_id, &avatar_url, &extra);
+        }
+    }
+    channel_row.append(&avatar_stack);
+
+    let channel_info = GtkBox::new(Orientation::Vertical, 2);
+    channel_info.set_hexpand(true);
+    if let Some(byline) = summary.channel_byline() {
+        let channel_name = Label::new(Some(&byline));
+        channel_name.set_halign(Align::Start);
+        channel_name.set_xalign(0.0);
+        channel_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        channel_name.add_css_class("yr-title");
+        channel_info.append(&channel_name);
+    }
+
+    let stats_text = [
+        (!summary.view_count_text.is_empty()).then_some(summary.view_count_text.as_str()),
+        (!summary.published_text.is_empty()).then_some(summary.published_text.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    if !stats_text.is_empty() {
+        let stats_label = Label::new(Some(&stats_text));
+        stats_label.add_css_class("yr-meta");
+        stats_label.set_halign(Align::Start);
+        stats_label.set_xalign(0.0);
+        stats_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        channel_info.append(&stats_label);
+    }
+    channel_row.append(&channel_info);
+
+    if summary.is_collaboration() {
+        let subscribe_btn = Button::with_label("Subscribe");
+        subscribe_btn.add_css_class("yr-btn");
+        subscribe_btn.add_css_class("primary");
+        set_pointer(&subscribe_btn);
+        let channels = summary.collaborators.clone();
+        let dialog_weak = dialog.downgrade();
+        let actions = actions.clone();
+        subscribe_btn.connect_clicked(move |_| {
+            if let Some(details_dialog) = dialog_weak.upgrade() {
+                show_collaborators_dialog(
+                    &details_dialog,
+                    &details_dialog,
+                    &channels,
+                    &actions,
+                );
+            }
+        });
+        channel_row.append(&subscribe_btn);
+    } else if let Some(channel) = collaborators
+        .first()
+        .filter(|channel| !channel.id.is_empty())
+    {
+        // Keep the original single-channel action; only real collaborations open the list.
+        let open_channel_btn = Button::with_label("Open channel");
+        open_channel_btn.add_css_class("yr-btn");
+        set_pointer(&open_channel_btn);
+        let channel_id = channel.id.clone();
+        let channel_name = channel.name.clone();
+        let dialog_weak = dialog.downgrade();
+        let on_open_channel = actions.on_open_channel.clone();
+        open_channel_btn.connect_clicked(move |_| {
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.close();
+            }
+            on_open_channel(channel_id.clone(), channel_name.clone());
+        });
+        channel_row.append(&open_channel_btn);
+    }
+
+    channel_row
 }
 
 fn show_collaborators_dialog(

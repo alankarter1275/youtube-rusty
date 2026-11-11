@@ -255,6 +255,14 @@ fn synthesize_visitor_data() -> String {
     encode_base64_url_safe_pct(&proto)
 }
 
+#[derive(Clone, Default)]
+struct VideoAttribution {
+    channel_id: String,
+    channel_name: String,
+    channel_avatar_url: String,
+    collaborators: Vec<VideoCollaborator>,
+}
+
 pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
@@ -266,6 +274,8 @@ pub struct Engine {
     seen_home_ids: RwLock<Vec<String>>,
     category_seed: AtomicU64,
     seen_category_ids: RwLock<Vec<String>>,
+    attribution_cache: RwLock<HashMap<String, VideoAttribution>>,
+    attribution_limit: Semaphore,
 }
 
 impl Engine {
@@ -309,6 +319,8 @@ impl Engine {
             seen_home_ids: RwLock::new(Vec::new()),
             category_seed: AtomicU64::new(init_seed.wrapping_add(3)),
             seen_category_ids: RwLock::new(Vec::new()),
+            attribution_cache: RwLock::new(HashMap::new()),
+            attribution_limit: Semaphore::new(4),
         }
     }
 
@@ -1748,6 +1760,56 @@ impl Engine {
                 Ok(ResolvedUrl::Playlist { id })
             }
         }
+    }
+
+    /// Enrich any video using the watch page's owner, independent of the feed it came from.
+    /// Errors leave the original summary untouched and are not cached, so a later attempt can retry.
+    pub async fn enrich_video_attribution(&self, mut video: VideoSummary) -> VideoSummary {
+        if video.id.is_empty() || video.is_collaboration() {
+            return video;
+        }
+        let cached = self.attribution_cache.read().await.get(&video.id).cloned();
+        let attribution = if let Some(cached) = cached {
+            Some(cached)
+        } else {
+            let Ok(_permit) = self.attribution_limit.acquire().await else { return video };
+            let cached = self.attribution_cache.read().await.get(&video.id).cloned();
+            if cached.is_some() {
+                cached
+            } else {
+                let result = tokio::time::timeout(Duration::from_secs(8), async {
+                    let body = json!({"context": {"client": {
+                        "clientName": "WEB", "clientVersion": "2.20260728.01.00",
+                        "hl": "en", "gl": "US"
+                    }}, "videoId": video.id});
+                    let response = self.http.post("https://www.youtube.com/youtubei/v1/next?prettyPrint=false")
+                        .header("User-Agent", RP_DESKTOP_UA)
+                        .header("Origin", "https://www.youtube.com")
+                        .header("Referer", "https://www.youtube.com/")
+                        .json(&body).send().await.ok()?;
+                    if !response.status().is_success() { return None; }
+                    let json = response.json::<Value>().await.ok()?;
+                    parse_watch_attribution(&json)
+                }).await.ok().flatten();
+                if let Some(ref value) = result {
+                    self.attribution_cache.write().await.insert(video.id.clone(), value.clone());
+                }
+                result
+            }
+        };
+        if let Some(data) = attribution {
+            if data.collaborators.len() > 1 {
+                video.channel_id = data.channel_id;
+                video.channel_name = data.channel_name;
+                video.channel_avatar_url = data.channel_avatar_url;
+                video.collaborators = data.collaborators;
+            } else {
+                if video.channel_id.is_empty() { video.channel_id = data.channel_id; }
+                if video.channel_name.is_empty() { video.channel_name = data.channel_name; }
+                if video.channel_avatar_url.is_empty() { video.channel_avatar_url = data.channel_avatar_url; }
+            }
+        }
+        video
     }
 
     pub async fn fetch_video_summary(&self, video_id: &str) -> Result<VideoSummary, String> {
@@ -4925,6 +4987,10 @@ fn parse_video_collaborators(lockup: &Value) -> Vec<VideoCollaborator> {
         return Vec::new();
     };
 
+    parse_collaborator_items(items)
+}
+
+fn parse_collaborator_items(items: &[Value]) -> Vec<VideoCollaborator> {
     let mut collaborators = Vec::new();
     let mut seen_ids = HashSet::new();
     for item in items {
@@ -4935,6 +5001,8 @@ fn parse_video_collaborators(lockup: &Value) -> Vec<VideoCollaborator> {
         let browse_id = view
             .pointer("/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
             .and_then(Value::as_str)
+            .or_else(|| view.pointer("/title/commandRuns").and_then(Value::as_array)
+                .and_then(|runs| runs.iter().find_map(|run| run.pointer("/onTap/innertubeCommand/browseEndpoint/browseId").and_then(Value::as_str))))
             .unwrap_or_default()
             .to_string();
         let id = if !browse_id.is_empty() {
@@ -4991,6 +5059,43 @@ fn parse_video_collaborators(lockup: &Value) -> Vec<VideoCollaborator> {
         });
     }
     collaborators
+}
+
+/// Only inspect the current video's secondary-info owner, never suggested videos.
+fn parse_watch_attribution(json: &Value) -> Option<VideoAttribution> {
+    fn find_owner(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Array(items) => items.iter().find_map(find_owner),
+            Value::Object(map) => {
+                if let Some(owner) = map.get("videoSecondaryInfoRenderer")
+                    .and_then(|v| v.pointer("/owner/videoOwnerRenderer")) {
+                    return Some(owner);
+                }
+                map.values().find_map(find_owner)
+            }
+            _ => None,
+        }
+    }
+    let owner = find_owner(json.get("contents")?)?;
+    let items = owner.pointer("/navigationEndpoint/showDialogCommand/panelLoadingStrategy/inlineContent/dialogViewModel/customContent/listViewModel/listItems")
+        .and_then(Value::as_array);
+    let collaborators = items.map(|items| parse_collaborator_items(items)).unwrap_or_default();
+    // Only verified distinct channel IDs count as formal credits.
+    let collaborators = if collaborators.len() > 1 && collaborators.iter().all(|c| c.id.starts_with("UC")) {
+        collaborators
+    } else { Vec::new() };
+    if let Some(primary) = collaborators.first() {
+        return Some(VideoAttribution { channel_id: primary.id.clone(), channel_name: primary.name.clone(),
+            channel_avatar_url: primary.avatar_url.clone(), collaborators });
+    }
+    let title = owner.get("title");
+    let channel_name = extract_yt_text(title).unwrap_or_default();
+    let channel_id = title.and_then(|t| t.pointer("/runs/0/navigationEndpoint/browseEndpoint/browseId"))
+        .or_else(|| owner.pointer("/navigationEndpoint/browseEndpoint/browseId"))
+        .and_then(Value::as_str).unwrap_or_default().to_string();
+    let channel_avatar_url = pick_json_sources_url(owner.pointer("/thumbnail/thumbnails").and_then(Value::as_array), 88).unwrap_or_default();
+    if channel_id.is_empty() && channel_name.is_empty() { return None; }
+    Some(VideoAttribution { channel_id, channel_name, channel_avatar_url, collaborators })
 }
 
 fn parse_video_lockup_json(lockup: &Value) -> Option<VideoSummary> {
@@ -6065,6 +6170,48 @@ fn map_video_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_owner_collaboration_reads_dialog_title_commands_and_ignores_recommendations() {
+        // Structure documented from a live watch response by moderntube/innertube-rs PR #7.
+        let channel = |name: &str, id: &str| json!({ "listItemViewModel": {
+            "title": { "content": name, "commandRuns": [{"onTap": {"innertubeCommand": {
+                "browseEndpoint": {"browseId": id}
+            }}}]},
+            "subtitle": { "content": "@creator • 1M subscribers" },
+            "leadingAccessory": {"avatarViewModel": {"image": {"sources": [{"url": "https://img/avatar.jpg", "width": 88}]}}}
+        }});
+        let data = json!({"contents": {"items": [
+            {"videoSecondaryInfoRenderer": {"owner": {"videoOwnerRenderer": {
+                "attributedTitle": {"content": "Alpha and Beta"},
+                "navigationEndpoint": {"showDialogCommand": {"panelLoadingStrategy": {"inlineContent": {
+                    "dialogViewModel": {"customContent": {"listViewModel": {"listItems": [
+                        channel("Alpha", "UCalpha"), channel("Beta", "UCbeta")
+                    ]}}}
+                }}}}
+            }}}},
+            {"videoRenderer": {"ownerText": {"simpleText": "Unrelated recommendation"}}}
+        ]}});
+        let actual = parse_watch_attribution(&data).unwrap();
+        assert_eq!(actual.channel_id, "UCalpha");
+        assert_eq!(actual.channel_name, "Alpha");
+        assert_eq!(actual.collaborators.len(), 2);
+        assert_eq!(actual.collaborators[1].id, "UCbeta");
+        assert_eq!(actual.collaborators[1].handle, "@creator");
+        assert_eq!(actual.collaborators[1].avatar_url, "https://img/avatar.jpg");
+    }
+
+    #[test]
+    fn watch_owner_single_channel_does_not_create_collaboration() {
+        let data = json!({"contents": {"videoSecondaryInfoRenderer": {"owner": {"videoOwnerRenderer": {
+            "title": {"runs": [{"text": "Solo", "navigationEndpoint": {"browseEndpoint": {"browseId": "UCsolo"}}}]},
+            "thumbnail": {"thumbnails": [{"url": "https://img/solo.jpg", "width": 88}]}
+        }}}}});
+        let actual = parse_watch_attribution(&data).unwrap();
+        assert_eq!(actual.channel_id, "UCsolo");
+        assert_eq!(actual.channel_name, "Solo");
+        assert!(actual.collaborators.is_empty());
+    }
 
     fn duration_test_video(id: &str, seconds: Option<u64>, text: &str) -> VideoSummary {
         VideoSummary {
