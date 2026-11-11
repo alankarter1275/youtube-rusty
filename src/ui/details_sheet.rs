@@ -482,6 +482,7 @@ fn build_channel_row(summary: &VideoSummary, actions: &CardActions, dialog: &adw
 
     if summary.is_collaboration() {
         let subscribe_btn = Button::with_label("Subscribe");
+        subscribe_btn.set_valign(Align::Center);
         subscribe_btn.add_css_class("yr-btn");
         subscribe_btn.add_css_class("primary");
         set_pointer(&subscribe_btn);
@@ -527,6 +528,7 @@ fn connect_open_channel(button: &Button, channel: &VideoCollaborator, actions: &
 fn make_channel_subscribe_button(channel: &VideoCollaborator, actions: &CardActions) -> Button {
     let subscribed = (actions.is_subscribed)(&channel.id);
     let button = Button::with_label(if subscribed { "Subscribed" } else { "Subscribe" });
+    button.set_valign(Align::Center);
     button.add_css_class("yr-btn");
     button.set_sensitive(!channel.id.is_empty());
     set_pointer(&button);
