@@ -14,6 +14,13 @@ use tokio::sync::{mpsc, Notify};
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const YR_BRIDGE_LUA: &str = r#"local utils = require 'mp.utils'
+local yr_diagnostics = false
+
+local function diagnostic_queue(stage, generation)
+    if yr_diagnostics and generation then
+        mp.commandv('script-message', 'yr-diagnostics', stage, tostring(generation))
+    end
+end
 
 local core_ready = false
 local req_counter = 0
@@ -58,6 +65,7 @@ end)
 mp.register_script_message('load-queue', function(json_path)
     local payload = read_and_remove_json(json_path)
     if not payload or not payload.items or #payload.items == 0 then return end
+    diagnostic_queue('queue_received', payload.sync_gen)
     local items = payload.items
     local start_idx = tonumber(payload.start_index) or 0
     if start_idx < 0 then start_idx = 0 end
@@ -76,7 +84,9 @@ mp.register_script_message('load-queue', function(json_path)
 
     if payload.m3u_path and payload.m3u_path ~= '' then
         mp.set_property('playlist-start', tostring(start_idx))
+        diagnostic_queue('before_loadlist', payload.sync_gen)
         mp.commandv('loadlist', payload.m3u_path, 'replace')
+        diagnostic_queue('after_loadlist', payload.sync_gen)
         os.remove(payload.m3u_path)
     end
 
@@ -243,11 +253,37 @@ pub enum MpvEvent {
     ProcessExited,
 }
 
+#[derive(Clone, Copy)]
+struct QueueTrace { generation: u64, trace_id: u64 }
+struct QueuedCommand { body: String, trace: Option<QueueTrace> }
+
+fn bridge_script(diagnostics: bool) -> String {
+    if diagnostics {
+        YR_BRIDGE_LUA.replacen("local yr_diagnostics = false", "local yr_diagnostics = true", 1)
+    } else {
+        YR_BRIDGE_LUA.to_owned()
+    }
+}
+
+// Never trust an arbitrary script-message as a log label or print its payload.
+fn diagnostic_queue_message(args: &[serde_json::Value]) -> Option<(&'static str, u64)> {
+    let stage = match args.get(1)?.as_str()? {
+        "queue_received" => "bridge_queue_received",
+        "before_loadlist" => "bridge_before_loadlist",
+        "after_loadlist" => "bridge_after_loadlist",
+        _ => return None,
+    };
+    let generation = args.get(2)?.as_str()?.parse::<u64>().ok()?;
+    if generation == 0 { return None; }
+    Some((stage, generation))
+}
+
 pub struct MpvSession {
     ipc_dir: PathBuf,
     payload_seq: AtomicU64,
     default_quality: Arc<Mutex<Quality>>,
-    cmd_sender: mpsc::UnboundedSender<String>,
+    cmd_sender: mpsc::UnboundedSender<QueuedCommand>,
+    session_seq: u64,
     process: Arc<Mutex<Option<Child>>>,
     is_running: Arc<AtomicBool>,
 }
@@ -368,12 +404,12 @@ impl MpvSession {
 
         let sock_path = ipc_dir.join("mpv.sock");
         let script_path = ipc_dir.join("yr_bridge.lua");
-        let _ = std::fs::write(&script_path, YR_BRIDGE_LUA);
+        let _ = std::fs::write(&script_path, bridge_script(crate::diagnostics::enabled()));
 
         let initial_quality = Quality::from_setting(&settings.default_quality);
         let default_quality = Arc::new(Mutex::new(initial_quality));
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<QueuedCommand>();
         let (imm_tx, mut imm_rx) = mpsc::unbounded_channel::<String>();
         let process_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let is_running = Arc::new(AtomicBool::new(true));
@@ -437,6 +473,7 @@ impl MpvSession {
 
             let diagnostic_process = crate::diagnostics::MpvProcess::set(child.id());
             crate::diagnostics::milestone("mpv_child_spawned");
+            crate::diagnostics::mpv_queue_event("child_spawned", seq, 0, 0);
             if let Ok(mut guard) = proc_for_task.lock() {
                 *guard = Some(child);
             }
@@ -466,7 +503,11 @@ impl MpvSession {
             }
 
             let stream = match stream_opt {
-                Some(s) => { spawn_to_ipc.finish("ok"); s },
+                Some(s) => {
+                    spawn_to_ipc.finish("ok");
+                    crate::diagnostics::mpv_queue_event("ipc_connected", seq, 0, 0);
+                    s
+                },
                 None => {
                     spawn_to_ipc.finish("ipc_unavailable");
                     running_for_task.store(false, Ordering::SeqCst);
@@ -551,12 +592,21 @@ impl MpvSession {
                             }
                             let _ = writer.flush().await;
                         }
-                        Some(cmd_str) = cmd_rx.recv() => {
-                            let line = format!("{cmd_str}\n");
+                        Some(command) = cmd_rx.recv() => {
+                            if let Some(trace) = command.trace {
+                                crate::diagnostics::mpv_queue_event("write_started", seq, trace.generation, trace.trace_id);
+                            }
+                            let line = format!("{}\n", command.body);
                             if writer.write_all(line.as_bytes()).await.is_err() {
+                                if let Some(trace) = command.trace {
+                                    crate::diagnostics::mpv_queue_event("write_error", seq, trace.generation, trace.trace_id);
+                                }
                                 break;
                             }
-                            let _ = writer.flush().await;
+                            let flushed = writer.flush().await;
+                            if let Some(trace) = command.trace {
+                                crate::diagnostics::mpv_queue_event(if flushed.is_ok() { "write_flushed" } else { "flush_error" }, seq, trace.generation, trace.trace_id);
+                            }
                         }
                         else => break,
                     }
@@ -593,7 +643,15 @@ impl MpvSession {
                                 "yr-bridge-ready" => {
                                     if !ready_for_read.swap(true, Ordering::SeqCst) {
                                         crate::diagnostics::milestone("mpv_bridge_ready");
+                                        crate::diagnostics::mpv_queue_event("bridge_ready", seq, 0, 0);
                                         notify_for_read.notify_waiters();
+                                    }
+                                }
+                                "yr-diagnostics" => {
+                                    if crate::diagnostics::enabled() {
+                                        if let Some((stage, generation)) = diagnostic_queue_message(args) {
+                                            crate::diagnostics::mpv_queue_event(stage, seq, generation, 0);
+                                        }
                                     }
                                 }
                                 "yr-queue-synced" => {
@@ -602,6 +660,7 @@ impl MpvSession {
                                         .and_then(|s| s.as_str())
                                         .and_then(|s| s.parse::<u64>().ok())
                                     {
+                                        crate::diagnostics::mpv_queue_event("bridge_queue_synced", seq, gen_num, 0);
                                         let _ = ev_tx.send(MpvEvent::QueueSynced(gen_num)).await;
                                     }
                                 }
@@ -666,7 +725,7 @@ impl MpvSession {
                                         };
 
                                         let span = crate::diagnostics::Span::new("mpv_resolve_stream");
-                                        let result = eng.resolve_playback_for_mpv(&vid_id, def_q, fmt_opt).await;
+                                        let result = eng.resolve_playback_for_mpv(&vid_id, def_q, fmt_opt, span.id()).await;
                                         span.finish(if result.is_ok() { "ok" } else { "error" });
                                         match result {
                                             Ok(resolved) => {
@@ -742,10 +801,12 @@ impl MpvSession {
                         }
                         Some("start-file") => {
                             crate::diagnostics::milestone("mpv_start_file");
+                            crate::diagnostics::mpv_queue_event("start_file", seq, 0, 0);
                             let _ = ev_tx.send(MpvEvent::Loading).await;
                         }
                         Some("file-loaded") => {
                             crate::diagnostics::milestone("mpv_file_loaded");
+                            crate::diagnostics::mpv_queue_event("file_loaded", seq, 0, 0);
                             let _ = ev_tx.send(MpvEvent::Loaded).await;
                         }
                         Some("end-file") => {
@@ -827,6 +888,7 @@ impl MpvSession {
             payload_seq: AtomicU64::new(1),
             default_quality,
             cmd_sender: cmd_tx,
+            session_seq: seq,
             process: process_slot,
             is_running,
         })
@@ -843,7 +905,7 @@ impl MpvSession {
     }
 
     fn send_json(&self, value: serde_json::Value) {
-        let _ = self.cmd_sender.send(value.to_string());
+        let _ = self.cmd_sender.send(QueuedCommand { body: value.to_string(), trace: None });
     }
 
     fn next_payload_seq(&self) -> u64 {
@@ -871,13 +933,16 @@ impl MpvSession {
         start_index: usize,
         audio_only: bool,
         sync_gen: u64,
+        trace_id: u64,
     ) {
         if items.is_empty() {
             return;
         }
+        let prepare = crate::diagnostics::Span::child("mpv_queue_prepare_files", trace_id);
         let n = self.next_payload_seq();
         let Some(m3u_path) = write_m3u8_file(&self.ipc_dir, &format!("load-queue-{n}.m3u8"), items)
         else {
+            prepare.finish("m3u_write_error");
             return;
         };
         let entries = Self::build_title_entries(items);
@@ -889,15 +954,24 @@ impl MpvSession {
             "sync_gen": sync_gen,
         });
         if let Some(path) = write_payload_json(&self.ipc_dir, &format!("load-queue-{n}.json"), &payload) {
-            self.send_json(json!({
+            prepare.finish("ok");
+            let body = json!({
                 "command": [
                     "script-message-to",
                     "yr_bridge",
                     "load-queue",
                     path.to_string_lossy()
                 ]
-            }));
+            }).to_string();
+            let trace = crate::diagnostics::enabled().then_some(QueueTrace { generation: sync_gen, trace_id });
+            if trace.is_some() {
+                crate::diagnostics::mpv_queue_event("enqueue_attempt", self.session_seq, sync_gen, trace_id);
+            }
+            if self.cmd_sender.send(QueuedCommand { body, trace }).is_err() && trace.is_some() {
+                crate::diagnostics::mpv_queue_event("enqueue_error", self.session_seq, sync_gen, trace_id);
+            }
         } else {
+            prepare.finish("json_write_error");
             let _ = std::fs::remove_file(&m3u_path);
         }
     }
@@ -1009,7 +1083,7 @@ impl MpvSession {
 
     pub fn shutdown(&self) {
         self.is_running.store(false, Ordering::SeqCst);
-        let _ = self.cmd_sender.send(json!({"command": ["quit"]}).to_string());
+        self.send_json(json!({"command": ["quit"]}));
         if let Ok(mut guard) = self.process.lock() {
             if let Some(mut proc) = guard.take() {
                 let _ = proc.kill();
@@ -1087,4 +1161,112 @@ mod tests {
         );
         assert_eq!(m3u, expected);
     }
+    #[test]
+    fn diagnostics_script_is_gated_and_message_parser_is_whitelisted() {
+        let ordinary = bridge_script(false);
+        let diagnostic = bridge_script(true);
+        assert_eq!(ordinary, YR_BRIDGE_LUA);
+        assert!(ordinary.contains("local yr_diagnostics = false"));
+        assert!(diagnostic.contains("local yr_diagnostics = true"));
+        assert!(diagnostic.contains("diagnostic_queue('queue_received', payload.sync_gen)"));
+        assert!(diagnostic.contains("diagnostic_queue('before_loadlist', payload.sync_gen)"));
+        assert!(diagnostic.contains("diagnostic_queue('after_loadlist', payload.sync_gen)"));
+        assert_eq!(diagnostic_queue_message(&[json!("yr-diagnostics"), json!("queue_received"), json!("42")]), Some(("bridge_queue_received", 42)));
+        assert_eq!(diagnostic_queue_message(&[json!("yr-diagnostics"), json!("before_loadlist"), json!("1")]), Some(("bridge_before_loadlist", 1)));
+        assert_eq!(diagnostic_queue_message(&[json!("yr-diagnostics"), json!("after_loadlist"), json!("2")]), Some(("bridge_after_loadlist", 2)));
+        assert!(diagnostic_queue_message(&[json!("yr-diagnostics"), json!("private user text"), json!("1")]).is_none());
+        assert!(diagnostic_queue_message(&[json!("yr-diagnostics"), json!("queue_received"), json!("not-a-number")]).is_none());
+        assert!(diagnostic_queue_message(&[json!("yr-diagnostics"), json!("queue_received"), json!("0")]).is_none());
+        assert!(diagnostic_queue_message(&[]).is_none());
+    }
+
+    // Tests the real bridge over MPV IPC with a generated local silent WAV.
+    // No network, video IDs, user configuration, or audio device is needed.
+    #[test]
+    #[ignore = "requires mpv with Lua support"]
+    fn mpv_bridge_local_playback() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        use std::time::{Duration, Instant};
+        struct Cleanup { child: Child, dir: PathBuf }
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = std::fs::remove_dir_all(&self.dir); }
+        }
+        for enabled in [false, true] {
+            let dir = std::env::temp_dir().join(format!("yr-mpv-test-{}-{}", std::process::id(), enabled));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("yr_bridge.lua");
+            let socket = dir.join("mpv.sock");
+            let wave = dir.join("silence.wav");
+            let m3u = dir.join("queue.m3u8");
+            let payload = dir.join("queue.json");
+            std::fs::write(&script, bridge_script(enabled)).unwrap();
+            let data_len = 32000u32; // two seconds of mono 16-bit PCM at 8 kHz
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"RIFF"); bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt "); bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes()); bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&8000u32.to_le_bytes()); bytes.extend_from_slice(&16000u32.to_le_bytes());
+            bytes.extend_from_slice(&2u16.to_le_bytes()); bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data"); bytes.extend_from_slice(&data_len.to_le_bytes());
+            bytes.resize(44 + data_len as usize, 0);
+            std::fs::write(&wave, bytes).unwrap();
+            std::fs::write(&m3u, format!("#EXTM3U\n{}\n", wave.display())).unwrap();
+            std::fs::write(&payload, json!({
+                "items": [{"url": wave.to_string_lossy(), "title": "test"}],
+                "m3u_path": m3u.to_string_lossy(), "start_index": 0,
+                "audio_only": true, "sync_gen": 42,
+            }).to_string()).unwrap();
+            let child = Command::new("mpv").args(["--no-config", "--no-terminal", "--idle=yes", "--force-window=no", "--keep-open=no", "--ytdl=no", "--vo=null", "--ao=null"])
+                .arg(format!("--script={}", script.display()))
+                .arg(format!("--input-ipc-server={}", socket.display()))
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("mpv must be installed");
+            let _cleanup = Cleanup { child, dir };
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                if let Ok(stream) = StdUnixStream::connect(&socket) { break stream; }
+                assert!(Instant::now() < deadline, "mpv IPC did not start");
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            stream.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let send = |stream: &mut StdUnixStream, value: serde_json::Value| {
+                writeln!(stream, "{value}").unwrap();
+            };
+            let mut ready = false;
+            while Instant::now() < deadline && !ready {
+                send(&mut stream, json!({"command":["script-message-to", "yr_bridge", "ping"]}));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        ready = value.get("args").and_then(|x| x.as_array()).and_then(|x| x.first()).and_then(|x| x.as_str()) == Some("yr-bridge-ready");
+                    }
+                }
+            }
+            assert!(ready, "bridge never became ready");
+            send(&mut stream, json!({"command":["script-message-to", "yr_bridge", "load-queue", payload.to_string_lossy()]}));
+            let mut stages = Vec::new();
+            let mut loaded = false;
+            let mut synced = false;
+            while Instant::now() < deadline && !(loaded && synced && (!enabled || stages.len() == 3)) {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() { continue; }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue; };
+                if value.get("event").and_then(|e| e.as_str()) == Some("file-loaded") { loaded = true; }
+                if let Some(args) = value.get("args").and_then(|a| a.as_array()) {
+                    if args.first().and_then(|a| a.as_str()) == Some("yr-queue-synced") { synced = true; }
+                    if args.first().and_then(|a| a.as_str()) == Some("yr-diagnostics") {
+                        stages.push(diagnostic_queue_message(args));
+                    }
+                }
+            }
+            assert!(loaded && synced, "local file and queue must load in both modes");
+            if enabled {
+                assert_eq!(stages, vec![Some(("bridge_queue_received", 42)), Some(("bridge_before_loadlist", 42)), Some(("bridge_after_loadlist", 42))]);
+            } else {
+                assert!(stages.is_empty(), "diagnostics must remain silent when disabled");
+            }
+        }
+    }
+
 }

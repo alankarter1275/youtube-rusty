@@ -17,7 +17,7 @@ jobs:
       - name: Install GTK4 and Libadwaita dev packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libgtk-4-dev libadwaita-1-dev xvfb xauth
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-4-dev libadwaita-1-dev xvfb xauth mpv
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -57,6 +57,7 @@ jobs:
           steps = [
               ("cargo check", ["cargo", "check", "-q", "--all-targets"]),
               ("cargo test", ["cargo", "test", "-q"]),
+              ("MPV diagnostic bridge", ["cargo", "test", "-q", "mpv_bridge_local_playback", "--", "--ignored", "--nocapture"]),
               ("GTK card lifetime probe", ["xvfb-run", "-a", "env", "GTK_A11Y=none", "GSK_RENDERER=cairo", "cargo", "test", "-q", "inspect_real_card_lifetimes", "--", "--ignored", "--nocapture"]),
               ("cargo build", ["cargo", "build", "-q"]),
           ]

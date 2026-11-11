@@ -428,27 +428,30 @@ impl Engine {
         video_id: &str,
         default_quality: Quality,
         ytdl_format_override: Option<&str>,
+        trace_id: u64,
     ) -> Result<ResolvedPlayback, String> {
-        let entry = self.fetch_or_get_verified_pool(video_id).await?;
+        let entry = self.fetch_or_get_verified_pool(video_id, trace_id).await?;
         resolve_from_verified_entry(&entry, default_quality, ytdl_format_override)
             .ok_or_else(|| "No playable streams available for this video.".to_string())
     }
 
     /// Warms the verified stream pool for `video_id` in background so upcoming queue transitions
     /// open instantaneously when MPV advances.
-    pub async fn prefetch_video_pool(&self, video_id: &str) {
-        if !video_id.is_empty() {
-            let _ = self.fetch_or_get_verified_pool(video_id).await;
-        }
+    pub async fn prefetch_video_pool(&self, video_id: &str, trace_id: u64) -> bool {
+        if video_id.is_empty() { return false; }
+        self.fetch_or_get_verified_pool(video_id, trace_id).await.is_ok()
     }
 
-    async fn fetch_or_get_verified_pool(&self, video_id: &str) -> Result<VerifiedPoolEntry, String> {
+    async fn fetch_or_get_verified_pool(&self, video_id: &str, trace_id: u64) -> Result<VerifiedPoolEntry, String> {
+        let pool_span = crate::diagnostics::Span::child("mpv_pool_get", trace_id);
+        let pool_id = pool_span.id();
         {
             let guard = self.verified_pools.read().await;
             if let Some(found) = guard
                 .iter()
                 .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL)
             {
+                pool_span.finish("cache_hit");
                 return Ok(found.clone());
             }
         }
@@ -464,7 +467,9 @@ impl Engine {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
+        let wait = crate::diagnostics::Span::child("mpv_pool_lock_wait", pool_id);
         let _vid_guard = vid_lock.lock().await;
+        wait.finish("ok");
 
         {
             let guard = self.verified_pools.read().await;
@@ -472,6 +477,7 @@ impl Engine {
                 .iter()
                 .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL)
             {
+                pool_span.finish("cache_hit_after_wait");
                 return Ok(found.clone());
             }
         }
@@ -480,11 +486,18 @@ impl Engine {
         let mut sd_fallback: Option<VerifiedPoolEntry> = None;
 
         // 1. VISIONOS App (NewPipe 2026.11 spec: POT-free & JS-free direct MP4 + full HLS ladder)
-        match self.fetch_innertube_visionos_app(video_id).await {
+        let fetch = crate::diagnostics::Span::child("mpv_fetch_visionos_app", pool_id);
+        let result = self.fetch_innertube_visionos_app(video_id).await;
+        fetch.finish(if result.is_ok() { "ok" } else { "error" });
+        match result {
             Ok(pool) if pool.has_playable_streams() => {
-                if let Some(entry) = self.probe_pool_into_verified(video_id, pool).await {
+                let probe = crate::diagnostics::Span::child("mpv_probe_visionos_app", pool_id);
+                let verified = self.probe_pool_into_verified(video_id, pool).await;
+                probe.finish(if verified.is_some() { "ok" } else { "unavailable" });
+                if let Some(entry) = verified {
                     if verified_entry_has_hd(&entry) {
                         self.store_verified_pool(entry.clone()).await;
+                        pool_span.finish("visionos_app");
                         return Ok(entry);
                     }
                     sd_fallback = Some(entry);
@@ -497,11 +510,18 @@ impl Engine {
         }
 
         // 2. VISIONOS Safari (yt-dlp 2026.10 `_DEFAULT_JSLESS_CLIENTS` spec)
-        match self.fetch_innertube_visionos_safari(video_id).await {
+        let fetch = crate::diagnostics::Span::child("mpv_fetch_visionos_safari", pool_id);
+        let result = self.fetch_innertube_visionos_safari(video_id).await;
+        fetch.finish(if result.is_ok() { "ok" } else { "error" });
+        match result {
             Ok(pool) if pool.has_playable_streams() => {
-                if let Some(entry) = self.probe_pool_into_verified(video_id, pool).await {
+                let probe = crate::diagnostics::Span::child("mpv_probe_visionos_safari", pool_id);
+                let verified = self.probe_pool_into_verified(video_id, pool).await;
+                probe.finish(if verified.is_some() { "ok" } else { "unavailable" });
+                if let Some(entry) = verified {
                     if verified_entry_has_hd(&entry) {
                         self.store_verified_pool(entry.clone()).await;
+                        pool_span.finish("visionos_safari");
                         return Ok(entry);
                     }
                     if sd_fallback.is_none() {
@@ -516,16 +536,23 @@ impl Engine {
         }
 
         // 3. RustyPipe pure-Rust JS player deobfuscation (TV & Desktop — covers "Made for Kids" videos too)
-        for (ctype, ua) in [
-            (ClientType::Tv, RP_TV_UA),
-            (ClientType::Desktop, RP_DESKTOP_UA),
+        for (ctype, ua, label) in [
+            (ClientType::Tv, RP_TV_UA, "mpv_fetch_tv"),
+            (ClientType::Desktop, RP_DESKTOP_UA, "mpv_fetch_desktop"),
         ] {
-            match self.rp_query().await.player_from_clients(video_id, &[ctype]).await {
+            let fetch = crate::diagnostics::Span::child(label, pool_id);
+            let result = self.rp_query().await.player_from_clients(video_id, &[ctype]).await;
+            fetch.finish(if result.is_ok() { "ok" } else { "error" });
+            match result {
                 Ok(player) => {
                     let pool = pool_from_rustypipe(player, ua, YT_WEB_REFERER);
                     if pool.has_playable_streams() {
-                        if let Some(entry) = self.probe_pool_into_verified(video_id, pool).await {
+                        let probe = crate::diagnostics::Span::child("mpv_probe_rustypipe", pool_id);
+                        let verified = self.probe_pool_into_verified(video_id, pool).await;
+                        probe.finish(if verified.is_some() { "ok" } else { "unavailable" });
+                        if let Some(entry) = verified {
                             self.store_verified_pool(entry.clone()).await;
+                            pool_span.finish("rustypipe");
                             return Ok(entry);
                         }
                     }
@@ -538,9 +565,11 @@ impl Engine {
 
         if let Some(entry) = sd_fallback {
             self.store_verified_pool(entry.clone()).await;
+            pool_span.finish("sd_fallback");
             return Ok(entry);
         }
 
+        pool_span.finish("error");
         if last_err.is_empty() {
             Err("No playable streams available for this video.".to_string())
         } else {

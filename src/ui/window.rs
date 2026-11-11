@@ -3496,6 +3496,8 @@ impl MainWindow {
         if all.is_empty() {
             return;
         }
+        let handoff = crate::diagnostics::Span::new("mpv_queue_handoff");
+        let handoff_id = handoff.id();
         let cur_idx = self.player_card.current_idx().min(all.len() - 1);
         let _seq = self.next_playback_seq();
         let sync_gen = self.next_mpv_sync_gen();
@@ -3515,8 +3517,10 @@ impl MainWindow {
             // Resolve stream pool in parallel while MPV initializes its IPC socket
             let eng = self.engine.clone();
             let cur_id = cur.id.clone();
+            let prefetch = crate::diagnostics::Span::child("mpv_current_prefetch", handoff_id);
             self.runtime.spawn(async move {
-                eng.prefetch_video_pool(&cur_id).await;
+                let ok = eng.prefetch_video_pool(&cur_id, prefetch.id()).await;
+                prefetch.finish(if ok { "ok" } else { "error_or_empty" });
             });
         }
 
@@ -3528,7 +3532,9 @@ impl MainWindow {
             cur_idx,
             quality == Quality::AudioOnly,
             sync_gen,
+            handoff_id,
         );
+        handoff.finish("queue_attempted");
         self.prefetch_next_track_pool();
         self.pump_queue_continuation();
     }
@@ -3539,7 +3545,7 @@ impl MainWindow {
             let engine = self.engine.clone();
             let vid_id = next_item.id;
             self.runtime.spawn(async move {
-                engine.prefetch_video_pool(&vid_id).await;
+                engine.prefetch_video_pool(&vid_id, 0).await;
             });
         }
     }
