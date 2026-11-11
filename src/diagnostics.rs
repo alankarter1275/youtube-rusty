@@ -197,6 +197,7 @@ fn sample_mpv() {
 }
 
 // Aggregate high-frequency image events instead of printing one line per thumbnail.
+#[derive(Clone, Copy)]
 pub enum ImageEvent { TextureHit, CompressedHit, DiskHit, Network, Coalesced, Decode, Delivered, DecodeTimeUs, NetworkTimeUs, DiskTimeUs }
 static IMAGE: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 pub fn image_event(event: ImageEvent, value: u64) {

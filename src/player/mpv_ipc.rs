@@ -435,7 +435,7 @@ impl MpvSession {
                 }
             };
 
-            let _diagnostic_process = crate::diagnostics::MpvProcess::set(child.id());
+            let diagnostic_process = crate::diagnostics::MpvProcess::set(child.id());
             crate::diagnostics::milestone("mpv_child_spawned");
             if let Ok(mut guard) = proc_for_task.lock() {
                 *guard = Some(child);
@@ -573,6 +573,7 @@ impl MpvSession {
             let imm_tx_read = imm_tx;
 
             tokio::spawn(async move {
+                let _diagnostic_process = diagnostic_process;
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !running_read.load(Ordering::SeqCst) {
