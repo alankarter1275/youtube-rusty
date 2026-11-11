@@ -618,14 +618,23 @@ impl VideoCard {
         title_label.add_css_class("yr-title");
         info_box.append(&title_label);
 
-        let meta_text = join_non_empty(&[&video.channel_name, &video.view_count_text]);
+        let credits = video.channel_credits();
+        let avatar = adw::Avatar::new(24, credits.first().map(|c| c.name.as_str()), true);
+        let (avatar_stack, extra_channel_avatars) = build_collaborator_avatar_stack(&avatar, &credits, 24);
+        let meta_row = GtkBox::new(Orientation::Horizontal, 8);
+        let byline = video.channel_byline().unwrap_or_default();
+        let meta_text = join_non_empty(&[&byline, &video.view_count_text]);
+        if video.is_collaboration() {
+            meta_row.append(&avatar_stack);
+        }
         if !meta_text.is_empty() {
             let meta_label = Label::new(Some(&meta_text));
             meta_label.add_css_class("yr-meta");
             meta_label.set_halign(Align::Start);
             meta_label.set_xalign(0.0);
             meta_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            info_box.append(&meta_label);
+            meta_row.append(&meta_label);
+            info_box.append(&meta_row);
         }
 
         click_target.append(&info_box);
@@ -760,14 +769,12 @@ impl VideoCard {
         container.set_child(Some(&root_box));
         container.set_hexpand(true);
 
-        let avatar = adw::Avatar::new(24, Some(&video.channel_name), true);
-
         Self {
             container,
             highlight_target: root_box,
             click_target,
             channel_target: None,
-            extra_channel_avatars: Vec::new(),
+            extra_channel_avatars,
             picture,
             avatar,
         }

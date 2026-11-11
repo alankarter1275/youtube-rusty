@@ -4765,56 +4765,66 @@ impl MainWindow {
         let total = pl.videos.len();
 
         for (idx, vid) in pl.videos.iter().enumerate() {
-            let pid = pl.id.clone();
-            let weak_reorder = Rc::downgrade(self);
-            let weak_remove = Rc::downgrade(self);
-            let pid_remove = pl.id.clone();
-
-            let card = VideoCard::new_playlist_track(
-                vid,
-                idx,
-                total,
-                layout,
-                true,
-                move |from, to| {
-                    if let Some(w) = weak_reorder.upgrade() {
-                        if w.playlist_store.move_video(&pid, from, to) {
-                            w.open_saved_playlist(&pid);
-                            w.highlight_reordered_playlist_row(to);
-                            w.focus_playlist_reorder_row(to);
-                        }
-                    }
-                },
-                move || {
-                    if let Some(w) = weak_remove.upgrade() {
-                        if let Some(removed_video) = w.playlist_store.remove_video_at(&pid_remove, idx)
-                        {
-                            w.open_saved_playlist(&pid_remove);
-
-                            let toast = adw::Toast::new("Removed video from playlist");
-                            toast.set_button_label(Some("Undo"));
-                            let weak_undo = Rc::downgrade(&w);
-                            let pid_undo = pid_remove.clone();
-                            toast.connect_button_clicked(move |_| {
-                                if let Some(w) = weak_undo.upgrade() {
-                                    if w.playlist_store.insert_video_at(
-                                        &pid_undo,
-                                        idx,
-                                        removed_video.clone(),
-                                    ) {
-                                        w.open_saved_playlist(&pid_undo);
-                                    }
-                                }
-                            });
-                            w.toast_overlay.add_toast(toast);
-                        }
-                    }
-                },
-            );
-
-            self.wire_playlist_track_interactions(&card, vid, idx, &actions);
-            self.flow_box.append(&card.container);
+            self.append_saved_playlist_track(&pl.id, vid, idx, total, layout, &actions, None, true);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_saved_playlist_track(self: &Rc<Self>, playlist_id: &str, vid: &VideoSummary,
+        idx: usize, total: usize, layout: ListCardLayout, actions: &CardActions,
+        position: Option<i32>, hydrate: bool) {
+        let pid = playlist_id.to_string();
+        let weak_reorder = Rc::downgrade(self);
+        let weak_remove = Rc::downgrade(self);
+        let pid_remove = playlist_id.to_string();
+
+        let card = VideoCard::new_playlist_track(
+            vid,
+            idx,
+            total,
+            layout,
+            true,
+            move |from, to| {
+                if let Some(w) = weak_reorder.upgrade() {
+                    if w.playlist_store.move_video(&pid, from, to) {
+                        w.open_saved_playlist(&pid);
+                        w.highlight_reordered_playlist_row(to);
+                        w.focus_playlist_reorder_row(to);
+                    }
+                }
+            },
+            move || {
+                if let Some(w) = weak_remove.upgrade() {
+                    if let Some(removed_video) = w.playlist_store.remove_video_at(&pid_remove, idx)
+                    {
+                        w.open_saved_playlist(&pid_remove);
+
+                        let toast = adw::Toast::new("Removed video from playlist");
+                        toast.set_button_label(Some("Undo"));
+                        let weak_undo = Rc::downgrade(&w);
+                        let pid_undo = pid_remove.clone();
+                        toast.connect_button_clicked(move |_| {
+                            if let Some(w) = weak_undo.upgrade() {
+                                if w.playlist_store.insert_video_at(
+                                    &pid_undo,
+                                    idx,
+                                    removed_video.clone(),
+                                ) {
+                                    w.open_saved_playlist(&pid_undo);
+                                }
+                            }
+                        });
+                        w.toast_overlay.add_toast(toast);
+                    }
+                }
+            },
+        );
+
+        self.wire_playlist_track_interactions(&card, vid, idx, actions);
+
+        if let Some(position) = position { self.flow_box.insert(&card.container, position); }
+        else { self.flow_box.append(&card.container); }
+        if hydrate { self.hydrate_playlist_track(&card, vid, idx, total, layout, actions, Some(playlist_id.to_string())); }
     }
 
     fn highlight_reordered_playlist_row(&self, index: usize) {
@@ -4953,7 +4963,43 @@ impl MainWindow {
             self.wire_playlist_track_interactions(&card, vid, idx, &actions);
             self.flow_box.append(&card.container);
             self.current_videos.borrow_mut().push(vid.clone());
+            self.hydrate_playlist_track(&card, vid, idx, 0, layout, &actions, None);
         }
+    }
+
+    fn hydrate_playlist_track(self: &Rc<Self>, card: &VideoCard, video: &VideoSummary,
+        idx: usize, total: usize, layout: ListCardLayout, actions: &CardActions, saved_id: Option<String>) {
+        if video.is_collaboration() || video.is_short { return; }
+        let (tx, rx) = async_channel::bounded(1);
+        let engine = self.engine.clone();
+        let original = video.clone();
+        self.runtime.spawn(async move {
+            let _ = tx.send(engine.enrich_video_attribution(original).await).await;
+        });
+        let weak = Rc::downgrade(self);
+        let card_weak = card.container.downgrade();
+        let original = video.clone();
+        let actions = actions.clone();
+        let request = self.request_seq.get();
+        glib::spawn_future_local(async move {
+            let Ok(updated) = rx.recv().await else { return };
+            if updated == original { return; }
+            let (Some(w), Some(old)) = (weak.upgrade(), card_weak.upgrade()) else { return };
+            if w.request_seq.get() != request || old.parent().is_none() { return; }
+            let position = old.index();
+            if position < 0 { return; }
+            for video in w.current_videos.borrow_mut().iter_mut() {
+                if video.id == updated.id { *video = updated.clone(); }
+            }
+            w.flow_box.remove(&old);
+            if let Some(id) = saved_id {
+                w.append_saved_playlist_track(&id, &updated, idx, total, layout, &actions, Some(position), false);
+            } else {
+                let card = VideoCard::new_playlist_track(&updated, idx, 0, layout, false, |_, _| {}, || {});
+                w.wire_playlist_track_interactions(&card, &updated, idx, &actions);
+                w.flow_box.insert(&card.container, position);
+            }
+        });
     }
 
     fn wire_playlist_track_interactions(
@@ -4964,6 +5010,14 @@ impl MainWindow {
         actions: &CardActions,
     ) {
         self.bind_home_picture(&vid.id, &vid.thumbnail_url, &card.picture);
+        if vid.is_collaboration() {
+            if !vid.channel_avatar_url.is_empty() {
+                self.bind_home_avatar(&vid.channel_id, &vid.channel_avatar_url, &card.avatar);
+            }
+            for (id, url, avatar) in &card.extra_channel_avatars {
+                if !url.is_empty() { self.bind_home_avatar(id, url, avatar); }
+            }
+        }
 
         let vid_id = vid.id.clone();
         let vid_id_det = vid.id.clone();
