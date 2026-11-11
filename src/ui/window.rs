@@ -191,6 +191,7 @@ pub struct MainWindow {
     selected_box: RefCell<Option<GtkBox>>,
     selected_action_cb: RefCell<Option<Rc<dyn Fn()>>>,
     open_channels: RefCell<Vec<Rc<ChannelPage>>>,
+    diagnostic_cards: crate::diagnostics::CardTracker,
     home_pictures: RefCell<Vec<(String, String, bool, glib::WeakRef<gtk4::Picture>)>>,
     home_avatars: RefCell<Vec<(String, String, glib::WeakRef<adw::Avatar>)>>,
     home_textures_suspended: Cell<bool>,
@@ -795,6 +796,7 @@ impl MainWindow {
             selected_box: RefCell::new(None),
             selected_action_cb: RefCell::new(None),
             open_channels: RefCell::new(Vec::new()),
+            diagnostic_cards: crate::diagnostics::CardTracker::default(),
             home_pictures: RefCell::new(Vec::new()),
             home_avatars: RefCell::new(Vec::new()),
             home_textures_suspended: Cell::new(false),
@@ -3868,6 +3870,7 @@ impl MainWindow {
     }
 
     fn clear_home_flow_box(&self) {
+        self.diagnostic_cards.before_clear(&self.flow_box);
         self.home_pictures.borrow_mut().clear();
         self.home_avatars.borrow_mut().clear();
         self.last_home_cull_y.set(0.0);
@@ -5911,6 +5914,7 @@ impl MainWindow {
             ViewMode::ShortsGrid => VideoCard::new_short(summary),
             ViewMode::SearchList => VideoCard::new_search(summary, layout),
         };
+        self.diagnostic_cards.track(&card);
 
         let sum_play = summary.clone();
         let on_play = actions.on_play.clone();

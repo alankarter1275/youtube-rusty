@@ -1,7 +1,9 @@
 //! Optional, privacy-preserving runtime diagnostics for the user's real device.
 //! All labels are static: do not put titles, URLs, search text, or IDs in logs.
 use gtk4::prelude::*;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -105,6 +107,102 @@ impl Drop for Activity {
 fn current_activity() -> Option<(&'static str, Duration)> {
     ACTIVITIES.get_or_init(|| Mutex::new(Vec::new())).lock()
         .unwrap_or_else(|e| e.into_inner()).last().map(|(_, label, start)| (*label, start.elapsed()))
+}
+
+// These probes hold only weak references and never keep a card or image alive.
+// Track just main-flow VideoCards (not skeletons, search channel cards, or channel pages).
+const MAX_TRACKED_CARDS: usize = 4096;
+const MAX_CARD_SAMPLE: usize = 256;
+const MAX_PENDING_CARD_BATCHES: usize = 16;
+
+#[derive(Clone)]
+struct CardProbe {
+    container: gtk4::glib::WeakRef<gtk4::FlowBoxChild>,
+    root: gtk4::glib::WeakRef<gtk4::Box>,
+    picture: gtk4::glib::WeakRef<gtk4::Picture>,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct CardCounts {
+    containers_alive: usize,
+    containers_parented: usize,
+    roots_alive: usize,
+    pictures_alive: usize,
+}
+fn card_counts(probes: &[CardProbe]) -> CardCounts {
+    let mut counts = CardCounts::default();
+    for probe in probes {
+        if let Some(container) = probe.container.upgrade() {
+            counts.containers_alive += 1;
+            if container.parent().is_some() { counts.containers_parented += 1; }
+        }
+        if probe.root.upgrade().is_some() { counts.roots_alive += 1; }
+        if probe.picture.upgrade().is_some() { counts.pictures_alive += 1; }
+    }
+    counts
+}
+
+#[derive(Default)]
+pub struct CardTracker {
+    cards: RefCell<Vec<CardProbe>>,
+    omitted: Cell<usize>,
+    pending: Rc<Cell<usize>>,
+}
+impl CardTracker {
+    pub fn track(&self, card: &crate::ui::video_card::VideoCard) {
+        if !enabled() { return; }
+        let mut cards = self.cards.borrow_mut();
+        if cards.len() >= MAX_TRACKED_CARDS {
+            self.omitted.set(self.omitted.get().saturating_add(1));
+            return;
+        }
+        cards.push(CardProbe {
+            container: card.container.downgrade(),
+            root: card.highlight_target.downgrade(),
+            picture: card.picture.downgrade(),
+        });
+    }
+
+    /// Called immediately before removing main-flow children. Only cards currently
+    /// parented to this FlowBox are sampled; replacements removed earlier are excluded.
+    pub fn before_clear(&self, flow: &gtk4::FlowBox) {
+        if !enabled() { return; }
+        let mut cards = self.cards.borrow_mut();
+        let mut eligible = 0usize;
+        let mut sample = Vec::new();
+        for card in cards.drain(..) {
+            let attached = card.container.upgrade()
+                .and_then(|container| container.parent())
+                .map(|parent| parent == *flow.upcast_ref::<gtk4::Widget>())
+                .unwrap_or(false);
+            if attached {
+                eligible += 1;
+                if sample.len() < MAX_CARD_SAMPLE { sample.push(card); }
+            }
+        }
+        let omitted = self.omitted.replace(0);
+        if eligible == 0 && omitted == 0 { return; }
+        let batch = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if self.pending.get() >= MAX_PENDING_CARD_BATCHES {
+            log(format_args!("event=card_lifetime batch={batch} status=skipped_pending_limit tracked_attached={eligible} untracked_created={omitted}"));
+            return;
+        }
+        self.pending.set(self.pending.get() + 1);
+        log(format_args!("event=card_lifetime batch={batch} status=scheduled tracked_attached={eligible} sampled={} untracked_created={omitted}", sample.len()));
+        let sample = Rc::new(sample);
+        let started = Instant::now();
+        for delay in [5, 30] {
+            let sample = sample.clone();
+            let pending = self.pending.clone();
+            gtk4::glib::timeout_add_local_once(Duration::from_secs(delay), move || {
+                let counts = card_counts(&sample);
+                log(format_args!("event=card_lifetime batch={batch} status=sample nominal_delay_s={delay} elapsed_ms={:.1} sampled={} containers_alive={} containers_parented={} roots_alive={} pictures_alive={}",
+                    elapsed_ms(started), sample.len(), counts.containers_alive,
+                    counts.containers_parented, counts.roots_alive, counts.pictures_alive));
+                if delay == 30 { pending.set(pending.get().saturating_sub(1)); }
+            });
+        }
+    }
 }
 
 /// Mark a UI change for the next observed frame-clock paint (not physical display).
@@ -297,4 +395,40 @@ mod tests {
         let s = parse_proc("VmRSS: nope\n", "invalid", "read_bytes: xyz");
         assert_eq!(s.rss_kib, None); assert_eq!(s.cpu_ticks, None); assert_eq!(s.read_bytes, None);
     }
+    // A display is required; CI runs this separately under Xvfb. The control
+    // ensures the probe does not itself keep widgets alive. The interaction
+    // result is printed, not assumed, so it remains useful after a future fix.
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn inspect_real_card_lifetimes() {
+        gtk4::init().expect("GTK display is required");
+        libadwaita::init().expect("initialize libadwaita");
+        let summary = crate::backend::models::VideoSummary {
+            id: String::new(), title: "Test".into(), channel_id: String::new(),
+            channel_name: String::new(), channel_avatar_url: String::new(),
+            duration_seconds: None, duration_text: String::new(), view_count_text: String::new(),
+            view_count: None, published_text: String::new(), published_unix: None,
+            is_short: false, thumbnail_url: String::new(), description_snippet: String::new(),
+            collaborators: vec![],
+        };
+        let sample = |interactions: bool| {
+            let flow = gtk4::FlowBox::new();
+            let card = crate::ui::video_card::VideoCard::new_grid(&summary);
+            if interactions { card.connect_card_interactions(|_| {}, || {}, || {}); }
+            let probe = CardProbe {
+                container: card.container.downgrade(),
+                root: card.highlight_target.downgrade(),
+                picture: card.picture.downgrade(),
+            };
+            flow.append(&card.container);
+            flow.remove(&card.container);
+            drop(card);
+            card_counts(&[probe])
+        };
+        let control = sample(false);
+        assert_eq!(control, CardCounts::default(), "the weak probe must not retain a removed card");
+        let with_interactions = sample(true);
+        eprintln!("CARD_LIFETIME_CONTROL={control:?} CARD_LIFETIME_WITH_INTERACTIONS={with_interactions:?}");
+    }
+
 }
