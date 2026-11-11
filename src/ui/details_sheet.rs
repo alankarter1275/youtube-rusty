@@ -127,7 +127,7 @@ impl DetailsSheet {
             let engine = actions.engine.clone();
             let original = summary.clone();
             actions.runtime.spawn(async move {
-                let result = engine.enrich_video_attribution(original).await;
+                let result = engine.enrich_video_attribution_priority(original).await;
                 let _ = tx.send(result).await;
             });
             let row_weak = channel_row.downgrade();

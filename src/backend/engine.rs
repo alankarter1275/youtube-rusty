@@ -1764,7 +1764,16 @@ impl Engine {
 
     /// Enrich any video using the watch page's owner, independent of the feed it came from.
     /// Errors leave the original summary untouched and are not cached, so a later attempt can retry.
-    pub async fn enrich_video_attribution(&self, mut video: VideoSummary) -> VideoSummary {
+    pub async fn enrich_video_attribution(&self, video: VideoSummary) -> VideoSummary {
+        self.enrich_video_attribution_inner(video, false).await
+    }
+
+    // A details dialog must not wait behind a long list of background card lookups.
+    pub async fn enrich_video_attribution_priority(&self, video: VideoSummary) -> VideoSummary {
+        self.enrich_video_attribution_inner(video, true).await
+    }
+
+    async fn enrich_video_attribution_inner(&self, mut video: VideoSummary, priority: bool) -> VideoSummary {
         if video.id.is_empty() || video.is_collaboration() {
             return video;
         }
@@ -1772,7 +1781,12 @@ impl Engine {
         let attribution = if let Some(cached) = cached {
             Some(cached)
         } else {
-            let Ok(_permit) = self.attribution_limit.acquire().await else { return video };
+            let _permit = if priority {
+                None
+            } else {
+                let Ok(permit) = self.attribution_limit.acquire().await else { return video };
+                Some(permit)
+            };
             let cached = self.attribution_cache.read().await.get(&video.id).cloned();
             if cached.is_some() {
                 cached
