@@ -45,25 +45,32 @@ pub struct Span {
     label: &'static str,
     started: Option<Instant>,
     id: u64,
+    parent_id: u64,
 }
 impl Span {
     pub fn new(label: &'static str) -> Self {
         if enabled() {
-            Self { label, started: Some(Instant::now()), id: NEXT_ID.fetch_add(1, Ordering::Relaxed) }
+            Self { label, started: Some(Instant::now()), id: NEXT_ID.fetch_add(1, Ordering::Relaxed), parent_id: 0 }
         } else {
-            Self { label, started: None, id: 0 }
+            Self { label, started: None, id: 0, parent_id: 0 }
         }
+    }
+    pub fn id(&self) -> u64 { self.id }
+    pub fn child(label: &'static str, parent_id: u64) -> Self {
+        let mut span = Self::new(label);
+        span.parent_id = parent_id;
+        span
     }
     pub fn finish(mut self, status: &'static str) {
         if let Some(started) = self.started.take() {
-            log(format_args!("event=span name={} id={} elapsed_ms={:.1} status={status}", self.label, self.id, elapsed_ms(started)));
+            log(format_args!("event=span name={} id={} parent_id={} elapsed_ms={:.1} status={status}", self.label, self.id, self.parent_id, elapsed_ms(started)));
         }
     }
 }
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some(started) = self.started.take() {
-            log(format_args!("event=span name={} id={} elapsed_ms={:.1} status=cancelled_or_abandoned", self.label, self.id, elapsed_ms(started)));
+            log(format_args!("event=span name={} id={} parent_id={} elapsed_ms={:.1} status=cancelled_or_abandoned", self.label, self.id, self.parent_id, elapsed_ms(started)));
         }
     }
 }

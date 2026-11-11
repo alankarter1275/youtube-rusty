@@ -4338,6 +4338,7 @@ impl MainWindow {
 
     pub fn search(self: &Rc<Self>, query: &str) {
         let action = crate::diagnostics::Span::new("search_action");
+        let action_id = action.id();
         let req_id = self.next_request_id();
         self.set_active_nav(None);
         let tab = self.search_tab.get();
@@ -4371,7 +4372,7 @@ impl MainWindow {
         let sf = self.search_sort_order.get();
 
         self.runtime.spawn(async move {
-            let backend = crate::diagnostics::Span::new("search_backend");
+            let backend = crate::diagnostics::Span::child("search_backend", action_id);
             let res = engine.search_items(&q, tab, df, duf, sf).await;
             backend.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sender.send(res).await;
@@ -5126,6 +5127,7 @@ impl MainWindow {
 
     pub fn search_category_opts(self: &Rc<Self>, category: &str, force_refresh: bool) {
         let action = crate::diagnostics::Span::new("category_action");
+        let action_id = action.id();
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::HomeCategory(category.to_string()),
@@ -5143,7 +5145,7 @@ impl MainWindow {
         let cat_ui = category.to_string();
 
         self.runtime.spawn(async move {
-            let backend = crate::diagnostics::Span::new("category_backend");
+            let backend = crate::diagnostics::Span::child("category_backend", action_id);
             let res = engine.category_feed(&cat, force_refresh).await;
             backend.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sender.send(res).await;
@@ -5325,6 +5327,7 @@ impl MainWindow {
 
     pub fn load_trending_opts(self: &Rc<Self>, force_refresh: bool) {
         let action = crate::diagnostics::Span::new("trending_action");
+        let action_id = action.id();
         let req_id = self.next_request_id();
         self.prepare_view_shell(
             ActiveView::HomeTrending,
@@ -5340,7 +5343,7 @@ impl MainWindow {
         let engine = self.engine.clone();
 
         self.runtime.spawn(async move {
-            let backend = crate::diagnostics::Span::new("trending_backend");
+            let backend = crate::diagnostics::Span::child("trending_backend", action_id);
             let res = engine.trending_initial(force_refresh).await;
             backend.finish(if res.is_ok() { "ok" } else { "error" });
             let _ = sender.send(res).await;
