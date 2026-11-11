@@ -3519,7 +3519,7 @@ impl MainWindow {
             let cur_id = cur.id.clone();
             let prefetch = crate::diagnostics::Span::child("mpv_current_prefetch", handoff_id);
             self.runtime.spawn(async move {
-                let ok = eng.prefetch_video_pool(&cur_id, prefetch.id()).await;
+                let ok = eng.prefetch_video_pool(&cur_id, quality, prefetch.id()).await;
                 prefetch.finish(if ok { "ok" } else { "error_or_empty" });
             });
         }
@@ -3544,8 +3544,9 @@ impl MainWindow {
         if let Some(next_item) = self.player_card.item_at(next_idx) {
             let engine = self.engine.clone();
             let vid_id = next_item.id;
+            let quality = self.playback_quality.get();
             self.runtime.spawn(async move {
-                engine.prefetch_video_pool(&vid_id, 0).await;
+                engine.prefetch_video_pool(&vid_id, quality, 0).await;
             });
         }
     }

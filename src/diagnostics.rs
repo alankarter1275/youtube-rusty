@@ -46,6 +46,16 @@ pub fn mpv_queue_event(stage: &'static str, session: u64, generation: u64, trace
     log(format_args!("event=mpv_queue stage={stage} session={session} generation={generation} trace_id={trace_id}"));
 }
 
+pub fn mpv_stream_choice(trace_id: u64, requested: crate::player::mpv::Quality, selected_audio: Option<bool>, override_present: bool) {
+    if !enabled() { return; }
+    let requested = match requested {
+        crate::player::mpv::Quality::P360 => "360p", crate::player::mpv::Quality::P720 => "720p",
+        crate::player::mpv::Quality::P1080 => "1080p", crate::player::mpv::Quality::AudioOnly => "audio",
+    };
+    let selected = match selected_audio { Some(true) => "audio", Some(false) => "video", None => "unavailable" };
+    log(format_args!("event=mpv_stream_choice trace_id={trace_id} requested={requested} selected={selected} override_present={override_present}"));
+}
+
 /// Each async operation has its own ID; dropping it early reports cancellation.
 #[must_use]
 pub struct Span {

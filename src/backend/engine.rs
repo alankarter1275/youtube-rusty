@@ -263,13 +263,84 @@ struct VideoAttribution {
     collaborators: Vec<VideoCollaborator>,
 }
 
+// A failed prefetch should be shared with requests already waiting for the
+// same video/quality, but a later user retry must actually retry the network.
+#[derive(Default)]
+struct PoolFlight {
+    generation: AtomicU64,
+    state: Mutex<PoolFlightState>,
+}
+#[derive(Default)]
+struct PoolFlightState {
+    failure: Option<PoolFlightFailure>,
+}
+struct PoolFlightFailure {
+    quality: Quality,
+    format: Option<String>,
+    message: String,
+}
+impl PoolFlight {
+    fn complete(&self, state: &mut PoolFlightState, failure: Option<PoolFlightFailure>) {
+        state.failure = failure;
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+    fn failure_since(&self, state: &PoolFlightState, observed: u64, quality: Quality, format: Option<&str>) -> Option<String> {
+        if observed == self.generation.load(Ordering::Acquire) { return None; }
+        state.failure.as_ref().filter(|f| f.quality == quality && f.format.as_deref() == format)
+            .map(|f| f.message.clone())
+    }
+}
+
+// Probe individually, with a bounded request count, concurrency and overall wait.
+// Anything untested or failing is omitted from the playable format catalog.
+async fn probe_candidates<F, Fut>(urls: &[String], limit: Arc<Semaphore>, probe: F) -> Vec<bool>
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = bool> + Send + 'static,
+{
+    let probe = Arc::new(probe);
+    let mut tasks = JoinSet::new();
+    let mut results = vec![false; urls.len()];
+    for (index, url) in urls.iter().take(24).cloned().enumerate() {
+        let probe = probe.clone();
+        let limit = limit.clone();
+        tasks.spawn(async move {
+            let Ok(_permit) = limit.acquire().await else { return (index, false) };
+            (index, probe(url).await)
+        });
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(7), async {
+        while let Some(result) = tasks.join_next().await {
+            if let Ok((index, ok)) = result { results[index] = ok; }
+        }
+    }).await;
+    // Dropping JoinSet aborts unfinished work; its results remain false.
+    results
+}
+
+fn retain_probed<T>(items: &mut Vec<T>, results: &[bool]) {
+    let mut index = 0;
+    items.retain(|_| {
+        let keep = results.get(index).copied().unwrap_or(false);
+        index += 1;
+        keep
+    });
+}
+
+async fn probe_media_url(http: &reqwest::Client, url: &str, ua: &str, referer: &str) -> bool {
+    let mut req = http.get(url).timeout(Duration::from_millis(3500))
+        .header("User-Agent", ua).header("Range", "bytes=0-1");
+    if !referer.is_empty() { req = req.header("Referer", referer); }
+    req.send().await.map(|resp| resp.status().is_success()).unwrap_or(false)
+}
+
 pub struct Engine {
     rp: RustyPipe,
     http: reqwest::Client,
     visitor_data: RwLock<Option<(String, Instant)>>,
     visitor_fetch_lock: Mutex<()>,
     verified_pools: RwLock<Vec<VerifiedPoolEntry>>,
-    pool_inflight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pool_inflight: Mutex<HashMap<String, Arc<PoolFlight>>>,
     home_seed: AtomicU64,
     seen_home_ids: RwLock<Vec<String>>,
     category_seed: AtomicU64,
@@ -430,26 +501,35 @@ impl Engine {
         ytdl_format_override: Option<&str>,
         trace_id: u64,
     ) -> Result<ResolvedPlayback, String> {
-        let entry = self.fetch_or_get_verified_pool(video_id, trace_id).await?;
-        resolve_from_verified_entry(&entry, default_quality, ytdl_format_override)
-            .ok_or_else(|| "No playable streams available for this video.".to_string())
+        let entry = match self.fetch_or_get_verified_pool(video_id, default_quality, ytdl_format_override, trace_id).await {
+            Ok(entry) => entry,
+            Err(error) => {
+                crate::diagnostics::mpv_stream_choice(trace_id, default_quality, None, ytdl_format_override.is_some());
+                return Err(error);
+            }
+        };
+        let result = resolve_from_verified_entry(&entry, default_quality, ytdl_format_override)
+            .ok_or_else(|| "No playable stream is available for the requested quality. Please try again.".to_string());
+        crate::diagnostics::mpv_stream_choice(trace_id, default_quality, result.as_ref().ok().map(|r| r.is_audio_only), ytdl_format_override.is_some());
+        result
     }
 
     /// Warms the verified stream pool for `video_id` in background so upcoming queue transitions
     /// open instantaneously when MPV advances.
-    pub async fn prefetch_video_pool(&self, video_id: &str, trace_id: u64) -> bool {
+    pub async fn prefetch_video_pool(&self, video_id: &str, quality: Quality, trace_id: u64) -> bool {
         if video_id.is_empty() { return false; }
-        self.fetch_or_get_verified_pool(video_id, trace_id).await.is_ok()
+        self.fetch_or_get_verified_pool(video_id, quality, None, trace_id).await.is_ok()
     }
 
-    async fn fetch_or_get_verified_pool(&self, video_id: &str, trace_id: u64) -> Result<VerifiedPoolEntry, String> {
+    async fn fetch_or_get_verified_pool(&self, video_id: &str, quality: Quality, format: Option<&str>, trace_id: u64) -> Result<VerifiedPoolEntry, String> {
         let pool_span = crate::diagnostics::Span::child("mpv_pool_get", trace_id);
         let pool_id = pool_span.id();
         {
             let guard = self.verified_pools.read().await;
             if let Some(found) = guard
                 .iter()
-                .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL)
+                .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL
+                    && entry_matches_request(e, quality, format))
             {
                 pool_span.finish("cache_hit");
                 return Ok(found.clone());
@@ -464,25 +544,33 @@ impl Engine {
             }
             inflight
                 .entry(video_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .or_insert_with(|| Arc::new(PoolFlight::default()))
                 .clone()
         };
+        let observed_generation = vid_lock.generation.load(Ordering::Acquire);
         let wait = crate::diagnostics::Span::child("mpv_pool_lock_wait", pool_id);
-        let _vid_guard = vid_lock.lock().await;
+        let mut flight = vid_lock.state.lock().await;
         wait.finish("ok");
 
         {
             let guard = self.verified_pools.read().await;
             if let Some(found) = guard
                 .iter()
-                .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL)
+                .find(|e| e.video_id == video_id && e.fetched_at.elapsed() < VERIFIED_POOL_TTL
+                    && entry_matches_request(e, quality, format))
             {
                 pool_span.finish("cache_hit_after_wait");
                 return Ok(found.clone());
             }
         }
 
+        let format_key = format.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(message) = vid_lock.failure_since(&flight, observed_generation, quality, format_key) {
+            pool_span.finish("coalesced_error");
+            return Err(message);
+        }
         let mut last_err = String::new();
+        let mut incompatible_stream = false;
         let mut sd_fallback: Option<VerifiedPoolEntry> = None;
 
         // 1. VISIONOS App (NewPipe 2026.11 spec: POT-free & JS-free direct MP4 + full HLS ladder)
@@ -495,14 +583,18 @@ impl Engine {
                 let verified = self.probe_pool_into_verified(video_id, pool).await;
                 probe.finish(if verified.is_some() { "ok" } else { "unavailable" });
                 if let Some(entry) = verified {
-                    if verified_entry_has_hd(&entry) {
+                    if !entry_matches_request(&entry, quality, format) {
+                        incompatible_stream = true;
+                    } else if verified_entry_has_hd(&entry) {
                         self.store_verified_pool(entry.clone()).await;
+                        vid_lock.complete(&mut flight, None);
                         pool_span.finish("visionos_app");
                         return Ok(entry);
+                    } else {
+                        sd_fallback = Some(entry);
                     }
-                    sd_fallback = Some(entry);
                 } else {
-                    last_err = "VisionOS app streams returned HTTP 403".to_string();
+                    last_err = "Could not verify streams from the VisionOS app source".to_string();
                 }
             }
             Ok(_) => {}
@@ -519,16 +611,18 @@ impl Engine {
                 let verified = self.probe_pool_into_verified(video_id, pool).await;
                 probe.finish(if verified.is_some() { "ok" } else { "unavailable" });
                 if let Some(entry) = verified {
-                    if verified_entry_has_hd(&entry) {
+                    if !entry_matches_request(&entry, quality, format) {
+                        incompatible_stream = true;
+                    } else if verified_entry_has_hd(&entry) {
                         self.store_verified_pool(entry.clone()).await;
+                        vid_lock.complete(&mut flight, None);
                         pool_span.finish("visionos_safari");
                         return Ok(entry);
-                    }
-                    if sd_fallback.is_none() {
+                    } else if sd_fallback.is_none() {
                         sd_fallback = Some(entry);
                     }
                 } else {
-                    last_err = "VisionOS Safari streams returned HTTP 403".to_string();
+                    last_err = "Could not verify streams from the VisionOS Safari source".to_string();
                 }
             }
             Ok(_) => {}
@@ -551,9 +645,13 @@ impl Engine {
                         let verified = self.probe_pool_into_verified(video_id, pool).await;
                         probe.finish(if verified.is_some() { "ok" } else { "unavailable" });
                         if let Some(entry) = verified {
-                            self.store_verified_pool(entry.clone()).await;
-                            pool_span.finish("rustypipe");
-                            return Ok(entry);
+                            if entry_matches_request(&entry, quality, format) {
+                                self.store_verified_pool(entry.clone()).await;
+                                vid_lock.complete(&mut flight, None);
+                                pool_span.finish("rustypipe");
+                                return Ok(entry);
+                            }
+                            incompatible_stream = true;
                         }
                     }
                 }
@@ -565,16 +663,23 @@ impl Engine {
 
         if let Some(entry) = sd_fallback {
             self.store_verified_pool(entry.clone()).await;
+            vid_lock.complete(&mut flight, None);
             pool_span.finish("sd_fallback");
             return Ok(entry);
         }
 
-        pool_span.finish("error");
-        if last_err.is_empty() {
-            Err("No playable streams available for this video.".to_string())
+        let message = if incompatible_stream {
+            "No playable stream is available for the requested quality. Please try again.".to_string()
+        } else if last_err.is_empty() {
+            "No playable streams available for this video.".to_string()
         } else {
-            Err(format!("Stream extraction failed: {last_err}"))
-        }
+            format!("Stream extraction failed: {last_err}")
+        };
+        vid_lock.complete(&mut flight, Some(PoolFlightFailure {
+            quality, format: format_key.map(str::to_string), message: message.clone(),
+        }));
+        pool_span.finish("error");
+        Err(message)
     }
 
     async fn store_verified_pool(&self, entry: VerifiedPoolEntry) {
@@ -595,30 +700,26 @@ impl Engine {
     ) -> Option<VerifiedPoolEntry> {
         let ua = pool.user_agent.clone();
         let referer = pool.referer.clone();
-        let muxed_url = pool.muxed.first().map(|m| m.url.clone());
-        let adap_url = pool.adaptive_video.first().map(|v| v.url.clone());
-        let aud_url = pool.audio.first().map(|a| a.url.clone());
+        let muxed_urls: Vec<_> = pool.muxed.iter().map(|v| v.url.clone()).collect();
+        let adap_urls: Vec<_> = pool.adaptive_video.iter().map(|v| v.url.clone()).collect();
+        let aud_urls: Vec<_> = pool.audio.iter().map(|a| a.url.clone()).collect();
         let hls_url = pool.hls_url.clone();
-
-        let (muxed_ok, adap_ok, aud_ok, hls_manifest) = tokio::join!(
-            async {
-                match muxed_url {
-                    Some(ref u) => self.probe_media_url(u, &ua, &referer).await,
-                    None => false,
-                }
-            },
-            async {
-                match adap_url {
-                    Some(ref u) => self.probe_media_url(u, &ua, &referer).await,
-                    None => false,
-                }
-            },
-            async {
-                match aud_url {
-                    Some(ref u) => self.probe_media_url(u, &ua, &referer).await,
-                    None => false,
-                }
-            },
+        let make_probe = || {
+            let http = self.http.clone();
+            let ua = ua.clone();
+            let referer = referer.clone();
+            move |url: String| {
+                let http = http.clone();
+                let ua = ua.clone();
+                let referer = referer.clone();
+                async move { probe_media_url(&http, &url, &ua, &referer).await }
+            }
+        };
+        let limit = Arc::new(Semaphore::new(8));
+        let (muxed, adaptive, audio, hls_manifest) = tokio::join!(
+            probe_candidates(&muxed_urls, limit.clone(), make_probe()),
+            probe_candidates(&adap_urls, limit.clone(), make_probe()),
+            probe_candidates(&aud_urls, limit.clone(), make_probe()),
             async {
                 match hls_url {
                     Some(ref u) => self.fetch_text_checked(u, &ua, &referer).await,
@@ -627,18 +728,11 @@ impl Engine {
             }
         );
 
-        if !muxed_ok {
-            pool.muxed.clear();
-        }
-        if !(adap_ok && aud_ok) {
-            pool.adaptive_video.clear();
-        }
-        if !aud_ok {
-            pool.audio.clear();
-        }
-        if hls_manifest.is_none() {
-            pool.hls_url = None;
-        }
+        retain_probed(&mut pool.muxed, &muxed);
+        retain_probed(&mut pool.adaptive_video, &adaptive);
+        retain_probed(&mut pool.audio, &audio);
+        if pool.audio.is_empty() { pool.adaptive_video.clear(); }
+        if hls_manifest.is_none() { pool.hls_url = None; }
 
         let has_playable = !pool.muxed.is_empty()
             || (!pool.adaptive_video.is_empty() && !pool.audio.is_empty())
@@ -734,19 +828,7 @@ impl Engine {
     }
 
     async fn probe_media_url(&self, url: &str, ua: &str, referer: &str) -> bool {
-        let mut req = self
-            .http
-            .get(url)
-            .timeout(Duration::from_millis(3500))
-            .header("User-Agent", ua)
-            .header("Range", "bytes=0-1");
-        if !referer.is_empty() {
-            req = req.header("Referer", referer);
-        }
-        match req.send().await {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
-        }
+        probe_media_url(&self.http, url, ua, referer).await
     }
 
     async fn fetch_text_checked(&self, url: &str, ua: &str, referer: &str) -> Option<String> {
@@ -3355,6 +3437,13 @@ fn pick_best_catalog_audio(streams: &[CatalogAudio]) -> Option<&CatalogAudio> {
     })
 }
 
+fn is_video_format_token(token: &str) -> bool {
+    let suffix = token.strip_prefix('v').or_else(|| token.strip_prefix('m'))
+        .or_else(|| token.strip_prefix("hls-"));
+    suffix.map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b'p'))
+        .unwrap_or(false)
+}
+
 fn resolve_from_verified_entry(
     entry: &VerifiedPoolEntry,
     default_quality: Quality,
@@ -3585,6 +3674,8 @@ fn resolve_from_verified_entry(
         })
     };
 
+    let mut explicit_audio_override = false;
+    let mut explicit_video_override = false;
     let (chosen_video, chosen_audio) = if let Some(ovr) =
         ytdl_format_override.map(str::trim).filter(|s| !s.is_empty())
     {
@@ -3596,7 +3687,13 @@ fn resolve_from_verified_entry(
             .iter()
             .find_map(|tok| audio_entries.iter().find(|a| a.format_id == *tok));
 
+        if vid_match.is_none() && parts.iter().any(|tok| is_video_format_token(tok)) {
+            return None;
+        }
         if vid_match.is_some() || aud_match.is_some() {
+            explicit_audio_override = vid_match.is_none() && aud_match.is_some()
+                && parts.iter().all(|tok| audio_entries.iter().any(|a| a.format_id == *tok));
+            explicit_video_override = parts.iter().any(|tok| is_video_format_token(tok));
             (vid_match, aud_match)
         } else if default_quality == Quality::AudioOnly {
             (None, best_default_audio)
@@ -3631,7 +3728,17 @@ fn resolve_from_verified_entry(
                 (uri.clone(), paired_audio.clone(), false)
             }
         },
-        (None, Some(aud)) => (aud.url.clone(), None, true),
+        (None, Some(aud)) => {
+            if !explicit_audio_override && (default_quality != Quality::AudioOnly || explicit_video_override) {
+                if let Some(master) = &pool.hls_url {
+                    (master.clone(), None, false)
+                } else {
+                    return None;
+                }
+            } else {
+                (aud.url.clone(), None, true)
+            }
+        },
         (None, None) => {
             if let Some(lowest_vid) = video_entries.last() {
                 let url = match &lowest_vid.source {
@@ -3687,6 +3794,10 @@ fn resolve_from_verified_entry(
         title: resolved_title,
         ytdl_json,
     })
+}
+
+fn entry_matches_request(entry: &VerifiedPoolEntry, quality: Quality, format: Option<&str>) -> bool {
+    resolve_from_verified_entry(entry, quality, format).is_some()
 }
 
 #[cfg(test)]
@@ -6219,7 +6330,118 @@ fn map_video_item(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    fn playback_test_pool() -> CandidatePool {
+        CandidatePool {
+            muxed: Vec::new(), adaptive_video: Vec::new(), audio: Vec::new(), hls_url: None,
+            user_agent: "test".into(), referer: String::new(), duration_secs: None,
+            title: None, channel_id: String::new(), channel_name: String::new(),
+            thumbnail_url: String::new(), view_count: None,
+        }
+    }
+    fn playback_test_video(id: u32, url: String, height: u32) -> RawVideoCandidate {
+        RawVideoCandidate { itag: id, url, width: height * 16 / 9, height, fps: 30,
+            bitrate: 500_000, filesize: None, hdr: false, is_mp4: true, codec: SimpleVideoCodec::H264 }
+    }
+    fn playback_test_audio(id: u32, url: String) -> RawAudioCandidate {
+        RawAudioCandidate { itag: id, url, bitrate: 128_000, sample_rate: 44100,
+            filesize: None, is_m4a: true, codec: SimpleAudioCodec::Aac }
+    }
+    fn playback_test_entry(pool: CandidatePool) -> VerifiedPoolEntry {
+        VerifiedPoolEntry { video_id: "test".into(), fetched_at: Instant::now(), pool, hls_manifest: None }
+    }
+
+    #[test]
+    fn video_requests_do_not_silently_become_audio() {
+        let mut pool = playback_test_pool();
+        pool.audio.push(playback_test_audio(251, "audio".into()));
+        let mut entry = playback_test_entry(pool);
+        assert!(!entry_matches_request(&entry, Quality::P360, None));
+        assert!(entry_matches_request(&entry, Quality::AudioOnly, None));
+        assert!(resolve_from_verified_entry(&entry, Quality::P360, Some("a251")).unwrap().is_audio_only);
+        assert!(resolve_from_verified_entry(&entry, Quality::P360, Some("v136+a251")).is_none());
+        assert!(resolve_from_verified_entry(&entry, Quality::AudioOnly, Some("v136+a251")).is_none());
+
+        // A fetched HLS master can still be useful even when no variants were parsed.
+        entry.pool.hls_url = Some("master".into());
+        entry.hls_manifest = Some("#EXTM3U\n".into());
+        let result = resolve_from_verified_entry(&entry, Quality::P360, None).unwrap();
+        assert_eq!(result.primary_url, "master");
+        assert!(!result.is_audio_only);
+        assert!(resolve_from_verified_entry(&entry, Quality::AudioOnly, None).unwrap().is_audio_only);
+    }
+
+    #[tokio::test]
+    async fn failed_candidates_are_removed_individually_and_cache_is_request_aware() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let n = socket.read(&mut request).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&request[..n]);
+                    let status = if req.starts_with("GET /bad") { "403 Forbidden" } else { "206 Partial Content" };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        let path = std::env::temp_dir().join(format!("rusty-pool-test-{}", std::process::id()));
+        let engine = Engine::new(&path);
+        let mut pool = playback_test_pool();
+        pool.muxed = vec![playback_test_video(18, format!("{base}/bad-mux"), 360),
+                          playback_test_video(22, format!("{base}/good-mux"), 720)];
+        pool.adaptive_video = vec![playback_test_video(136, format!("{base}/bad-video"), 720),
+                                   playback_test_video(135, format!("{base}/good-video"), 480)];
+        pool.audio = vec![playback_test_audio(140, format!("{base}/bad-audio")),
+                          playback_test_audio(251, format!("{base}/good-audio"))];
+        let entry = engine.probe_pool_into_verified("test", pool).await.unwrap();
+        assert_eq!(entry.pool.muxed.iter().map(|v| v.itag).collect::<Vec<_>>(), vec![22]);
+        assert_eq!(entry.pool.adaptive_video.iter().map(|v| v.itag).collect::<Vec<_>>(), vec![135]);
+        assert_eq!(entry.pool.audio.iter().map(|a| a.itag).collect::<Vec<_>>(), vec![251]);
+        let selected = resolve_from_verified_entry(&entry, Quality::P360, None).unwrap();
+        assert_eq!(selected.primary_url, format!("{base}/good-video"));
+        assert_eq!(selected.audio_url.as_deref(), Some(format!("{base}/good-audio").as_str()));
+        let json: Value = serde_json::from_str(selected.ytdl_json.as_deref().unwrap()).unwrap();
+        let ids: Vec<_> = json["formats"].as_array().unwrap().iter().filter_map(|v| v["format_id"].as_str()).collect();
+        assert!(!ids.contains(&"m18") && !ids.contains(&"v136") && !ids.contains(&"a140"));
+        engine.store_verified_pool(entry).await;
+        let cached = engine.fetch_or_get_verified_pool("test", Quality::P360, None, 0).await.unwrap();
+        assert!(entry_matches_request(&cached, Quality::P360, None));
+
+        // An Audio-prefetched pool cannot satisfy a later video request, while a
+        // deliberate audio format override remains valid even at 360p.
+        let mut audio_pool = playback_test_pool();
+        audio_pool.audio.push(playback_test_audio(251, format!("{base}/good-audio")));
+        let audio_entry = engine.probe_pool_into_verified("test", audio_pool).await.unwrap();
+        engine.store_verified_pool(audio_entry).await;
+        let guard = engine.verified_pools.read().await;
+        assert!(!entry_matches_request(&guard[0], Quality::P360, None));
+        assert!(entry_matches_request(&guard[0], Quality::AudioOnly, None));
+        assert!(entry_matches_request(&guard[0], Quality::P360, Some("a251")));
+        drop(guard);
+        server.abort();
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn failed_inflight_is_shared_with_waiters_but_not_later_retries() {
+        let flight = PoolFlight::default();
+        let observed = flight.generation.load(Ordering::Acquire);
+        let mut state = flight.state.lock().await;
+        flight.complete(&mut state, Some(PoolFlightFailure { quality: Quality::P360,
+            format: None, message: "unavailable".into() }));
+        assert_eq!(flight.failure_since(&state, observed, Quality::P360, None).as_deref(), Some("unavailable"));
+        assert!(flight.failure_since(&state, observed, Quality::AudioOnly, None).is_none());
+        assert!(flight.failure_since(&state, observed, Quality::P360, Some("a251")).is_none());
+        let retry = flight.generation.load(Ordering::Acquire);
+        assert!(flight.failure_since(&state, retry, Quality::P360, None).is_none());
+    }
 
     #[test]
     fn watch_owner_collaboration_reads_dialog_title_commands_and_ignores_recommendations() {
