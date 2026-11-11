@@ -496,11 +496,36 @@ popover modelbutton:hover, .yr-menu-item:hover {
 .yr-suggest-row.active {
   background-color: alpha(#E8DDD5, 0.10);
 }
-dialog.yr-collaborators-dialog, .yr-collaborators-dialog {
+/* AdwDialog fills the host window; paint only its sheet, not the full-screen
+   dialog widget, so the dimmed content beneath remains visible. */
+dialog.yr-sheet, dialog.yr-collaborators-dialog {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+dialog.yr-sheet floating-sheet > dimming,
+dialog.yr-sheet bottom-sheet > dimming,
+dialog.yr-collaborators-dialog floating-sheet > dimming,
+dialog.yr-collaborators-dialog bottom-sheet > dimming {
+  background-color: alpha(black, 0.25);
+}
+dialog.yr-collaborators-dialog floating-sheet > sheet,
+dialog.yr-collaborators-dialog bottom-sheet > sheet {
   background-color: @yr_surface;
   border: 1px solid alpha(#E8DDD5, 0.16);
   border-radius: 18px;
-  box-shadow: 0 16px 40px alpha(black, 0.55);
+  box-shadow: 0 16px 40px alpha(black, 0.35);
+}
+button.yr-channel-link-button {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  min-height: 0;
+  min-width: 0;
+}
+button.yr-channel-link-button:hover label {
+  text-decoration: underline;
 }
 .yr-collaborator-avatar {
   border: 2px solid @yr_bg;
@@ -531,8 +556,9 @@ dialog.yr-collaborators-dialog, .yr-collaborators-dialog {
   color: @yr_text2;
   margin: 8px 14px 2px 14px;
 }
-dialog.yr-sheet, .yr-sheet {
-  background-color: alpha(@yr_surface, 0.90);
+dialog.yr-sheet floating-sheet > sheet,
+dialog.yr-sheet bottom-sheet > sheet {
+  background-color: @yr_surface;
   border: 1px solid alpha(#E8DDD5, 0.14);
   border-radius: 22px;
   box-shadow: 0 24px 72px alpha(black, 0.55);

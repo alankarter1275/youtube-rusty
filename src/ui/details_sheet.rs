@@ -418,7 +418,23 @@ fn build_channel_row(summary: &VideoSummary, actions: &CardActions, dialog: &adw
                 .load_into_avatar(&channel_id, &avatar_url, &extra);
         }
     }
-    channel_row.append(&avatar_stack);
+    // For an ordinary video the avatar and name both navigate to its channel.
+    // Collaboration attribution remains separate from the per-channel dialog.
+    if !summary.is_collaboration() {
+        if let Some(channel) = primary.filter(|channel| !channel.id.is_empty()) {
+            let avatar_link = Button::new();
+            avatar_link.add_css_class("yr-channel-link-button");
+            avatar_link.set_tooltip_text(Some("Open channel"));
+            avatar_link.set_child(Some(&avatar_stack));
+            set_pointer(&avatar_link);
+            connect_open_channel(&avatar_link, channel, actions, dialog);
+            channel_row.append(&avatar_link);
+        } else {
+            channel_row.append(&avatar_stack);
+        }
+    } else {
+        channel_row.append(&avatar_stack);
+    }
 
     let channel_info = GtkBox::new(Orientation::Vertical, 2);
     channel_info.set_hexpand(true);
@@ -428,7 +444,22 @@ fn build_channel_row(summary: &VideoSummary, actions: &CardActions, dialog: &adw
         channel_name.set_xalign(0.0);
         channel_name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         channel_name.add_css_class("yr-title");
-        channel_info.append(&channel_name);
+        if !summary.is_collaboration() {
+            if let Some(channel) = primary.filter(|channel| !channel.id.is_empty()) {
+                let name_link = Button::new();
+                name_link.add_css_class("yr-channel-link-button");
+                name_link.set_halign(Align::Start);
+                name_link.set_tooltip_text(Some("Open channel"));
+                name_link.set_child(Some(&channel_name));
+                set_pointer(&name_link);
+                connect_open_channel(&name_link, channel, actions, dialog);
+                channel_info.append(&name_link);
+            } else {
+                channel_info.append(&channel_name);
+            }
+        } else {
+            channel_info.append(&channel_name);
+        }
     }
 
     let stats_text = [
@@ -472,24 +503,40 @@ fn build_channel_row(summary: &VideoSummary, actions: &CardActions, dialog: &adw
         .first()
         .filter(|channel| !channel.id.is_empty())
     {
-        // Keep the original single-channel action; only real collaborations open the list.
-        let open_channel_btn = Button::with_label("Open channel");
-        open_channel_btn.add_css_class("yr-btn");
-        set_pointer(&open_channel_btn);
-        let channel_id = channel.id.clone();
-        let channel_name = channel.name.clone();
-        let dialog_weak = dialog.downgrade();
-        let on_open_channel = actions.on_open_channel.clone();
-        open_channel_btn.connect_clicked(move |_| {
-            if let Some(dialog) = dialog_weak.upgrade() {
-                dialog.close();
-            }
-            on_open_channel(channel_id.clone(), channel_name.clone());
-        });
-        channel_row.append(&open_channel_btn);
+        let subscribe_btn = make_channel_subscribe_button(channel, actions);
+        subscribe_btn.add_css_class("primary");
+        channel_row.append(&subscribe_btn);
     }
 
     channel_row
+}
+
+fn connect_open_channel(button: &Button, channel: &VideoCollaborator, actions: &CardActions, dialog: &adw::Dialog) {
+    let id = channel.id.clone();
+    let name = channel.name.clone();
+    let on_open = actions.on_open_channel.clone();
+    let dialog_weak = dialog.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(dialog) = dialog_weak.upgrade() {
+            dialog.close();
+        }
+        on_open(id.clone(), name.clone());
+    });
+}
+
+fn make_channel_subscribe_button(channel: &VideoCollaborator, actions: &CardActions) -> Button {
+    let subscribed = (actions.is_subscribed)(&channel.id);
+    let button = Button::with_label(if subscribed { "Subscribed" } else { "Subscribe" });
+    button.add_css_class("yr-btn");
+    button.set_sensitive(!channel.id.is_empty());
+    set_pointer(&button);
+    let toggle = actions.on_toggle_subscription.clone();
+    let channel = channel.clone();
+    button.connect_clicked(move |button| {
+        let subscribed = toggle(channel.clone());
+        button.set_label(if subscribed { "Subscribed" } else { "Subscribe" });
+    });
+    button
 }
 
 fn show_collaborators_dialog(
@@ -587,25 +634,7 @@ fn show_collaborators_dialog(
         }
         row.append(&info);
 
-        let is_subscribed = (actions.is_subscribed)(&channel.id);
-        let subscribe_btn = Button::with_label(if is_subscribed {
-            "Subscribed"
-        } else {
-            "Subscribe"
-        });
-        subscribe_btn.add_css_class("yr-btn");
-        subscribe_btn.set_sensitive(!channel.id.is_empty());
-        set_pointer(&subscribe_btn);
-        let toggle = actions.on_toggle_subscription.clone();
-        let channel_for_toggle = channel.clone();
-        subscribe_btn.connect_clicked(move |button| {
-            let now_subscribed = toggle(channel_for_toggle.clone());
-            button.set_label(if now_subscribed {
-                "Subscribed"
-            } else {
-                "Subscribe"
-            });
-        });
+        let subscribe_btn = make_channel_subscribe_button(channel, actions);
         row.append(&subscribe_btn);
         rows.append(&row);
     }
